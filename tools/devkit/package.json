@@ -1,0 +1,16 @@
+{
+  "name": "@bt-share/devkit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Android real-device verification CLI (adb + uiautomator), zero dependencies.",
+  "type": "module",
+  "bin": {
+    "devkit": "./devkit.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "smoke": "node examples/system-ui-smoke.mjs"
+  }
+}

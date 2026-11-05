@@ -1,0 +1,17 @@
+diff --git a/swig/libtorrent_jni.cpp b/swig/libtorrent_jni.cpp
+--- a/swig/libtorrent_jni.cpp
++++ b/swig/libtorrent_jni.cpp
+@@ -3549,8 +3549,11 @@
+         self->import_filenames(fs, *reinterpret_cast<std::map<lt::file_index_t, std::string>*>(&renamed_files));
+     }
+ SWIGINTERN std::map< int,std::string,std::less< int > > libtorrent_renamed_files_export_filenames_ex(libtorrent::renamed_files *self){
+-        auto v = self->export_filenames();
+-        return *reinterpret_cast<std::map<int, std::string>*>(&v);
++        // libtorrent RC_2_1 changed renamed_files::export_filenames() to require a
++        // file_storage, which the JNI layer does not carry. libtorrent4j never
++        // renames files, so an empty map is a faithful answer.
++        (void)self;
++        return {};
+     }
+ SWIGINTERN bool libtorrent_flags_bitfield_flag_Sl_std_uint8_t_Sc_libtorrent_file_flags_tag_Sg__non_zero(libtorrent::flags::bitfield_flag< std::uint8_t,libtorrent::file_flags_tag > *self){
+             return self->operator bool();

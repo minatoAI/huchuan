@@ -23,8 +23,6 @@ interface GroupStore {
     fun setFileUploadLimit(groupId: String, fileId: String, kbps: Int)
 
     fun addComment(groupId: String, fileId: String, body: String, parentId: String?)
-
-    fun addFile(groupId: String, name: String, sizeBytes: Long, sourceMember: String): GroupFile
 }
 
 /** 本机设置：用户名、全局限速。 */

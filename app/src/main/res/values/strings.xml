@@ -12,11 +12,13 @@
     <string name="p0_title">网络检测</string>
     <string name="p0_pass">可互传</string>
     <string name="p0_limited">仅本机可用</string>
+    <string name="p0_degraded">仅局域网可用</string>
     <string name="p0_change_network">请换网络后重测</string>
     <string name="p0_retest">重测</string>
     <string name="p0_enter">进入</string>
     <string name="p0_failed">检测失败</string>
     <string name="p0_offline">无网络连接</string>
+    <string name="p0_booting">启动中</string>
     <string name="p0_checking">正在检测网络</string>
     <string name="p0_item_nat">NAT 类型</string>
     <string name="p0_item_ipv6">IPv6</string>
@@ -56,6 +58,8 @@
     <!-- P4 文件详情 -->
     <string name="p4_activate">激活</string>
     <string name="p4_sleep">休眠</string>
+    <!-- 只给无障碍/自动化用的开关名，界面上不显示（Switch 本身没有文字）。 -->
+    <string name="p4_activate_toggle">激活开关</string>
     <string name="p4_teaming">正在组队 · %1$d 人</string>
     <string name="p4_seeders">做种者 %1$d</string>
     <string name="p4_waiting_seeder">等待做种者</string>
@@ -101,6 +105,7 @@
     <string name="p7_unlimited">不限</string>
     <string name="p7_notification">通知</string>
     <string name="p7_network_diagnostics">网络诊断</string>
+    <string name="p7_network_status">网络：%1$s</string>
     <string name="p7_notify_bubble">系统气泡</string>
     <string name="p7_notify_in_app">仅应用内</string>
     <string name="p7_notify_muted">静音</string>

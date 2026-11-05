@@ -1,7 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- 内核：消息层 TLS 连接 + BitTorrent 监听/下载 + 局域网发现。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- mDNS（_huchuan._tcp）走组播：Android 上必须拿 WifiManager.MulticastLock 才收得到，
+         拿锁要 CHANGE_WIFI_MULTICAST_STATE，读 Wi-Fi 状态要 ACCESS_WIFI_STATE。 -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <application
+        android:name=".HuchuanApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"

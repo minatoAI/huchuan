@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>互传</title>
+<link rel="icon" href="data:,">
+<script>
+  /* 主题跟随系统；?theme=dark|light 只给开发取证用，正常启动不带这个参数。
+     这一段必须早于样式表，否则深色下会先闪一帧浅色。 */
+  (function () {
+    var forced = new URLSearchParams(location.search).get('theme');
+    var dark = forced ? forced === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  })();
+</script>
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="app" role="application" aria-label="互传"></div>
+<script src="js/data.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

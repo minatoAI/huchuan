@@ -12,14 +12,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
@@ -34,7 +31,6 @@ import app.huchuan.core.Member
 import kotlinx.coroutines.launch
 
 /** P6 成员。入口：P3 顶部「成员（n 人）」；出口：系统返回 → P3。 */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MembersScreen(
     state: HuchuanState,
@@ -52,8 +48,8 @@ fun MembersScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val copiedLabel = stringResource(R.string.p6_copied)
 
-    Scaffold(
-        topBar = { TopAppBar(title = { Text(stringResource(R.string.p6_title)) }) },
+    PageScaffold(
+        title = stringResource(R.string.p6_title),
         snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
         Column(
@@ -64,7 +60,9 @@ fun MembersScreen(
             if (group.members.isEmpty()) {
                 Text(
                     text = stringResource(R.string.p6_empty),
-                    modifier = Modifier.padding(24.dp),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(Spacing.section),
                 )
             } else {
                 LazyColumn(modifier = Modifier.weight(1f)) {
@@ -74,14 +72,20 @@ fun MembersScreen(
                 }
             }
 
-            Column(modifier = Modifier.padding(16.dp)) {
+            Column(
+                modifier = Modifier.padding(
+                    horizontal = Spacing.pageHorizontal,
+                    vertical = Spacing.pageVertical,
+                ),
+            ) {
                 Text(
                     text = stringResource(R.string.p6_invite_code),
                     style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
                     text = group.inviteCode,
-                    style = MaterialTheme.typography.titleMedium,
+                    style = MaterialTheme.typography.titleLarge,
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable {
@@ -91,7 +95,7 @@ fun MembersScreen(
                             )
                             scope.launch { snackbarHostState.showSnackbar(copiedLabel) }
                         }
-                        .padding(vertical = 4.dp),
+                        .padding(vertical = 8.dp),
                 )
             }
         }
@@ -101,15 +105,34 @@ fun MembersScreen(
 @Composable
 private fun MemberRow(member: Member) {
     ListItem(
-        headlineContent = { Text(member.name) },
+        headlineContent = {
+            Text(
+                text = member.name,
+                style = MaterialTheme.typography.titleMedium,
+            )
+        },
         supportingContent = {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
                 if (member.online) {
-                    Text(stringResource(R.string.p6_online))
+                    Text(
+                        text = stringResource(R.string.p6_online),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
-                Text(stringResource(R.string.p6_seeding, member.seedingCount))
+                Text(
+                    text = stringResource(R.string.p6_seeding, member.seedingCount),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         },
-        trailingContent = { Text(member.platform, style = MaterialTheme.typography.labelMedium) },
+        trailingContent = {
+            Text(
+                text = member.platform,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        },
     )
 }

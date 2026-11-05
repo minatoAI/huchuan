@@ -12,12 +12,12 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import app.huchuan.HuchuanState
 import app.huchuan.R
 import app.huchuan.core.Group
+import app.huchuan.core.NetworkStatus
 import app.huchuan.core.NotificationLevel
 
 /**
@@ -41,9 +42,17 @@ import app.huchuan.core.NotificationLevel
 @Composable
 fun SettingsDrawer(
     state: HuchuanState,
-    onDiagnostics: () -> Unit,
 ) {
     val device = state.deviceState
+    val networkReport = remember { state.probe.check() }
+    val networkLabel = when {
+        networkReport.status == NetworkStatus.PASS -> stringResource(R.string.p0_pass)
+        networkReport.status == NetworkStatus.OFFLINE -> stringResource(R.string.p0_offline)
+        networkReport.status == NetworkStatus.FAIL && networkReport.items.isNotEmpty() ->
+            stringResource(R.string.p0_degraded)
+
+        else -> stringResource(R.string.p0_failed)
+    }
 
     var name by remember(device.userName) { mutableStateOf(device.userName) }
     var uploadText by remember(device.uploadLimitKbps) {
@@ -57,8 +66,11 @@ fun SettingsDrawer(
         Column(
             modifier = Modifier
                 .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+                .padding(
+                    horizontal = Spacing.pageHorizontal,
+                    vertical = Spacing.section,
+                ),
+            verticalArrangement = Arrangement.spacedBy(Spacing.pageVertical),
         ) {
             Text(
                 text = stringResource(R.string.p7_title),
@@ -81,7 +93,7 @@ fun SettingsDrawer(
                 text = stringResource(R.string.p7_global_limit),
                 style = MaterialTheme.typography.titleSmall,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
                 OutlinedTextField(
                     value = uploadText,
                     onValueChange = { input ->
@@ -133,9 +145,13 @@ fun SettingsDrawer(
                 NotificationSection(state = state, group = group)
             }
 
-            TextButton(onClick = onDiagnostics) {
-                Text(stringResource(R.string.p7_network_diagnostics))
-            }
+            // 只读状态行：P7 不再跳回 P0（P0 是开机自检，不是诊断页）。
+            Text(
+                text = stringResource(R.string.p7_network_status, networkLabel),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
         }
     }
 }
@@ -144,7 +160,10 @@ fun SettingsDrawer(
 @Composable
 private fun NotificationSection(state: HuchuanState, group: Group) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(text = group.name, style = MaterialTheme.typography.labelLarge)
+        Text(
+            text = group.name,
+            style = MaterialTheme.typography.labelLarge,
+        )
         Row(
             modifier = Modifier.horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -157,6 +176,10 @@ private fun NotificationSection(state: HuchuanState, group: Group) {
                         state.touch()
                     },
                     label = { Text(notificationLabel(level)) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                        selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    ),
                 )
             }
         }

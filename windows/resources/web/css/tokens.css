@@ -1,0 +1,99 @@
+/* 互传 Windows 壳 · 设计令牌
+ *
+ * 颜色不是新调的一套，而是照抄 Android 的 M3 ColorScheme（app/src/main/kotlin/app/huchuan/ui/theme/Theme.kt），
+ * 两端的品牌、对比度、状态色来自同一份取值：品牌深玉青 #1F6F5C。
+ *
+ * 两条铁律沿用 Android：
+ *   1. 填充按钮明暗两套都锁 #1F6F5C + 白字，深色下不会变成薄荷绿；
+ *   2. 文本 / 开关 / 进度这类要和背景比对比度的角色，深色用同色相提亮版 #4FC7A5。
+ */
+:root {
+  color-scheme: light;
+
+  /* 品牌 */
+  --brand: #1f6f5c;          /* 文本 / 图标 / 开关 / 进度 */
+  --brand-fill: #1f6f5c;     /* 填充按钮的底，两套都是它 */
+  --brand-fill-hover: #18574a;
+  --on-brand: #ffffff;
+  --brand-wash: rgba(31, 111, 92, 0.08);
+  --focus: rgba(31, 111, 92, 0.4);
+
+  /* 表面 */
+  --bg: #f7fbf8;
+  --surface: #ffffff;
+  --surface-low: #f1f5f2;
+  --surface-mid: #ebefec;
+  --surface-high: #e5eae6;
+  --surface-highest: #dfe4e0;
+
+  /* 文本 */
+  --ink: #171d1a;
+  --ink-2: #3f4945;
+  --ink-3: #6f7974;
+
+  /* 线 */
+  --line: #bfc9c3;
+  --line-strong: #6f7974;
+  --hairline: rgba(23, 29, 26, 0.1);
+
+  /* 强调 / 状态 */
+  --accent: #a6f2d8;         /* 状态 chip 的强调底 */
+  --accent-ink: #002117;
+  --notice: #3e6374;         /* 降级告警 */
+  --danger: #ba1a1a;
+
+  --hover: rgba(23, 29, 26, 0.045);
+  --shadow: 0 10px 32px rgba(23, 29, 26, 0.16);
+
+  /* 版面：8px 栅格，只留四档间距，避免随手 12/16/24 混用 */
+  --gap-xs: 4px;
+  --gap-sm: 8px;
+  --gap: 16px;
+  --gap-lg: 24px;
+  --gap-xl: 32px;
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+
+  --font: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-num: "Cascadia Mono", "Consolas", var(--font);
+
+  --topbar-h: 56px;
+  --page-max: 960px;
+  --page-max-wide: 1040px;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --brand: #4fc7a5;
+  --brand-fill: #1f6f5c;
+  --brand-fill-hover: #26836d;
+  --on-brand: #ffffff;
+  --brand-wash: rgba(79, 199, 165, 0.12);
+  --focus: rgba(79, 199, 165, 0.45);
+
+  --bg: #0f1513;
+  --surface: #171d1a;
+  --surface-low: #1b211e;
+  --surface-mid: #252b28;
+  --surface-high: #303633;
+  --surface-highest: #3a403d;
+
+  --ink: #dfe4e0;
+  --ink-2: #bec9c3;
+  --ink-3: #88938d;
+
+  --line: #3f4945;
+  --line-strong: #88938d;
+  --hairline: rgba(223, 228, 224, 0.12);
+
+  --accent: #0f4a3b;
+  --accent-ink: #b7f0dc;
+  --notice: #a5ccdf;
+  --danger: #ffb4ab;
+
+  --hover: rgba(223, 228, 224, 0.06);
+  --shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+}

@@ -144,24 +144,6 @@ class InMemoryGroupStore(seed: List<Group> = FakeData.groups) : GroupStore {
         }
     }
 
-    override fun addFile(groupId: String, name: String, sizeBytes: Long, sourceMember: String): GroupFile {
-        val file = GroupFile(
-            id = "f" + nextId++,
-            name = name,
-            sizeBytes = sizeBytes,
-            sourceMember = sourceMember,
-            state = FileState.SEEDING,
-            progressPercent = 100,
-            seeders = 1,
-            teammates = 0,
-            uploadLimitKbps = 0,
-            downloadRateBps = 0L,
-            uploadRateBps = 0L,
-        )
-        update(groupId) { it.copy(files = it.files + file) }
-        return file
-    }
-
     private fun update(groupId: String, block: (Group) -> Group) {
         val index = state.indexOfFirst { it.id == groupId }
         if (index >= 0) state[index] = block(state[index])

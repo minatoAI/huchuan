@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -47,8 +46,8 @@ fun UserNameScreen(
             modifier = Modifier
                 .padding(padding)
                 .fillMaxSize()
-                .padding(24.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+                .padding(Spacing.section),
+            verticalArrangement = Arrangement.spacedBy(Spacing.pageVertical),
         ) {
             OutlinedTextField(
                 value = name,
@@ -70,7 +69,7 @@ fun UserNameScreen(
                 modifier = Modifier.fillMaxWidth(),
             )
 
-            Button(
+            BrandButton(
                 onClick = {
                     if (name.isBlank()) emptyError = true else saving = true
                 },

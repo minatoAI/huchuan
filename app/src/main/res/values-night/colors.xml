@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="window_background">#FF101413</color>
+    <!-- 与 ui/theme/Theme.kt 的 surface 保持一致 -->
+    <color name="window_background">#FF0F1513</color>
 </resources>

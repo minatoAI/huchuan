@@ -1,25 +1,32 @@
 package app.huchuan
 
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import app.huchuan.core.Group
+import app.huchuan.core.GroupFile
 import app.huchuan.core.GroupStore
 import app.huchuan.core.InMemoryGroupStore
 import app.huchuan.core.InMemoryLocalDeviceStore
 import app.huchuan.core.InMemoryNetworkProbe
 import app.huchuan.core.LocalDevice
 import app.huchuan.core.LocalDeviceStore
+import app.huchuan.core.NetworkCheckItem
+import app.huchuan.core.NetworkCheckKind
 import app.huchuan.core.NetworkProbe
+import app.huchuan.core.NetworkReport
+import app.huchuan.core.NetworkStatus
+import app.huchuan.kernel.M1Runtime
 import app.huchuan.ui.FileScreen
 import app.huchuan.ui.GroupScreen
 import app.huchuan.ui.HomeScreen
@@ -28,7 +35,44 @@ import app.huchuan.ui.NetworkScreen
 import app.huchuan.ui.NewGroupScreen
 import app.huchuan.ui.SettingsDrawer
 import app.huchuan.ui.UserNameScreen
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/** 仅 adb 可用的调试入口，界面上不出现任何开关。 */
+object DebugIntent {
+    const val NETWORK = "huchuan.debug.network"
+    const val HOLD = "huchuan.debug.hold"
+
+    /** 手动 IP:port 候选，逗号分隔；给 mDNS 不通的局域网兜底（协议 §3.3）。 */
+    const val MANUAL = "huchuan.debug.manual"
+}
+
+/**
+ * 调试用网络探针：只替换检测结果，不改核心接口。
+ * limited = 降级（仅局域网可用）；failed = 检测失败；offline = 无网络连接。
+ */
+private class DebugNetworkProbe(
+    private val delegate: NetworkProbe,
+    private val mode: String?,
+) : NetworkProbe {
+    override fun check(): NetworkReport = when (mode) {
+        "limited" -> NetworkReport(
+            status = NetworkStatus.FAIL,
+            items = listOf(
+                NetworkCheckItem(NetworkCheckKind.NAT_TYPE, passed = false),
+                NetworkCheckItem(NetworkCheckKind.IPV6, passed = true),
+                NetworkCheckItem(NetworkCheckKind.IPV4, passed = true),
+            ),
+        )
+
+        "failed" -> NetworkReport(status = NetworkStatus.FAIL)
+        "offline" -> NetworkReport(status = NetworkStatus.OFFLINE)
+        else -> delegate.check()
+    }
+}
 
 /** 页面（spec §2）。P7 设置是 P2 上的抽屉，不占独立目的地。 */
 sealed interface Destination {
@@ -48,13 +92,14 @@ sealed interface Destination {
 }
 
 /**
- * 界面状态：内存假数据 + 返回栈。revision 是数据变更的版本号，
- * 页面通过读取它订阅内存 store 的变化（M1 用内存实现，不需要 Flow）。
+ * 界面状态：数据全部来自 [GroupStore]（真机上是 M1 内核的投影），
+ * 另加一个返回栈。revision 是刷新版本号：页面读它就订阅了数据变化。
  */
 class HuchuanState(
     val groups: GroupStore,
     val device: LocalDeviceStore,
     val probe: NetworkProbe,
+    val runtime: M1Runtime? = null,
 ) {
     private val stack = mutableStateListOf<Destination>(Destination.Network(fromSettings = false))
 
@@ -106,6 +151,7 @@ class HuchuanState(
 
     /** 加入或创建成功 → P3，且 P3 的系统返回必须落到 P2。 */
     fun openGroup(groupId: String) {
+        runtime?.prefs?.clearUnread(groupId)
         stack.clear()
         stack.add(Destination.Home)
         stack.add(Destination.GroupPage(groupId))
@@ -114,20 +160,76 @@ class HuchuanState(
     fun touch() {
         revision++
     }
+
+    // ------------------------------------------------------------------ 需要内核的动作（一律离开界面线程）
+
+    /** P5「加入」：只给后 8 位，内核自己去发现 + 连接。 */
+    suspend fun joinGroup(tail8: String): Group? = withContext(Dispatchers.IO) {
+        groups.joinGroup(tail8)
+    }
+
+    /**
+     * P5「新建群组」。内核要注册 mDNS 服务、写 state.json —— 都是网络/磁盘动作，
+     * 放到界面线程会被 Android 直接抛 NetworkOnMainThreadException。
+     */
+    suspend fun createGroup(name: String): Group = withContext(Dispatchers.IO) {
+        groups.createGroup(name)
+    }
+
+    /** P4 发评论：签名后要广播给对端，同样不能占界面线程。 */
+    suspend fun addComment(groupId: String, fileId: String, body: String, parentId: String?) {
+        withContext(Dispatchers.IO) {
+            groups.addComment(groupId, fileId, body, parentId)
+        }
+        touch()
+    }
+
+    /** P3「添加文件」：SAF URI → 私有目录副本 → 做种 → 广播 file.add。 */
+    suspend fun shareDocument(groupId: String, uri: Uri): GroupFile? = withContext(Dispatchers.IO) {
+        runtime?.importAndShare(groupId, uri)
+    }
+
+    /** P4 激活/休眠：真起真停 BT 任务。 */
+    suspend fun setFileActive(groupId: String, fileId: String, active: Boolean) {
+        withContext(Dispatchers.IO) {
+            groups.setFileActive(groupId, fileId, active)
+        }
+        touch()
+    }
 }
 
 @Composable
 fun HuchuanApp(
-    state: HuchuanState = remember {
-        HuchuanState(
-            groups = InMemoryGroupStore(),
-            device = InMemoryLocalDeviceStore(),
-            probe = InMemoryNetworkProbe(),
-        )
+    runtime: M1Runtime? = null,
+    debugNetwork: String? = null,
+    debugHold: String? = null,
+    state: HuchuanState = remember(runtime, debugNetwork) {
+        if (runtime != null) {
+            HuchuanState(
+                groups = runtime.store,
+                device = runtime.prefs,
+                probe = DebugNetworkProbe(runtime.probe, debugNetwork),
+                runtime = runtime,
+            )
+        } else {
+            HuchuanState(
+                groups = InMemoryGroupStore(),
+                device = InMemoryLocalDeviceStore(),
+                probe = DebugNetworkProbe(InMemoryNetworkProbe(), debugNetwork),
+            )
+        }
     },
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+
+    // 内核在别的线程改状态（进度、对端评论、成员上线），界面靠这个节拍刷新。
+    LaunchedEffect(state) {
+        while (isActive) {
+            delay(REFRESH_MS)
+            state.touch()
+        }
+    }
 
     fun goBack() {
         val leaving = state.current
@@ -149,19 +251,13 @@ fun HuchuanApp(
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
-            SettingsDrawer(
-                state = state,
-                onDiagnostics = {
-                    scope.launch { drawerState.close() }
-                    state.push(Destination.Network(fromSettings = true))
-                },
-            )
+            SettingsDrawer(state = state)
         },
     ) {
         when (val destination = state.current) {
             is Destination.Network -> NetworkScreen(
                 state = state,
-                fromSettings = destination.fromSettings,
+                holdAt = debugHold,
                 onEnter = {
                     if (state.deviceState.userNameUnset) {
                         state.push(Destination.UserName)
@@ -169,7 +265,6 @@ fun HuchuanApp(
                         state.enterHome()
                     }
                 },
-                onBack = { goBack() },
             )
 
             Destination.UserName -> UserNameScreen(
@@ -183,7 +278,9 @@ fun HuchuanApp(
                 state = state,
                 onOpenSettings = { scope.launch { drawerState.open() } },
                 onNewGroup = { state.push(Destination.NewGroup(firstLaunch = false)) },
-                onOpenGroup = { state.push(Destination.GroupPage(it)) },
+                onOpenGroup = {
+                    state.openGroup(it)
+                },
             )
 
             is Destination.GroupPage -> GroupScreen(
@@ -211,3 +308,6 @@ fun HuchuanApp(
         }
     }
 }
+
+/** 界面刷新节拍：内核状态变化不推事件，按固定节拍重读。 */
+private const val REFRESH_MS = 700L
