@@ -1,0 +1,16 @@
+# 构建产物
+build/
+.gradle/
+local.properties
+captures/
+.cxx/
+
+# 本机私有
+.idea/
+*.iml
+.DS_Store
+
+# 不纳入版本库的临时目录
+spikes/
+artifacts/
+windows/build/

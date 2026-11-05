@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 文案唯一来源：逐条对应 docs/design/product-spec.md §3 各页「文案」行，字面照抄，不得改写。 -->
+<resources>
+    <string name="app_name">互传</string>
+
+    <!-- 通用 -->
+    <string name="common_back">返回</string>
+    <string name="common_retry">重试</string>
+    <string name="unit_kbps">KB/s</string>
+
+    <!-- P0 网络检测 -->
+    <string name="p0_title">网络检测</string>
+    <string name="p0_pass">可互传</string>
+    <string name="p0_limited">仅本机可用</string>
+    <string name="p0_change_network">请换网络后重测</string>
+    <string name="p0_retest">重测</string>
+    <string name="p0_enter">进入</string>
+    <string name="p0_failed">检测失败</string>
+    <string name="p0_offline">无网络连接</string>
+    <string name="p0_checking">正在检测网络</string>
+    <string name="p0_item_nat">NAT 类型</string>
+    <string name="p0_item_ipv6">IPv6</string>
+    <string name="p0_item_ipv4">IPv4</string>
+
+    <!-- P1 用户名 -->
+    <string name="p1_title">用户名</string>
+    <string name="p1_save">保存</string>
+    <string name="p1_empty">请输入用户名</string>
+    <string name="p1_max_length">最多 20 字</string>
+    <string name="p1_saving">保存中</string>
+    <string name="p1_save_failed">保存失败</string>
+
+    <!-- P2 首页 -->
+    <string name="p2_search">搜索群组</string>
+    <string name="p2_empty">还没有群组</string>
+    <string name="p2_seeding">做种 %1$d</string>
+    <string name="p2_team">组队 %1$d 人</string>
+    <string name="p2_unread">%1$d 条新消息</string>
+    <string name="p2_settings">设置</string>
+    <string name="p2_new_group">+</string>
+    <string name="p2_load_failed">加载失败，重试</string>
+    <string name="p2_offline">离线，仅显示缓存</string>
+
+    <!-- P3 群组 -->
+    <string name="p3_add_file">添加文件</string>
+    <string name="p3_members">成员（%1$d 人）</string>
+    <string name="p3_state_seeding">做种中</string>
+    <string name="p3_state_sleeping">休眠</string>
+    <string name="p3_state_downloading">下载中</string>
+    <string name="p3_team">组队 %1$d 人</string>
+    <string name="p3_seeders">做种 %1$d</string>
+    <string name="p3_empty">还没有文件</string>
+    <string name="p3_load_failed">加载失败，重试</string>
+    <string name="p3_offline">离线，显示缓存</string>
+
+    <!-- P4 文件详情 -->
+    <string name="p4_activate">激活</string>
+    <string name="p4_sleep">休眠</string>
+    <string name="p4_teaming">正在组队 · %1$d 人</string>
+    <string name="p4_seeders">做种者 %1$d</string>
+    <string name="p4_waiting_seeder">等待做种者</string>
+    <string name="p4_comment_hint">写评论</string>
+    <string name="p4_send">发送</string>
+    <string name="p4_no_comments">还没有评论</string>
+    <string name="p4_reply">回复 %1$s</string>
+    <string name="p4_upload_limit">单文件限速</string>
+    <string name="p4_unlimited">不限</string>
+    <string name="p4_source">来源 %1$s</string>
+    <string name="p4_connecting">正在连接做种者</string>
+    <string name="p4_connect_failed">连不上做种者，重试</string>
+    <string name="p4_offline">离线，等待上线</string>
+
+    <!-- P5 新群组 -->
+    <string name="p5_title">新群组</string>
+    <string name="p5_join">加入</string>
+    <string name="p5_joining">加入中</string>
+    <string name="p5_create_group">新建群组</string>
+    <string name="p5_invite_hint">邀请码后 8 位</string>
+    <string name="p5_invite_wrong">邀请码不对</string>
+    <string name="p5_group_name_default">%1$s的群组</string>
+    <string name="p5_create">创建</string>
+    <string name="p5_join_failed">加入失败</string>
+    <string name="p5_offline">离线，无法加入</string>
+
+    <!-- P6 成员 -->
+    <string name="p6_title">成员</string>
+    <string name="p6_online">在线</string>
+    <string name="p6_seeding">做种 %1$d</string>
+    <string name="p6_invite_code">邀请码</string>
+    <string name="p6_copied">已复制</string>
+    <string name="p6_empty">暂无成员</string>
+    <string name="p6_load_failed">加载失败，重试</string>
+    <string name="p6_offline">离线，显示缓存</string>
+
+    <!-- P7 设置 -->
+    <string name="p7_title">设置</string>
+    <string name="p7_user_name">用户名</string>
+    <string name="p7_global_limit">全局限速</string>
+    <string name="p7_upload">上行</string>
+    <string name="p7_download">下行</string>
+    <string name="p7_unlimited">不限</string>
+    <string name="p7_notification">通知</string>
+    <string name="p7_network_diagnostics">网络诊断</string>
+    <string name="p7_notify_bubble">系统气泡</string>
+    <string name="p7_notify_in_app">仅应用内</string>
+    <string name="p7_notify_muted">静音</string>
+    <string name="p7_reading">读取中</string>
+    <string name="p7_read_failed">读取失败，重试</string>
+    <string name="p7_offline_editable">离线可改，联网后生效</string>
+</resources>
