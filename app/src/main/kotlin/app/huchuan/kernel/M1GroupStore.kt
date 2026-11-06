@@ -23,9 +23,6 @@ import java.util.Locale
  */
 class M1GroupStore(private val rt: M1Runtime) : GroupStore {
 
-    /** 单文件限速（协议 §4）：界面设置过才记，0 表示不限。 */
-    private val uploadLimits = HashMap<String, Int>()
-
     // ------------------------------------------------------------------ GroupStore
 
     override fun groups(): List<Group> = rt.kernel.groups().map { toGroup(it) }
@@ -56,7 +53,10 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
             group.stopFile(fileId)
             return
         }
-        if (group.localRole(fileId) != GroupRuntime.LocalRole.NONE) return
+        if (group.localRole(fileId) != GroupRuntime.LocalRole.NONE) {
+            reapplyFileLimit(group, fileId)
+            return
+        }
         if (entry.addedBy == rt.kernel.deviceId) {
             // 自己做种的文件被休眠过：从私有目录里的副本重新做种。
             val copy = File(rt.shareDir, entry.name)
@@ -68,12 +68,34 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
         } else {
             group.startDownload(fileId)
         }
+        // 限速挂在 torrent handle 上，休眠时连 handle 一起没了：重新挂回会话后补一次。
+        reapplyFileLimit(group, fileId)
     }
 
+    /**
+     * P4 单文件限速（协议 §4：一文件一 torrent + setUploadLimit），单位 KB/s，0 = 不限。
+     *
+     * 先落盘再下发：界面每敲一个数字调一次，进程随时可能被杀，设置不能只活在内存里。
+     * 0 会真的把 handle 上的限制清掉（libtorrent 的 0 就是不限），不是「跳过不设」。
+     */
     override fun setFileUploadLimit(groupId: String, fileId: String, kbps: Int) {
+        val limit = kbps.coerceAtLeast(0)
+        rt.prefs.setFileUploadLimitKbps(fileId, limit)
         val group = rt.kernel.group(groupId) ?: return
-        uploadLimits[fileId] = kbps.coerceAtLeast(0)
-        group.setUploadLimitKbps(fileId, kbps)
+        group.setUploadLimitKbps(fileId, limit)
+        Log.i(
+            M1Runtime.TAG,
+            "event=file_upload_limit group_id=" + groupId + " file_id=" + fileId +
+                " kbps=" + limit + " applied=" + (group.localRole(fileId) != GroupRuntime.LocalRole.NONE),
+        )
+    }
+
+    /** 把落盘的单文件限速重新下发给一个已经挂回会话的 torrent。 */
+    fun reapplyFileLimit(group: GroupRuntime, fileId: String) {
+        val limit = rt.prefs.fileUploadLimitKbps(fileId)
+        if (limit <= 0) return
+        group.setUploadLimitKbps(fileId, limit)
+        Log.i(M1Runtime.TAG, "event=file_upload_limit_reapplied file_id=" + fileId + " kbps=" + limit)
     }
 
     override fun addComment(groupId: String, fileId: String, body: String, parentId: String?) {
@@ -135,8 +157,10 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
             FileState.DOWNLOADING -> group.percent(entry.fileId)
             FileState.SLEEPING -> if (onDisk) 100 else 0
         }
-        val peers = group.peerCount(entry.fileId)
-        val teammates = if (state == FileState.DOWNLOADING) (peers - 1).coerceAtLeast(0) else 0
+        // 队友数只有一个来源：内核的观测读口（docs/design/product-spec.md §306）。
+        // 以前这里写的是 peerCount - 1，会把做种者算成队友、也不会在 100% 时归零；
+        // GroupRuntime.teammates 数的才是「真互连、非做种者、本机仍处于部分」的成员。
+        val teammates = group.teammates(entry.fileId)
         val seeders = (if (entry.addedBy == rt.kernel.deviceId) 0 else 1) +
             (if (state == FileState.SEEDING) 1 else 0)
         val comments = group.visibleOps(entry.fileId).map { op ->
@@ -157,7 +181,7 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
             progressPercent = percent,
             seeders = seeders,
             teammates = teammates,
-            uploadLimitKbps = uploadLimits[entry.fileId] ?: 0,
+            uploadLimitKbps = rt.prefs.fileUploadLimitKbps(entry.fileId),
             downloadRateBps = if (state == FileState.DOWNLOADING) group.downloadRateBps(entry.fileId) else 0L,
             uploadRateBps = if (state == FileState.SEEDING) group.uploadRateBps(entry.fileId) else 0L,
             comments = comments,

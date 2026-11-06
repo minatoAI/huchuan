@@ -44,7 +44,7 @@ public final class DesktopPeer {
             if (args.length == 0) {
                 System.err.println("usage: DesktopPeer <host|join> data=<dir> work=<dir> [name=..] [tail8=..] [manual=ip:port] "
                         + "[msg_port=..] [bt_port=..] [share=path1,path2] [comment=..] [expect_comment=..]"
-                        + " [echo=..] [echo_delay_ms=..] [download=0|1] [hold=seconds]");
+                        + " [echo=..] [echo_delay_ms=..] [download=0|1] [hold=seconds] [control=<file>]");
                 System.exit(2);
             }
             String role = args[0];
@@ -295,10 +295,27 @@ public final class DesktopPeer {
             System.out.flush();
         }
 
-        // ---------------------------------------------------------- 6. 一直做种
+        // ---------------------------------------------------------- 6. 一直做种（+ 按需下载）
+        // control=<文件>：脚本往里写一行 "download=<文件名>"，这里就把对端的同名文件拉一份。
+        // 何时开始传由脚本决定，速率在这里量（startDownload → isComplete 的墙钟差），不靠日志猜。
+        // 真机验收用它验「P7 全局限速生效 / 清掉限制后恢复」。
+        String controlPath = opts.getOrDefault("control", "");
+        java.util.Set<String> controlDone = new java.util.HashSet<>();
         long holdDeadline = System.currentTimeMillis() + holdSeconds * 1000L;
         while (System.currentTimeMillis() < holdDeadline) {
-            Thread.sleep(2000);
+            if (!controlPath.isEmpty()) {
+                for (String command : readControl(controlPath)) {
+                    if (!command.startsWith("download=")) {
+                        continue;
+                    }
+                    String wanted = command.substring("download=".length()).trim();
+                    if (wanted.isEmpty() || !controlDone.add(wanted)) {
+                        continue;
+                    }
+                    autoDownload(kernel, group, wanted);
+                }
+            }
+            Thread.sleep(400);
         }
         System.out.println("PEER hold_done shared=" + shared.size());
         System.out.println("RESULT=PASS");
@@ -308,6 +325,85 @@ public final class DesktopPeer {
     }
 
     // ------------------------------------------------------------------ 工具
+
+    /** 控制文件全文（一行一条命令）；不存在/读不到就是空表。 */
+    static List<String> readControl(String path) {
+        try {
+            Path file = Paths.get(path);
+            if (!Files.isRegularFile(file)) {
+                return java.util.Collections.emptyList();
+            }
+            return Files.readAllLines(file);
+        } catch (Throwable ignored) {
+            return java.util.Collections.emptyList();
+        }
+    }
+
+    /**
+     * 按需下载一个对端文件，并把实测速率打出来。
+     *
+     * kbps 的分母是 startDownload 到 isComplete 的墙钟时间：稳态限速下会贴着标称值，
+     * 不限速时远高于它 —— 这就是「限速生效 / 已清掉」的判据。
+     */
+    static void autoDownload(M1Kernel kernel, GroupRuntime group, String name) throws Exception {
+        FileEntry entry = null;
+        long seenDeadline = System.currentTimeMillis() + 120_000L;
+        while (System.currentTimeMillis() < seenDeadline) {
+            for (FileEntry candidate : group.files()) {
+                if (candidate.getName().equals(name) && !candidate.getAddedBy().equals(kernel.getDeviceId())) {
+                    entry = candidate;
+                    break;
+                }
+            }
+            if (entry != null) {
+                break;
+            }
+            Thread.sleep(200);
+        }
+        if (entry == null) {
+            System.out.println("PEER auto_done name=" + clean(name) + " complete=false reason=file_not_seen");
+            System.out.flush();
+            return;
+        }
+        long startedAt = System.currentTimeMillis();
+        boolean started = group.startDownload(entry.getFileId());
+        System.out.println("PEER auto_download name=" + clean(name)
+                + " file_id=" + entry.getFileId()
+                + " size=" + entry.getSize()
+                + " started=" + started);
+        System.out.flush();
+        if (!started) {
+            return;
+        }
+        long deadline = System.currentTimeMillis() + DOWNLOAD_TIMEOUT_MS;
+        long lastSample = 0L;
+        while (System.currentTimeMillis() < deadline && !group.isComplete(entry.getFileId())) {
+            long now = System.currentTimeMillis();
+            // 每 2 s 打一行瞬时速率与 BT 连接数：均速会把「连接慢」和「限速低」混在一起，
+            // 这两行能直接分开看（peers 是 libtorrent 看到的该 torrent 连接数）。
+            if (now - lastSample >= 2000L) {
+                lastSample = now;
+                System.out.println("PEER auto_progress name=" + clean(name)
+                        + " pct=" + (int) (group.progress(entry.getFileId()) * 100.0)
+                        + " peers=" + group.peerCount(entry.getFileId())
+                        + " rate_kbps=" + (group.downloadRateBps(entry.getFileId()) / 1024L));
+                System.out.flush();
+            }
+            Thread.sleep(100);
+        }
+        long elapsedMs = System.currentTimeMillis() - startedAt;
+        boolean complete = group.isComplete(entry.getFileId());
+        File saved = group.savedFile(entry.getFileId());
+        long bytes = (saved != null && saved.isFile()) ? saved.length() : 0L;
+        long kbps = elapsedMs > 0 ? (bytes / 1024L) * 1000L / elapsedMs : 0L;
+        System.out.println("PEER auto_done name=" + clean(name)
+                + " complete=" + complete
+                + " bytes=" + bytes
+                + " elapsed_ms=" + elapsedMs
+                + " kbps=" + kbps
+                + " sha256=" + (saved != null && saved.isFile() ? sha256(saved) : ""));
+        System.out.flush();
+    }
 
     static FileEntry waitRemoteFile(M1Kernel kernel, GroupRuntime group, long timeoutMs) throws Exception {
         long deadline = System.currentTimeMillis() + timeoutMs;

@@ -96,7 +96,43 @@ P6 的离线文案因此由 `离线，显示缓存` 收成 `离线`（`p6_offlin
 这条不是风格问题——真机上界面线程写 socket 会抛 `NetworkOnMainThreadException`，
 内核的 `sendQuietly` 会因此把整条对端连接关掉（本轮踩过一次：评论发不出去，对端也掉线）。
 
-### 2.6 adb 调试入口（界面上没有开关）
+### 2.6 组队通告与限速（脚本第 9 / 12 步）
+
+**组队通告只做通告**（spec §306）：不调 `piecePriority`、不改 libtorrent 片调度，最坏情况与不显示时一致。
+
+| 位置 | 数据源 | 显示规则 |
+| --- | --- | --- |
+| P3 文件行 | `GroupFile.teammates`（`M1GroupStore` 读 `GroupRuntime.teammates(fileId)`） | 队友 ≥ 1 才出次级 chip「组队 n 人」，n = 队友数 + 1；0 时整枚不出现（不是「组队 0 人」） |
+| P4 进度区 | 同上 | 队友 ≥ 1 时一行「正在组队 · n 人」，n = 队友数 + 1；本机到 100% 立刻消失 |
+
+- 队友数只有一个来源：内核的观测读口（真互连、对端不是做种者、本机仍处于「部分」）。
+  界面里那条 `(peerCount - 1)` 的老算法已删——它会把做种者算成队友，100% 也不归零。
+- 「立刻消失」有两层保险：内核在文件 100% 时 `teammates()` 直接回 0；界面的 `GroupFile.showsTeam()`
+  再卡一次 `progressPercent < 100`，覆盖「进度打满、状态还没翻页」的那一拍。
+- 刷新靠内核事件：队友数变化走 `teammates_changed`，手机侧 `LogcatEvents` 收到就推一次重读，
+  **界面没有定时器**。
+
+**限速**（两处都标 KB/s，内核内部 ×1024 转字节/秒）：
+
+| 入口 | 落点 | 0 的含义 | 重启后 |
+| --- | --- | --- | --- |
+| P4 单文件限速 | `GroupRuntime.setUploadLimitKbps(fileId, kbps)` → `TorrentHandle.setUploadLimit(kbps×1024)` | 清掉该 torrent 的限制 | `AppPrefs.file_limit.<fileId>` 落盘，冷启动与重新激活时重放 |
+| P7 全局限速（上/下） | `M1Kernel.setSessionUploadLimit / setSessionDownloadLimit` → libtorrent 会话级 `upload_rate_limit` / `download_rate_limit` | 不限（`不限`开关 = 两项都下发 0） | `AppPrefs` 落盘，冷启动 `M1Runtime.reapplyStoredLimits()` 重放 |
+
+- 全局限速是**会话级**：走 `applySettings`，运行期立即生效，对已经在传的 torrent 同样有效；
+  和单文件限速同时存在时，每个 torrent 取更小的那个。
+- 真机判据（脚本第 12 步，三份 32 MiB 素材各管一件事）：P4 设 1024 → 桌面端稳态 965 KB/s、
+  均速 958，清空输入框后 `kbps=0`；P7 设上行 512 → 另一份稳态 494 KB/s、均速 481；
+  清掉限制后第三份 10853 KB/s（多轮在 8.4–11.7 MB/s 区间）。
+  两条限速都带内核读回（`session_up_kbps=512 ok=true` / `kbps=1024 applied=true`），
+  防「设置成功但没生效」。
+- **判据用稳态，不用均速**：稳态 = 桌面端 `auto_progress` 里 libtorrent 报的瞬时速率中位数
+  （丢掉前 3 个样本）。均速会被建链/起步稀释 —— 同一套 P4 参数有一轮均速只有 327 KB/s，
+  而稳态是 981；用均速会把它误判成「限速只有标称的 1/3」。
+- 下发串行化：输入框每敲一位就下发一次（5 → 51 → 512），统一丢进 `M1Runtime.limitDispatcher`
+  这个单线程，保证最后一次输入就是最后一次落地，且不占界面线程。
+
+### 2.7 adb 调试入口（界面上没有开关）
 
 | extra | 作用 |
 | --- | --- |
@@ -104,7 +140,7 @@ P6 的离线文案因此由 `离线，显示缓存` 收成 `离线`（`p6_offlin
 | `huchuan.debug.hold=boot\|checking\|result` | 停在 P0 某阶段供截图 |
 | `huchuan.debug.manual=ip:port[,ip:port]` | 加入时的手动候选（mDNS 不通时兜底） |
 
-### 2.7 做种计数与重启续种（脚本第 11 步）
+### 2.8 做种计数与重启续种（脚本第 11 步）
 
 两条都在真机上验，不靠单测结论：
 
@@ -160,9 +196,20 @@ quick 模式下对端没共享压力文件，所以这两条就是「0 → 1」�
 
 ```
 DesktopPeer host data=<dir> work=<dir> [name=..] [group_name=..] [msg_port=47100] [bt_port=51413]
-               [share=a,b,c] [echo=<正文>] [echo_delay_ms=..] [hold=秒]
+               [share=a,b,c] [echo=<正文>] [echo_delay_ms=..] [hold=秒] [control=<文件>]
 DesktopPeer join data=<dir> work=<dir> tail8=XXXXXXXX [manual=ip:port] [download=0|1]
 ```
+
+`control=<文件>` 是给限速验收用的「按需下载」通道：脚本往这个文件里追加一行 `download=<文件名>`，
+对端每 400 ms 读一次，把对端的同名文件拉一份，并打出
+
+```
+PEER auto_download name=<文件名> file_id=.. size=.. started=true
+PEER auto_done name=<文件名> complete=true bytes=.. elapsed_ms=.. kbps=.. sha256=..
+```
+
+`kbps` 是 `startDownload` → `isComplete` 的墙钟均值（KB/s）。限速生效时它贴着标称值，
+不限速时远高于标称值 —— 这就是第 12 步判「限住了 / 清掉了」的依据，不靠 logcat 里的瞬时速率猜。
 
 host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → 共享压力文件 → 等对端加入 →
 等对端共享的文件 → 下载并打印 SHA-256 → 发评论 → 等对端回评论 →（`echo=` 给了就延迟补一条评论）
@@ -212,6 +259,19 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 | `crash_buffer.app_crash_0` | crash 缓冲区里没有 `app.huchuan` 的崩溃（缓冲区是全局的，uiautomator 的崩溃单列） |
 | `no_scudo_abort` | 全量 logcat 里没有 `Scudo` / `Fatal signal` / `Abort message` |
 | `no_anr` | 没有 `ANR in app.huchuan` |
+| `team.p3_no_chip_at_0` | 0 队友时 P3 文件行不出现「组队」字样（ui-dump --texts 取全屏文本） |
+| `team.p4_no_line_at_0` | 0 队友时 P4 不出现「正在组队」 |
+| `team.no_teammate_events` | 整个流程里没有任何 `teammates_changed count>0`（0 是常态，界面不靠定时器） |
+| `limit.file_set_1024` | P4 单文件限速输入 1024 → `file_upload_limit ... kbps=1024 applied=true`（applied = 该 torrent 已在会话里） |
+| `limit.file_1024_enforced` | 桌面端下载该 32 MiB 的**稳态**速率 ≤ 1229 KB/s（标称 1024 留 20% 余量；下限 100 只证明在传） |
+| `limit.file_cleared` | 清空输入框 → `file_upload_limit ... kbps=0 applied=true`（0 = 不限，真的把 handle 上的限制清掉） |
+| `limit.global_set_512` | P7 上行改成 512：`global_limit_set up_kbps=512`（单位 KB/s） |
+| `limit.global_applied` | 读回校验：`global_limit_applied ... session_up_kbps=512 ... ok=true`（读的是会话里生效的值，不是本地偏好） |
+| `limit.global_512_enforced` | 桌面端下载另一份 32 MiB 的**稳态**速率 ≤ 600 KB/s（标称 512 留 20% 余量，下限 200 防呆） |
+| `limit.global_cleared` / `limit.global_applied_cleared` | 「不限」把两项都下发 0，并读回 `session_up_kbps=0 ok=true` |
+| `limit.cleared_speed_restored` | 清掉限制后第三份同尺寸文件实测 > 2048 KB/s（2 MB/s） |
+| `limit.global_restored_after_restart` | 冷启动后按偏好重新下发 512：`global_limit_applied ... session_up_kbps=512 ... ok=true` 的条数比重启前多一条（限速不落内核盘，只靠 app 重放） |
+| `limit.restored_logged` | 冷启动日志里有 `limits_restored files=N`（全局限速 + 每个文件的限速都在这里重放） |
 
 ## 5. 产物
 
@@ -220,7 +280,11 @@ artifacts/m1-device/
   screenshots/     关键界面截图（P1、P5 输入、P3、SAF、P4 评论、P2 角标前后、每轮完成、
                    成员页 final-members（做种计数）、 restart-p2 / restart-p3 / restart-p4 /
                    restart-members（force-stop 冷启动一路的证据）、
-                   restart-reconnect / restart-p6-online（冷启动自动重连与 P6 实时在线））
+                   restart-reconnect / restart-p6-online（冷启动自动重连与 P6 实时在线）、
+                   p3-no-team-chip / p4-no-team-line（组队 0 态）、
+                   p12-p4-file-limit-1024 / p12-p4-file-limit-cleared（P4 单文件限速设与清）、
+                   p12-p7-limit-512 / p12-p7-limit-cleared（P7 全局限速设与清，抽屉里拍的）、
+                   p12-files-seeding / p12-unlimited-download）
   ui-dumps/        失败现场的界面层级
   logs/app-logcat.log        只含 huchuan/m1 事件
   logs/full-logcat.log       全量（Scudo/ANR 断言用）
@@ -244,7 +308,12 @@ artifacts/m1-device/
    脚本因此单独断言 `join.mdns_discovered`（看 `lan=`），不拿 `join_via` 当唯一依据。
    本机同时有 Wi-Fi（192.168.31.218）和 VPN（172.30.236.122/32）两张网卡，
    `LanDiscovery` 会优先绑「私有 IPv4 且不是 /32 点对点」的那张，并把解析到的每个地址都出成候选。
-4. **全局限速没接内核**：P7 的上下行限速只存设置；M1 内核只实现了单文件限速（协议 §4）。
+4. **组队通告只验了 0 态**（单台手机跑不出队友 ≥ 1）：M1 的验收链路永远是「一端做种、一端下载」，
+   而 spec §306 明确做种者不计入队友；--quick 又跳过手机自己下载的压力轮。所以
+   P3 chip / P4「正在组队 · n 人」的**0 态（不显示）**有真机断言，
+   **n ≥ 1 的展示只有代码路径与口径，没有真机证据**。
+   要补：两台手机同时对同一文件处于「部分」，或再起一个**也在下载**的对端（第二个桌面 peer 即可）。
+   这是本轮唯一没能在真机上验到的界面行为，别把它当成已验。
 5. **通知档只存不通知**：M2 才有通知通道。
 6. **「做种 n」对「下完转做种」的设备偏低** —— 已修（2026-11-06）。缺陷现象、修法与现场证据见 §7-4；
    本文件对应的断言是 `p6.peer_seeding_after_download` 与 `peer_announce.seeds_after_download`。

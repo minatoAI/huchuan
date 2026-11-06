@@ -125,7 +125,8 @@ fun FileScreen(
                 )
             }
 
-            if (file.inTeam) {
+            // 组队通告：只显示人数，不动片调度（spec §4.6 / M2）。到 100% 的同一拍就消失。
+            if (file.showsTeam()) {
                 Text(
                     text = stringResource(R.string.p4_teaming, file.teamSize),
                     style = MaterialTheme.typography.bodyMedium,
@@ -182,8 +183,8 @@ fun FileScreen(
                     onValueChange = { input ->
                         val digits = input.filter { it.isDigit() }.take(6)
                         limitText = digits
-                        state.groups.setFileUploadLimit(groupId, file.id, digits.toIntOrNull() ?: 0)
-                        state.touch()
+                        // 清空输入框 = 0 = 不限：真的把 handle 上的限制清掉，不是「跳过不设」。
+                        scope.launch { state.setFileUploadLimit(groupId, file.id, digits.toIntOrNull() ?: 0) }
                     },
                     placeholder = { Text(stringResource(R.string.p4_unlimited)) },
                     suffix = { Text(stringResource(R.string.unit_kbps)) },

@@ -21,6 +21,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.huchuan.R
 import app.huchuan.core.FileState
+import app.huchuan.core.GroupFile
 import app.huchuan.ui.theme.BrandJade
 import java.util.Locale
 
@@ -116,6 +117,15 @@ fun fileStateLabel(state: FileState): String = when (state) {
     FileState.DOWNLOADING -> stringResource(R.string.p3_state_downloading)
     FileState.SLEEPING -> stringResource(R.string.p3_state_sleeping)
 }
+
+/**
+ * 组队是否该出现在界面上（P3 的 chip 与 P4 的「正在组队」行共用这一个判定）。
+ *
+ * 口径（spec §306）：队友数 = 内核观测到的「真互连、非做种者、本机仍处于部分」的成员数；
+ * 本机到 100% 即退出组队，所以这里再卡一次 progress < 100 —— 内核那边 isFinished 为真时
+ * teammates 已经回到 0，这一条是给「进度已经打满、状态还没翻页」的那一拍兜底，保证立刻消失。
+ */
+fun GroupFile.showsTeam(): Boolean = teammates > 0 && progressPercent < 100
 
 /** 状态 chip：只做展示，不给点击语义。强调态用 primaryContainer，跟品牌色同族。 */
 @Composable

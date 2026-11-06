@@ -1,0 +1,30 @@
+# 互传 · Cloudflare Worker 部署配置
+# 三分钟部署见 docs/deploy-cloudflare.md
+name = "huchuan-relay"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+# 用免费的 *.workers.dev 子域，不绑自定义域名（link-share.md §10.1）
+workers_dev = true
+
+# 三个 Durable Object：群 swarm（tracker）、分享注册表、信令房间。
+# 全部使用 SQLite 后端（DO 的 KV 接口在其上可用），免费层即可。
+[[durable_objects.bindings]]
+name = "SWARM"
+class_name = "TrackerSwarm"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "ShareRegistry"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "SignalRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TrackerSwarm", "ShareRegistry", "SignalRoom"]
+
+# 可选：额度接近上限时把 announce interval 从 600 s 调大（link-share.md §10.2 的降频档），
+# 客户端只跟随服务端下发的值，不改客户端。取消注释即可生效。
+# [vars]
+# ANNOUNCE_INTERVAL_SEC = "1800"

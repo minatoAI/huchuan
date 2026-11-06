@@ -2,7 +2,8 @@
 
 - 版本：2026-11-06 · 内核 agent · 对应协议 v0（docs/design/protocol.md，唯一事实源）
 - 状态：**M1 全流程在桌面 JVM 上用两个独立进程跑通**（建群 → 后 8 位加入 → 32 MiB 共享/下载/SHA 一致 → 评论 3 s 内入库 → 全程 dht_nodes=0）
-- M1.5（本轮）：三件事 —— ① **修「组队不成立」的缺陷**：`connectSeeders` 原来「有 1 条 peer 就整轮不拨」，单做种者先被连上后多个下载者永不互连；现在按「每成员一次拨号」，幂等去重 + 复用冷启动重连的退避与预算（`MemberDialPolicy`）。② **修「两端同时拨号永远连不上」的缺陷**：被 `duplicate_link` 裁决关掉的一侧原来只会退避重拨；现在认出「同一成员已有活链路」并直接沿用（`settleOnExistingLink`），僵尸链路不再参与裁决。③ **新增队友数观测读口** `kernel.teammates(gid, fileId)`（数据来自 libtorrent 的 peer 列表，无新协议字段、不用 0x53）。E0 实测 `D=1.1394 / T_all=301.7s / peers=2/2` → 结论「只做通告，不做分片」，见 docs/reports/e0-team.md
+- 本轮（P7 全局限速接线前置）：内核补**会话级（全局）限速** —— `setSessionUploadLimit` / `setSessionDownloadLimit` / `sessionUploadLimitKbps` / `sessionDownloadLimitKbps`，运行期改立刻生效、对会话里**已存在**的 torrent 同样生效；入参 KB/s，内部 ×1024 字节/秒，0 = 不限（口径见 §6）。**踩到的坑**：libtorrent 默认把局域网与回环对端排除在全局限速之外（`upload_rate_limit` 只作用在 global peer class 上），只设那两个值时读数一切正常、局域网上一点没慢（实测 16 MiB loopback：设 2048 KB/s 仍按 31 MB/s 跑完）；内核在建会话时把私网段并进 global peer class 修掉（同一流量压到 ≈1.4 MB/s）。顺带修掉「端口兜底用 0」的缺陷（见 §8-2）。app 侧接线不在本轮
+- M1.5（上一轮）：三件事 —— ① **修「组队不成立」的缺陷**：`connectSeeders` 原来「有 1 条 peer 就整轮不拨」，单做种者先被连上后多个下载者永不互连；现在按「每成员一次拨号」，幂等去重 + 复用冷启动重连的退避与预算（`MemberDialPolicy`）。② **修「两端同时拨号永远连不上」的缺陷**：被 `duplicate_link` 裁决关掉的一侧原来只会退避重拨；现在认出「同一成员已有活链路」并直接沿用（`settleOnExistingLink`），僵尸链路不再参与裁决。③ **新增队友数观测读口** `kernel.teammates(gid, fileId)`（数据来自 libtorrent 的 peer 列表，无新协议字段、不用 0x53）。E0 实测 `D=1.1394 / T_all=301.7s / peers=2/2` → 结论「只做通告，不做分片」，见 docs/reports/e0-team.md
 - M1.4（上一轮）：补两个内核缺口 —— ① 冷启动后主动重连群成员（mDNS + 落盘的手动地址 + 上次连过的端点，指数退避 1/2/4/8/16/30 s、每群并发 3），完成后暴露 `KernelEvents.peersChanged` 给 P6；② 完成判定不再等 2 s 巡查节拍，libtorrent 的 `torrent_finished_alert` + 200 ms 兜底巡查当场推 `fileCompleted`（实测：事件比「本进程第一次看到 isComplete」只早 51 ms，另一次跑早 135 ms）。见 §3.3
 - M1.3（上一轮）：做种集合与完成判定合成一份来源（`SeedingLedger`），下载完成即进入做种集合，休眠、文件被移走删掉、数据不完整都移出；重启续种（原 G2）按 `state.json` 里的做种集合恢复做种，文件不在或大小不对就降级为休眠并记日志。修掉真机上「下完转做种自报 seeds=0」的缺陷（docs/m1-device.md §6-6）
 - 不在本文件范围：UI 实现细节（app/ 已通过 `M1Runtime` + `M1GroupStore` 接内核，没有 runtime 时回退 `InMemoryGroupStore`）、tracker 跨网（M2）、Android .so
@@ -19,12 +20,12 @@ bash scripts/m1-headless.sh
 
 1. `./gradlew :core:jar :core:m1Deps :core:m1Native`（构建内核 + 拉依赖 + 解出 `libtorrent4j.dll`）
 2. `javac` 编译 harness（`harness/src/main/java`）
-3. 跑字节层自检 `SelfTest`（128 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；本轮新增冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃）
+3. 跑字节层自检 `SelfTest`（151 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；本轮新增会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃）
 4. 起 A、B 两个 JVM 进程跑 M1 全流程，然后只用 grep 复核日志
 
 产物：`artifacts/m1/log-A.log`、`log-B.log`、`selftest.log`、`a-data/`、`b-data/`（含 `state.json`、`identity.txt`、`downloads/`）。`artifacts/` 不进版本库。
 
-一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **1 分半到 2 分钟**（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3）；脚本的 35 条 CHECK 全 PASS（自检 128 条另计）。
+一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **1 分 40 秒左右**（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；本轮自检里新增的 loopback 限速用例固定多花 ~10 s）；脚本的 35 条 CHECK 全 PASS（自检 151 条另计）。
 
 本轮新增的三条硬断言在 harness 里。`scripts/m1-headless.sh` 本轮不动，它仍然只看 harness 的退出码（`process.rc_0_0` / `catchup.process_rc_0_0_0`）：harness 判 FAIL 即整轮 FAIL，脚本输出里也有对应的证据行。
 
@@ -73,7 +74,7 @@ G1/G3/G4 的运行时验证不在这条脚本里（脚本本轮不动），用�
 | `OpLog.kt` | 评论日志：验签、opId 去重、prev 链、Lamport、乱序 pending、作者游标、读游标 `ReadCursor` / 未读计数 `Unread`（G4） | §6 |
 | `PubRegistry.kt` | 设备公钥库（dev → pub64）与 file.list 条目验签口径 `EntryCheck`（no_sig / no_pub / bad_sig） | §7 §10 |
 | `GroupRuntime.kt` | 一个群的运行时：成员表、文件清单、评论、连接、BT 任务、持久化快照；对外就是 GroupRuntime API。含「每成员一次拨号」(`connectSeeders`)、撞车后沿用既存活链路 (`settleOnExistingLink`)、队友数观测 (`teammates`) | §7 §11 |
-| `BtSession.kt` | libtorrent4j 私有会话：建 v1 私有种、加种/做种、swig `connect_peer`、单文件限速、dht_nodes、做种健康状态 `seedState`、对端列表快照 `peerSnapshot`（队友数与拨号去重的唯一数据源） | §4 §8 |
+| `BtSession.kt` | libtorrent4j 私有会话：建 v1 私有种、加种/做种、swig `connect_peer`、单文件限速、**会话级（P7 全局）限速**（含私网段并进 global peer class）、dht_nodes、做种健康状态 `seedState`、对端列表快照 `peerSnapshot`（队友数与拨号去重的唯一数据源） | §4 §8 |
 | `Seeding.kt` | 「本机在做种的文件」唯一来源 `SeedingLedger`（下载完成进、休眠与文件缺失出、只数清单里还有的）+ 重启续种判定 `SeedRestore` | §7 |
 | `Discovery.kt` | JmDNS `_huchuan._tcp` 注册/浏览；手动 `IP:port` 解析 | §3.1 §3.3 §3.4 |
 | `PeerLink.kt` | 一条消息层连接的全部语义：hello 绑定 → join → sync → 广播 → ping/bye/err | §2.3 §5 §7 §8 |
@@ -143,6 +144,13 @@ group.setSuperSeeding(entry.fileId, true)    // 运行中开关（BEP 16 允许�
 group.connectSeeders(entry.fileId)            // 把已知做种端点接上（swig connect_peer）
 val op = group.comment(entry.fileId, "这条能收到吗？", null) // parent 非空即回复
 group.files(); group.members(); group.visibleOps(fileId)
+
+// P7 全局限速（会话级）：入参 KB/s，0 = 不限；运行期调用立刻生效，对已在传输的 torrent 同样生效
+kernel.setSessionUploadLimit(512)      // 上行 512 KB/s
+kernel.setSessionDownloadLimit(2048)   // 下行 2 MB/s
+kernel.setSessionUploadLimit(0)        // 恢复不限
+kernel.sessionUploadLimitKbps()        // 真值读回（读会话里生效的值），刚设 0 这里就是 0
+kernel.sessionDownloadLimitKbps()
 
 // 展示用端到端时延（毫秒）：减法两边都在本机时钟上，跨设备时钟不同步也不会出负值
 val latencyMs = kernel.latencyMillis(op.author, op.ts, System.currentTimeMillis())
@@ -432,6 +440,7 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 | 评论时延 | 本机时钟口径：`latencyMillis = 本机收到时刻 − (对端 ts − 时钟偏移)`；偏移取历次 `对端 ts − 本机收到时刻` 的最大值（单程时延最小的那一次），只用 hello/join.req/join.ok/peer.announce/member.name 校准。只展示，排序固定 `(lamport, author, seq)` | `M1Kernel.latencyMillis` |
 | 单帧发送失败 | 只丢这一帧并记 `peer_send_failed`；连续 `MAX_CONSECUTIVE_SEND_FAILURES = 3` 帧失败才断链（`peer_link_closed reason=send_failures`） | `PeerLink` companion |
 | 单文件限速 | `setUploadLimitKbps(fileId, n)` 的单位是 **KB/s**：内部 `setUploadLimit(n × 1024)` 字节/秒，0 = 不限。早先按 kbit/s 算（`×1024/8`），实际限速只有标称值的 1/8 | `BtSession.setUploadLimit` |
+| 会话级（P7 全局）限速 | 入参 **KB/s**（0 = 不限），内部 **×1024** 得字节/秒交给 libtorrent（`upload_rate_limit` / `download_rate_limit`）。走 `applySettings` 下发，**运行期立刻生效**，作用在本会话的带宽通道上，会话里所有 torrent（含已在传的）一起受约束；与单文件限速同时存在时每个 torrent 取更小的那个。读回读的是会话里生效的值（`session::get_settings()` 同步到会话线程），不是缓存。**私网段与回环段在建会话时被并进 global peer class** —— libtorrent 默认不限额局域网/回环对端，不并类的话限速在局域网上等于没设 | `BtSession.setSessionUploadLimit` / `bindLocalPeersToGlobalClass`、`M1Kernel.setSessionUploadLimit` |
 | join 限速 | 计数单位是**校验失败次数**（滑动窗口，成功不计数）：5 次/10 min/源 IP、30 次/h/群 | `JoinRateLimiter` |
 | 帧限速 | 60 帧/s/连接，每秒重置；超了回 `E_RATE` 并断开 | `PeerLink.MAX_FRAMES_PER_SECOND` |
 | connect_peer 拨号（M1.5） | **每成员一次**，去重键 `fileId@dev`；已互连不重拨，未连上的按 `ReconnectPolicy` 退避（1/2/4/8/16/30 s 封顶）重试，每轮最多 3 个新拨号 | `MemberDialPolicy`、`GroupRuntime.connectSeeders` |
@@ -468,7 +477,7 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 ## 8. 退化点（实现里真实存在，不是设想）
 
 1. **mDNS 不可用 → 手动 IP:port。** JmDNS 3.6.2 在本机两进程实测可用（`join_candidates lan=1`，加入走 `source=lan`）。若运行环境没有组播（虚拟网卡、被防火墙拦、Android 没拿 MulticastLock），浏览结果为空，`joinByTail8` 自动退到调用方给的手动候选；日志 `join_candidates lan=0` 且 `join_via source=manual`。脚本对 `lan>=1` 是**硬断言**：`lan=0` 直接 `CHECK FAIL mdns.discovered_lan_candidate` 并打 `DEGRADED`，不允许静默降级到手动 IP:port（手动候选只用于兜底联通性，不替 mDNS 背书的发现层）。
-2. **端口占用顺延。** 消息层 47100→47101…47199→系统分配；BT 51413→51413+99→系统分配。两个进程同一台机器时 A 拿默认口、B 顺延（日志里 `msg_port=47101 bt_port=51513` 就是 B）。
+2. **端口占用顺延。** 消息层 47100→47101…47199→系统分配；BT 51413→51413+99→系统分配。两个进程同一台机器时 A 拿默认口、B 顺延（日志里 `msg_port=47101 bt_port=51513` 就是 B）。**BT 侧的最后一级兜底本轮修过**：原来直接把 `listen_interfaces="0.0.0.0:0"` 交给 libtorrent，实测 2.1.0-39 会报 `listen_port>0`、`is_listening=true`，但那个端口根本不接 TCP（外部 connect 直接 ConnectException），于是兜底出来的会话收不到任何入向连接，还看不出报错。现在先在 JVM 里用 `ServerSocket(0)` 要一个空闲端口再交下去（`BtSession.freePort`，最多试 5 次），`btHint=0` 的场景实测可以正常做种/下载。
 3. **候选连接顺序：lan 优先、manual 兜底。** §3.4 的 `manual(3) > lan(2)` 是「同一个 endpoint 去重时记谁」的优先级；两者 key 不同时不构成同键冲突，这里按 M1「mDNS 是主路径」（§3.1）先试 lan。
 4. **Windows/MSYS 路径。** 脚本对 java/javac 一律用 `cygpath -m`（`E:/a/b`）：`javac` 的 `@argfile` 会把反斜杠当转义符，用 `cygpath -w` 会读不到源文件。
 
@@ -483,7 +492,7 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 - **撞车断言的证伪边界。** `harness/reconnect-race.sh` 在 loopback 上跑：TCP 是全双工且 EOF 必达，对称竞态本身能收敛，所以「永不 attach」这一症状要真机切断网络（半开连接）才复现。夹具因此把判据做成「撞车兜底必须走到（`race_settled ≥ 1`）+ 撞完 60 s 不抖」，并用 `-Dhuchuan.mutants=no_link_fallback` 反向臂证明它有证伪力；真机上的半开连接路径仍未自动化覆盖。
 - **无 tracker、无跨网。** M1 只有 mDNS + 手动。
 - **评论的 seq 空洞只标记不补齐**：`pending` 池按 prev 链挂起（512 条/作者、10 min），没有做「按游标回补」的端到端用例。
-- **限速只做到接口**：`setUploadLimitKbps` 已接到 `TorrentHandle`，单位是 KB/s（见 §6 口径表），但验收脚本没压测限速数值；真机脚本用 `throttle=1:2048` 间接验过一次。
+- **限速的验收边界**：单文件限速（`setUploadLimitKbps`）只接到 `TorrentHandle`，验收脚本没压测它的数值，真机脚本用 `throttle=1:2048` 间接验过一次；会话级（P7 全局）限速本轮在 SelfTest 里用 loopback 真流量钉住了「限速后确实慢下来（8 MiB / 1024 KB/s ≥ 5 s）」与「私网对端也在限速范围内」，但仍是回环，**跨网（非私网对端走 global class 的那条路）没有实测**；两个类同时限额时单条连接的瞬时速率会抖动（实测 127 KB/s–3.8 MB/s），看均值不看瞬时。
 - **补同步路径没有自动化覆盖**：常规两进程流程里文件靠 file.add 广播到达，`join.ok` 的 files 快照与 `file.list` 只在「加入时的清单为空」或「重连补差」时触发。快照路径用 `-Dm1.shareFirst=1`（A 先共享再等加入）手工跑过；`file.list` 的线上路径还没有用例，条目签名只在 `SelfTest` 里钉了编码与验签。
 - **`app/tools/peer/DesktopPeer.java` 的时延还是旧口径**（本机墙钟 − 对端 `ts`），跨设备会出负值；内核已给 `M1Kernel.latencyMillis`，桌面工具接上即可（`app/` 不在本轮改动范围）。
 - **群规模 32 人未做硬校验**（协议 §12 的风险）。

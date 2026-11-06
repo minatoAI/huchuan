@@ -26,6 +26,13 @@
 #       冷启动自动重连（restart.reconnect 组，四条）：kernel_started reconnect=on /
 #       reconnect_attempt 的 sources 含 peer / peer_reconnected elapsed_ms ≤ 5000 /
 #       对端 desktop-peer.log 出现 peer_bound role=in；外加 P6 上对端那一行实时变回「在线」。
+#       组队通告 0 态：本机在整个 quick 流程里只做种（不下载），队友必然 0 →
+#       P3 文件行不出现「组队」chip、P4 不出现「正在组队」行（0 就是不显示，不是显示 0）；
+#       logcat 里也不会出现 teammates_changed count≥1。
+#       限速（step 12，单位一律 KB/s）：
+#       P4 单文件限速设 1024 → 桌面端下载 32 MiB 实测 ≤ 1229 KB/s（20% 余量），清空输入框后 kbps=0；
+#       P7 全局限速设上行 512 → 另一份 32 MiB 实测 ≤ 600 KB/s；清掉限制（不限）→ 第三份实测 > 2 MB/s。
+#       两条都带内核读回校验（session_up_kbps=512 / ok=true），防止「设置成功但没生效」。
 # 证据：artifacts/m1-device/（截图、ui-dump、logcat、peer 日志、拉回的文件与哈希）
 #
 # 最后一行打印 PASS / FAIL，退出码 0 / 1。
@@ -263,6 +270,14 @@ back_to_group() {
   return 1
 }
 
+# 回到 P3：先回 P2，再点群行进去。P7 抽屉关掉之后人停在 P2，
+# 只按返回键永远到不了 P3（再按就退出应用了），所以进群这一段必须点。
+enter_group() {
+  back_to_home || return 1
+  tap "$GROUP_NAME" >/dev/null 2>&1 || return 1
+  see_text "添加文件" 25000
+}
+
 # 回到 P2：「搜索群组」是首页搜索框的占位文案，别的页面没有。
 back_to_home() {
   local i
@@ -319,6 +334,87 @@ member_seeding() {
 # 某个成员那一行的在线状态：'在线' / '离线'（内核连接表的实时值，见 restart.reconnect_p6_online）。
 member_status() {
   member_near "$1" '^(在线|离线)$' "${2:-}"
+}
+
+# ---------------------------------------------------------------- 组队通告（step 9）
+
+# 当前界面上的文本行（devkit ui-dump --texts）。断言「某字眼不出现」时用它，
+# 比 see_text 直接（see_text 只能证明「出现了」）。
+ui_texts() { dks ui-dump --texts 2>/dev/null; }
+
+# ---------------------------------------------------------------- P7 全局限速（step 12）
+
+# 打开 P7 抽屉：P2 右上「设置」→ 等「全局限速」出现。
+open_settings() {
+  back_to_home || return 1
+  tap "设置" >/dev/null 2>&1 || return 1
+  see_text "全局限速" 20000
+}
+
+# 把 P7 上行限速设成 $1 KB/s（0 = 打开「不限」）。
+#
+# 抽屉里的「不限」是一个开关，点一下翻转一次；脚本是唯一的状态机驱动者：
+# 首次打开时它是开的（AppPrefs 默认 unlimited=true），所以先点一下输入框才可编辑。
+# 成功与否由 logcat 的 event=global_limit_set 判定，不靠界面猜测。
+p7_upload_limit() {
+  local kbps="$1" shot="${2:-}" before
+  before="$(count_log "event=global_limit_set")"
+  open_settings || return 1
+  tap "不限" >/dev/null 2>&1 || return 1
+  sleep 1
+  if [ "$kbps" != "0" ]; then
+    tap "上行" >/dev/null 2>&1 || return 1
+    sleep 1
+    # 先清空旧值：输入框会保留上一次的数字，直接 input text 会追加成 512512。
+    sh_ input keyevent KEYCODE_MOVE_END >/dev/null 2>&1
+    sh_ input keyevent 67 67 67 67 67 67 >/dev/null 2>&1
+    sleep 1
+    sh_ input text "$kbps" >/dev/null 2>&1
+    sleep 1
+  fi
+  # 截图必须在抽屉还开着的时候拍：关掉之后就只剩 P2 了（第一版就踩了这个坑）。
+  if [ -n "$shot" ]; then screenshot "$shot"; fi
+  sh_ input keyevent 111 >/dev/null 2>&1 || true   # ESC 收键盘，别让返回键先吃在键盘上
+  sleep 1
+  back_to_home || return 1
+  wait_log_count "event=global_limit_set" $((before + 1)) 20000
+}
+
+# 桌面端按需下载：往控制文件里追加一行 download=<文件名>（DesktopPeer 每 400 ms 读一次）。
+peer_download() {
+  mkdir -p "$(dirname "$PEER_CONTROL")"
+  printf 'download=%s\n' "$1" >> "$PEER_CONTROL"
+}
+
+# 等桌面端把这个文件下完：PEER auto_done name=<文件名> complete=true
+wait_peer_auto_done() {
+  local name="$1" timeout="${2:-420}" start
+  start=$(date +%s)
+  while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
+    if grep -qF "PEER auto_done name=$name complete=true" "$PEER_LOG" 2>/dev/null; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# 桌面端实测速率（KB/s）：auto_done 里的 kbps 字段（startDownload → isComplete 的墙钟均值）。
+peer_auto_kbps() {
+  grep -F "PEER auto_done name=$1 complete=" "$PEER_LOG" 2>/dev/null | tail -1 \
+    | grep -o 'kbps=[0-9]*' | cut -d= -f2
+}
+
+# 桌面端**稳态**速率（KB/s）：auto_progress 里 libtorrent 报的瞬时速率中位数，丢掉前 3 个样本（~6 s）。
+# 限速判据用稳态而不是均速：均速里混着建链时间，会把「起步慢」误判成「限速低」。
+peer_auto_steady_kbps() {
+  local samples
+  samples="$(grep -F "PEER auto_progress name=$1 " "$PEER_LOG" 2>/dev/null \
+    | grep -o 'rate_kbps=[0-9]*' | cut -d= -f2 | tail -n +4 | sort -n)"
+  if [ -z "$samples" ]; then
+    # 传得比 6 s 还快（不限速的那几份）→ 没有稳态样本，退回均速。
+    peer_auto_kbps "$1"
+    return
+  fi
+  printf '%s\n' "$samples" | awk '{ a[NR]=$1 } END { print a[int((NR + 1) / 2)] }'
 }
 
 # 前台窗口是不是我们的应用
@@ -379,6 +475,9 @@ echo $$ > "$LOCK"
 
 PEER_PID=""
 PEER_LOG="$ART/logs/desktop-peer.log"
+# 按需下载的控制文件：脚本往里写 download=<文件名>，桌面对端照办（step 12 的限速验收用）。
+PEER_CONTROL="$ART/desktop/control.txt"
+rm -f "$PEER_CONTROL"
 cleanup() {
   if [ -n "$PEER_PID" ] && kill -0 "$PEER_PID" 2>/dev/null; then
     kill "$PEER_PID" 2>/dev/null
@@ -391,7 +490,7 @@ trap cleanup EXIT
 
 # ------------------------------------------------------------------ 1. 构建
 
-step "1/11 构建"
+step "1/12 构建"
 ( cd "$ROOT" && ./gradlew --console=plain -q :app:assembleDebug :core:jar :core:m1Deps :core:m1Native ) \
   || die "gradle 构建失败"
 APK="$ROOT/app/build/outputs/apk/debug/app-debug.apk"
@@ -419,13 +518,29 @@ chk "apk.selfbuilt_arm64_so" "$([ "$SO_SHA" = "$WANT_SHA" ] && echo 1 || echo 0)
 
 # ------------------------------------------------------------------ 2. 素材
 
-step "2/11 素材与设备准备"
+step "2/12 素材与设备准备"
 PAYLOAD="$ART/payload/m1-payload-32m.bin"
 if [ ! -f "$PAYLOAD" ] || [ "$(stat -c %s "$PAYLOAD" 2>/dev/null)" != "33554432" ]; then
   head -c 33554432 /dev/urandom > "$PAYLOAD" || die "生成 32 MiB 素材失败"
 fi
 PAYLOAD_SHA="$(sha256_of "$PAYLOAD")"
 info "payload 32 MiB sha256=$PAYLOAD_SHA"
+
+# 限速验收（step 12）的三份素材：与主素材同尺寸，内容不同才能各自成种。
+# 都是 32 MiB：512 KB/s 下要传 ~64 s、1024 KB/s 下 ~32 s，够量出稳态速率；
+# 不限速时几秒传完，两档判据不会互相打架。三份各管一件事：
+#   m1-throttle-32m.bin → P4 单文件限速（1024 KB/s）
+#   m1-free-32m.bin     → P7 全局限速（512 KB/s）
+#   m1-restore-32m.bin  → 清掉全局限制之后的恢复速率（> 2 MB/s）
+THROTTLE_PAYLOAD="$ART/payload/m1-throttle-32m.bin"
+FREE_PAYLOAD="$ART/payload/m1-free-32m.bin"
+RESTORE_PAYLOAD="$ART/payload/m1-restore-32m.bin"
+for speed_file in "$THROTTLE_PAYLOAD" "$FREE_PAYLOAD" "$RESTORE_PAYLOAD"; do
+  if [ ! -f "$speed_file" ] || [ "$(stat -c %s "$speed_file" 2>/dev/null)" != "33554432" ]; then
+    head -c 33554432 /dev/urandom > "$speed_file" || die "生成限速素材失败：$speed_file"
+  fi
+  info "限速素材 $(basename "$speed_file") sha256=$(sha256_of "$speed_file")"
+done
 
 STRESS_FILES=()
 if [ "$QUICK" = "0" ]; then
@@ -449,7 +564,7 @@ sh_ wm dismiss-keyguard >/dev/null 2>&1
 
 # ------------------------------------------------------------------ 3. 清场
 
-step "3/11 清场并安装"
+step "3/12 清场并安装"
 # 只清掉本脚本自己的对端（按命令行里的 DesktopPeer 认），不碰机器上别人的 java 进程。
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { $_.CommandLine -like '*DesktopPeer*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >/dev/null 2>&1
 sh_ am force-stop "$PKG" >/dev/null 2>&1
@@ -458,12 +573,16 @@ sh_ pm clear "$PKG" >/dev/null 2>&1
 "$ADB" -s "$SERIAL" logcat -b all -c >/dev/null 2>&1
 info "logcat / crash buffer cleared"
 
-"$ADB" -s "$SERIAL" push "$(w "$PAYLOAD")" "/sdcard/Download/$(basename "$PAYLOAD")" 2>&1 | tail -1
-sh_ "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/$(basename "$PAYLOAD")" >/dev/null 2>&1
+for push_file in "$PAYLOAD" "$THROTTLE_PAYLOAD" "$FREE_PAYLOAD" "$RESTORE_PAYLOAD"; do
+  push_name="$(basename "$push_file")"
+  "$ADB" -s "$SERIAL" push "$(w "$push_file")" "/sdcard/Download/$push_name" 2>&1 | tail -1
+  # 媒体库索引要立刻看到，SAF 的「下载」目录里才有这几行。
+  sh_ "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/$push_name" >/dev/null 2>&1
+done
 
 # ------------------------------------------------------------------ 4. 桌面对端
 
-step "4/11 启动桌面对端"
+step "4/12 启动桌面对端"
 PHONE_IP="$(sh_ "ip -4 addr show wlan0" | grep -o 'inet [0-9.]*' | head -1 | awk '{print $2}')"
 [ -n "$PHONE_IP" ] || die "手机没有 wlan0 IPv4"
 PC_IP="$(node -e '
@@ -500,6 +619,7 @@ fi
 java -Dlibtorrent4j.jni.path="$PEER_NATIVE" -Dfile.encoding=UTF-8 -cp "$PEER_CP" DesktopPeer host \
   data="$(w "$PEER_DATA")" work="$(w "$ART/desktop")" name="$PEER_NAME" msg_port=47100 bt_port=51413 \
   group_name="$GROUP_NAME" share="$PEER_SHARE" "$PEER_THROTTLE" hold=2400 \
+  control="$(w "$PEER_CONTROL")" \
   echo="from-pc-2" echo_delay_ms="$ECHO_DELAY_MS" \
   > "$PEER_LOG" 2>&1 &
 PEER_PID=$!
@@ -532,7 +652,7 @@ fi
 
 # ------------------------------------------------------------------ 5. 启动应用
 
-step "5/11 启动应用并过 P0/P1"
+step "5/12 启动应用并过 P0/P1"
 sh_ am start -n "$PKG/$ACTIVITY" --es huchuan.debug.manual "$PC_IP:$MSG_PORT" 2>&1 | tail -1
 if ! wait_log "app_kernel_ready" 40000; then
   applog | tail -20
@@ -565,7 +685,7 @@ sleep 1
 
 # ------------------------------------------------------------------ 6. 只输后 8 位加入
 
-step "6/11 P5 只输后 8 位加入"
+step "6/12 P5 只输后 8 位加入"
 if ! see_text "邀请码后 8 位" 25000; then
   screenshot "p5-missing"
   die "没进 P5（新群组页）"
@@ -602,7 +722,7 @@ screenshot "p3-group"
 
 # ------------------------------------------------------------------ 7. SAF 共享文件
 
-step "7/11 P3 SAF 选文件 → 做种"
+step "7/12 P3 SAF 选文件 → 做种"
 PAYLOAD_NAME="$(basename "$PAYLOAD")"
 
 # SAF 抽屉有动画：点完「显示根目录」要等抽屉真的展开再点「下载」，
@@ -675,7 +795,7 @@ chk "share.copy_matches_payload" "$([ "$SEED_SHA" = "$PAYLOAD_SHA" ] && echo 1 |
 
 # ------------------------------------------------------------------ 8. 桌面下载 + 评论双向
 
-step "8/11 桌面下载与评论双向"
+step "8/12 桌面下载与评论双向"
 if ! wait_log_peer "PEER download_done" 300000; then
   tail -30 "$PEER_LOG"
   die "桌面端没下载完"
@@ -707,7 +827,7 @@ screenshot "p4-both-comments"
 
 # ------------------------------------------------------------------ 9. 未读角标（G4）
 
-step "9/11 未读角标：P2 出数，进群/进文件清零"
+step "9/12 未读角标：P2 出数，进群/进文件清零"
 
 # 未读角标只在 P2 上看得到，所以先退回首页；桌面端在这之后才补发评论（echo。
 # 手机不在群组页上时收到的新评论，正是 P2 该显示未读的那种。
@@ -737,6 +857,13 @@ fi
 CLEARED_GROUP="$(log_field "ui_mark_read scope=group" cleared)"
 chk "unread.marked_on_group_open" "$([ "${CLEARED_GROUP:-0}" -ge 1 ] && echo 1 || echo 0)" "cleared=$CLEARED_GROUP"
 
+# 组队通告 0 态（spec §306）：本机在这个群里只有「做种中的自己的文件」，没有在下任何东西，
+# 队友数必然 0 —— 0 就是不显示，P3 行内不该出现「组队」这枚次级 chip。
+P3_TEXTS_NO_TEAM="$(ui_texts)"
+chk "team.p3_no_chip_at_0" "$(printf '%s' "$P3_TEXTS_NO_TEAM" | grep -q '组队' && echo 0 || echo 1)" \
+  "0 队友时 P3 不出现「组队」（不是「组队 0 人」）"
+screenshot "p3-no-team-chip"
+
 # 进文件：P4 打开就 markFileRead，这条文件的游标推到最后一条可见 op。
 if ! see_text "$PAYLOAD_NAME" 20000; then
   screenshot "p3-no-file"
@@ -750,6 +877,12 @@ if ! see_text "写评论" 25000; then
 fi
 MARK_FILE="$(applog | grep -F 'ui_mark_read scope=file' | tail -1)"
 chk "unread.marked_on_file_open" "$(printf '%s' "$MARK_FILE" | grep -q "file_id=$FILE_ID" && echo 1 || echo 0)" "file_id=$FILE_ID"
+
+# 同一个 0 态在 P4 上的对应断言：不出现「正在组队 · N 人」这一行。
+P4_TEXTS_NO_TEAM="$(ui_texts)"
+chk "team.p4_no_line_at_0" "$(printf '%s' "$P4_TEXTS_NO_TEAM" | grep -q '正在组队' && echo 0 || echo 1)" \
+  "0 队友时 P4 不出现「正在组队」"
+screenshot "p4-no-team-line"
 
 # 回 P2：角标必须消失。这里的「消失」是内核未读归零的结果，不是界面自己记的账。
 back_to_home || die "回不到 P2"
@@ -769,10 +902,10 @@ see_text "添加文件" 25000 || die "回不到 P3（压力测试起点）"
 # ------------------------------------------------------------------ 10. 崩溃压力
 
 if [ "$QUICK" = "1" ]; then
-  step "10/11 崩溃压力（--quick 跳过）"
+  step "10/12 崩溃压力（--quick 跳过）"
   warn "跳过压力测试"
 else
-  step "10/11 崩溃压力 ${STRESS_ROUNDS} x ${STRESS_MIB} MiB（第 2 轮中途取消一次）"
+  step "10/12 崩溃压力 ${STRESS_ROUNDS} x ${STRESS_MIB} MiB（第 2 轮中途取消一次）"
   back_to_group || die "回不到 P3（软键盘/返回栈异常）"
 
   ROUND=1
@@ -854,7 +987,7 @@ fi
 
 # ------------------------------------------------------------------ 11. 做种计数与重启续种（G2）
 
-step "11/11 做种计数（P6）与重启续种"
+step "11/12 做种计数（P6）与重启续种"
 
 # 对端自报的做种数（协议 §10 peer.announce.seeds）= 它共享出去的文件数 + 下载完成转做种的那个。
 # 缺陷现场（docs/m1-device.md §6-6）：下载完成不进做种集合，对端自报停在共享数，
@@ -1040,10 +1173,168 @@ chk "restart.reconnect_p6_online" "$([ "$PEER_ONLINE_AFTER" = "在线" ] && echo
   "P6 对端[$PEER_NAME]行=${PEER_ONLINE_AFTER:-?}（ui_peers_changed online=true ${UI_PEERS_ONLINE:-0} 条，实时状态不是缓存）"
 screenshot "restart-p6-online"
 
-# ------------------------------------------------------------------ 12. 断言与证据
+# ------------------------------------------------------------------ 12. 组队通告（0 态）与 P7 全局限速
+
+step "12/12 组队通告（0 态）与限速（P4 单文件 / P7 全局）"
+
+# 组队的两条 0 态断言在 step 9 已经拍过（P3 无 chip、P4 无「正在组队」）。这里补一条日志级的否定证据：
+# 整个流程里内核从没报过 teammates_changed count≥1 —— 队友数只在真的有人互连时才变，界面不靠定时器刷。
+TEAM_EVENTS="$(applog | grep -o 'teammates_changed count=[0-9]*' | grep -vc 'count=0' | tr -d ' ')"
+chk "team.no_teammate_events" "$([ "${TEAM_EVENTS:-0}" = "0" ] && echo 1 || echo 0)" \
+  "teammates_changed count>0：${TEAM_EVENTS:-0} 条"
+
+# ① 先把用得到的两份素材共享进群：torrent 先进会话，限速才有「对已存在的 torrent 也生效」可验。
+back_to_group || die "回不到 P3（限速验收起点）"
+THROTTLE_NAME="$(basename "$THROTTLE_PAYLOAD")"
+FREE_NAME="$(basename "$FREE_PAYLOAD")"
+RESTORE_NAME="$(basename "$RESTORE_PAYLOAD")"
+for share_name in "$THROTTLE_NAME" "$FREE_NAME"; do
+  SEED_BEFORE="$(count_log "event=file_seeding")"
+  saf_pick "$share_name" || die "SAF 选不到 $share_name"
+  if ! wait_log_count "event=file_seeding" $((SEED_BEFORE + 1)) 90000; then
+    screenshot "p12-share-failed"
+    applog | tail -20
+    die "共享素材失败：$share_name"
+  fi
+  back_to_group || die "回不到 P3（共享 $share_name 之后）"
+done
+screenshot "p12-files-seeding"
+
+# ② P4 单文件限速 1024 KB/s：进该文件的 P4 → 点占位符「不限」聚焦输入框 → 输入 1024。
+# 走的是「一文件一 torrent + TorrentHandle.setUploadLimit」，与 P7 的 session 级限速是两层。
+if ! see_text "$THROTTLE_NAME" 20000; then
+  screenshot "p12-p3-no-throttle-file"
+  die "P3 上没有 $THROTTLE_NAME"
+fi
+tap "$THROTTLE_NAME" exact
+if ! see_text "单文件限速" 25000; then
+  screenshot "p12-p4-missing"
+  uidump "p12-p4-missing"
+  die "点文件行没进 P4"
+fi
+tap "不限" >/dev/null 2>&1 || die "点不进单文件限速输入框"
+sleep 1
+sh_ input text "1024" >/dev/null 2>&1
+sleep 2
+sh_ input keyevent 111 >/dev/null 2>&1 || true   # ESC 收键盘，截图别被键盘挡
+screenshot "p12-p4-file-limit-1024"
+FILE_LIMIT_SET="$(applog | grep -F 'event=file_upload_limit' | tail -1)"
+chk "limit.file_set_1024" "$(printf '%s' "$FILE_LIMIT_SET" | grep -q 'kbps=1024 applied=true' && echo 1 || echo 0)" \
+  "$(printf '%s' "$FILE_LIMIT_SET" | grep -o 'kbps=[0-9]* applied=[a-z]*')"
+back_to_group || die "回不到 P3（P4 设完限速之后）"
+
+# ③ 桌面端下载这份 32 MiB：实测速率必须贴着 1024 KB/s（留 20% 余量 → ≤1229；下限 400 防「压根没传」）。
+peer_download "$THROTTLE_NAME"
+if ! wait_peer_auto_done "$THROTTLE_NAME" 420; then
+  tail -20 "$PEER_LOG"
+  die "桌面端没下完 $THROTTLE_NAME"
+fi
+FILE_KBPS="$(peer_auto_kbps "$THROTTLE_NAME")"
+FILE_STEADY="$(peer_auto_steady_kbps "$THROTTLE_NAME")"
+# 判据分两截：上限 = 标称 1024 留 20% 余量（1229）；下限只证明「确实在传」。
+# 稳态速率才是限速的读数：均速会被建链/起步稀释（实测同一套参数均速 327、稳态 981）。
+chk "limit.file_1024_enforced" \
+  "$([ "${FILE_STEADY:-0}" -ge 100 ] 2>/dev/null && [ "${FILE_STEADY:-0}" -le 1229 ] 2>/dev/null && echo 1 || echo 0)" \
+  "桌面稳态 ${FILE_STEADY:-?} KB/s、均速 ${FILE_KBPS:-?} KB/s（标称 1024，判据 ≤1229；不限速时 >8000）"
+
+# ④ 清掉单文件限速：输入框清空 = 0 = 不限（真的把 handle 上的限制清掉，不是「跳过不设」）。
+enter_group || die "回不到 P3（清单文件限速）"
+tap "$THROTTLE_NAME" exact
+see_text "单文件限速" 25000 || die "进不了 P4（清单文件限速）"
+tap "1024" exact >/dev/null 2>&1 || die "点不进单文件限速输入框（已有值）"
+sh_ input keyevent KEYCODE_MOVE_END >/dev/null 2>&1
+sh_ input keyevent 67 67 67 67 >/dev/null 2>&1
+sleep 2
+sh_ input keyevent 111 >/dev/null 2>&1 || true
+screenshot "p12-p4-file-limit-cleared"
+FILE_LIMIT_CLEARED="$(applog | grep -F 'event=file_upload_limit' | tail -1)"
+chk "limit.file_cleared" "$(printf '%s' "$FILE_LIMIT_CLEARED" | grep -q 'kbps=0 applied=true' && echo 1 || echo 0)" \
+  "$(printf '%s' "$FILE_LIMIT_CLEARED" | grep -o 'kbps=[0-9]* applied=[a-z]*')"
+back_to_group || die "回不到 P3（清单文件限速之后）"
+
+# ⑤ P7 全局限速 512 KB/s（上行；下行不动）。界面标注的单位就是 KB/s，输入的数直接是 KB/s。
+p7_upload_limit 512 "p12-p7-limit-512" || die "P7 设不了 512 KB/s 上行限速"
+LIMIT_UP="$(log_field "event=global_limit_set" up_kbps)"
+chk "limit.global_set_512" "$([ "$LIMIT_UP" = "512" ] && echo 1 || echo 0)" \
+  "global_limit_set up_kbps=${LIMIT_UP:-?}（单位 KB/s）"
+# 读回校验：下发的是 512，内核会话里生效的也必须是 512（防「设置成功但没生效」）。
+chk "limit.global_applied" \
+  "$(applog | grep -q 'event=global_limit_applied up_kbps=512 .*session_up_kbps=512 .*ok=true' && echo 1 || echo 0)" \
+  "$(applog | grep -o 'event=global_limit_applied .*ok=[a-z]*' | tail -1)"
+
+# ⑥ 桌面端下载第二份 32 MiB：被 session 级 512 KB/s 限住（留 20% 余量 → ≤600 KB/s）。
+peer_download "$FREE_NAME"
+if ! wait_peer_auto_done "$FREE_NAME" 420; then
+  tail -20 "$PEER_LOG"
+  die "桌面端没下完 $FREE_NAME"
+fi
+GLOBAL_KBPS="$(peer_auto_kbps "$FREE_NAME")"
+GLOBAL_STEADY="$(peer_auto_steady_kbps "$FREE_NAME")"
+chk "limit.global_512_enforced" \
+  "$([ "${GLOBAL_STEADY:-0}" -ge 200 ] 2>/dev/null && [ "${GLOBAL_STEADY:-0}" -le 600 ] 2>/dev/null && echo 1 || echo 0)" \
+  "桌面稳态 ${GLOBAL_STEADY:-?} KB/s、均速 ${GLOBAL_KBPS:-?} KB/s（标称 512，判据 ≤600）"
+
+# ⑦ 限速还开着的时候把第三份素材也共享进群（它的 torrent 是在限速下建起来的），再清掉限制。
+# P7 关抽屉后停在 P2，进群要「回首页 → 点群行」，只按返回键是到不了 P3 的。
+enter_group || die "回不到 P3（恢复验收起点）"
+SEED_BEFORE="$(count_log "event=file_seeding")"
+saf_pick "$RESTORE_NAME" || die "SAF 选不到 $RESTORE_NAME"
+if ! wait_log_count "event=file_seeding" $((SEED_BEFORE + 1)) 90000; then
+  screenshot "p12-restore-share-failed"
+  applog | tail -20
+  die "共享恢复素材失败：$RESTORE_NAME"
+fi
+back_to_group || die "回不到 P3"
+
+p7_upload_limit 0 "p12-p7-limit-cleared" || die "P7 清不掉限速"
+LIMIT_CLEARED="$(log_field "event=global_limit_set" up_kbps)"
+chk "limit.global_cleared" "$([ "$LIMIT_CLEARED" = "0" ] && echo 1 || echo 0)" \
+  "global_limit_set up_kbps=${LIMIT_CLEARED:-?}（清掉 = 下发 0）"
+chk "limit.global_applied_cleared" \
+  "$(applog | grep -q 'event=global_limit_applied up_kbps=0 .*session_up_kbps=0 .*ok=true' && echo 1 || echo 0)" \
+  "$(applog | grep -o 'event=global_limit_applied .*ok=[a-z]*' | tail -1)"
+
+# ⑧ 同一个 session 再下一份：速率必须回到 > 2 MB/s（2048 KB/s）。限制没清掉这里会掉到 ~512。
+peer_download "$RESTORE_NAME"
+if ! wait_peer_auto_done "$RESTORE_NAME" 300; then
+  tail -20 "$PEER_LOG"
+  die "桌面端没下完 $RESTORE_NAME"
+fi
+RESTORE_KBPS="$(peer_auto_kbps "$RESTORE_NAME")"
+RESTORE_STEADY="$(peer_auto_steady_kbps "$RESTORE_NAME")"
+chk "limit.cleared_speed_restored" "$([ "${RESTORE_STEADY:-0}" -gt 2048 ] 2>/dev/null && echo 1 || echo 0)" \
+  "桌面稳态 ${RESTORE_STEADY:-?} KB/s、均速 ${RESTORE_KBPS:-?} KB/s（判据 >2048）"
+enter_group || warn "回不到 P3（清掉限速之后）"
+screenshot "p12-unlimited-download"
+
+# ⑨ 冷启动恢复：限速不落内核盘，重启后要由 app 按 SharedPreferences 重新下发。
+# 先把上行设回 512，再 force-stop + 冷启动；只认「重启之后多出来的那条」，重启前的同名日志冒充不了。
+p7_upload_limit 512 "p12-p7-limit-again" || die "P7 设不回 512 KB/s"
+RESTORED_BEFORE="$(count_log "event=global_limit_applied up_kbps=512 down_kbps=0 session_up_kbps=512 session_down_kbps=0 ok=true")"
+KERNEL_READY_BEFORE="$(count_log "app_kernel_ready")"
+sh_ am force-stop "$PKG" >/dev/null 2>&1
+sleep 2
+sh_ am start -n "$PKG/$ACTIVITY" --es huchuan.debug.manual "$PC_IP:$MSG_PORT" 2>&1 | tail -1
+if ! wait_log_count "app_kernel_ready" $((KERNEL_READY_BEFORE + 1)) 90000; then
+  screenshot "p12-restart-failed"
+  applog | tail -20
+  die "冷启动后内核没起来（限速恢复验收）"
+fi
+wait_log_count "event=global_limit_applied up_kbps=512 down_kbps=0 session_up_kbps=512" $((RESTORED_BEFORE + 1)) 60000 \
+  || warn "冷启动后 60 s 内没有看到按偏好重新下发 512"
+RESTORED_AFTER="$(count_log "event=global_limit_applied up_kbps=512 down_kbps=0 session_up_kbps=512 session_down_kbps=0 ok=true")"
+chk "limit.global_restored_after_restart" \
+  "$([ "${RESTORED_AFTER:-0}" -gt "${RESTORED_BEFORE:-0}" ] && echo 1 || echo 0)" \
+  "冷启动后按偏好重下发：${RESTORED_BEFORE:-0} → ${RESTORED_AFTER:-0} 条（session_up_kbps=512 ok=true）"
+chk "limit.restored_logged" "$(applog | grep -q 'event=limits_restored' && echo 1 || echo 0)" \
+  "limits_restored files=$(log_field limits_restored files)"
+# 设置也还在界面上：打开 P7 就能看到 512（证据截图）。
+if open_settings; then screenshot "p12-restart-restored"; back_to_home || true; fi
+
+# ------------------------------------------------------------------ 13. 断言与证据
 
 step "证据与断言"
-back_to_group || warn "回不到 P3（最后一屏可能不是 P3）"
+enter_group || warn "回不到 P3（最后一屏可能不是 P3）"
 screenshot "final-p3"
 
 applog > "$ART/logs/app-logcat.log"

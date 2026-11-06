@@ -154,7 +154,8 @@ private fun FileRow(file: GroupFile, onClick: () -> Unit) {
                     text = fileStateLabel(file.state),
                     highlighted = file.state != FileState.SLEEPING,
                 )
-                if (file.inTeam) {
+                // 队友 ≥ 1 才有这一枚次级 chip；0 队友时整枚不出现（不是显示「组队 1 人」）。
+                if (file.showsTeam()) {
                     StateChip(
                         text = stringResource(R.string.p3_team, file.teamSize),
                         highlighted = true,

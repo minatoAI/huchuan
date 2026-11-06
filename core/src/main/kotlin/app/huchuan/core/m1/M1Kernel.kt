@@ -110,6 +110,9 @@ class M1Kernel @JvmOverloads constructor(
         for (g in allGroups()) restoredGroupIds.add(g.groupId)
 
         bt = BtSession(btHint, File(dataDir, "bt"), ipFilterEnabled = true)
+        // P7 全局限速：宿主可能在 start() 之前就把设置读出来了，先把目标值交给会话（start 前设置进 settings_pack）。
+        if (sessionUploadKbps > 0) bt.setSessionUploadLimit(sessionUploadKbps)
+        if (sessionDownloadKbps > 0) bt.setSessionDownloadLimit(sessionDownloadKbps)
         // 完成判定不再等 2 s 巡查（缺口二）：libtorrent 判完当场塞队列，由完成线程立刻推事件。
         bt.onTorrentFinished = { fileId -> onTorrentFinishedAlert(fileId) }
         bt.start()
@@ -148,6 +151,9 @@ class M1Kernel @JvmOverloads constructor(
                 "reconnect" to if (reconnecter != null) "on" else "off",
                 "completion_alert" to if (bt.listenerError.isEmpty()) "on" else "off",
                 "completion_alert_error" to bt.listenerError,
+                "session_up_kbps" to sessionUploadLimitKbps().toString(),
+                "session_down_kbps" to sessionDownloadLimitKbps().toString(),
+                "session_limit_local_scope" to bt.localPeersRateLimited().toString(),
             ),
         )
     }
@@ -226,6 +232,62 @@ class M1Kernel @JvmOverloads constructor(
     }
 
     internal fun localBtPortLong(): Long = localBtPort().toLong()
+
+    // ------------------------------------------------------------------ 会话级（P7 全局限速）
+
+    /** P7 全局限速的目标值（KB/s，0 = 不限）。会话起来之前先记在这里，[start] 时补一次。 */
+    @Volatile
+    private var sessionUploadKbps = 0
+
+    @Volatile
+    private var sessionDownloadKbps = 0
+
+    /**
+     * P7 全局限速（上行）。入参 **KB/s**，0 = 不限；内部 ×1024 交给 libtorrent（字节/秒）。
+     *
+     * 运行期调用**立即生效**：走 `SessionManager.applySettings`，作用在本会话的带宽通道上，
+     * 当前会话里所有 torrent（含已经在传的）都受它约束 —— 不是只写进「下次建会话」的 settings_pack。
+     * 与单文件限速（[BtSession.setUploadLimit]）是两层，同时存在时每个 torrent 取更小的那个。
+     * 会话还没起来时先记下，[start] 建会话时带上。
+     */
+    fun setSessionUploadLimit(kbps: Int) {
+        val value = if (kbps < 0) 0 else kbps
+        sessionUploadKbps = value
+        if (this::bt.isInitialized) bt.setSessionUploadLimit(value)
+        events.log(
+            "session_upload_limit",
+            mapOf(
+                "kbps" to value.toString(),
+                "applied_kbps" to sessionUploadLimitKbps().toString(),
+                "error" to sessionLimitError(),
+            ),
+        )
+    }
+
+    /** P7 全局限速（下行），口径同 [setSessionUploadLimit]。 */
+    fun setSessionDownloadLimit(kbps: Int) {
+        val value = if (kbps < 0) 0 else kbps
+        sessionDownloadKbps = value
+        if (this::bt.isInitialized) bt.setSessionDownloadLimit(value)
+        events.log(
+            "session_download_limit",
+            mapOf(
+                "kbps" to value.toString(),
+                "applied_kbps" to sessionDownloadLimitKbps().toString(),
+                "error" to sessionLimitError(),
+            ),
+        )
+    }
+
+    /** 上行限速**真值**（KB/s）：读的是会话里生效的值，不是本类的缓存；会话没起来时为待生效目标值。 */
+    fun sessionUploadLimitKbps(): Int =
+        if (this::bt.isInitialized) bt.sessionUploadLimitKbps() else sessionUploadKbps
+
+    /** 下行限速真值（KB/s），口径同 [sessionUploadLimitKbps]。 */
+    fun sessionDownloadLimitKbps(): Int =
+        if (this::bt.isInitialized) bt.sessionDownloadLimitKbps() else sessionDownloadKbps
+
+    private fun sessionLimitError(): String = if (this::bt.isInitialized) bt.rateLimitError else ""
 
     // ------------------------------------------------------------------ 群
 

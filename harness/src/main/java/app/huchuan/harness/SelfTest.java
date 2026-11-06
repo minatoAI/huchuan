@@ -1,6 +1,7 @@
 package app.huchuan.harness;
 
 import app.huchuan.core.m1.B32;
+import app.huchuan.core.m1.BtSession;
 import app.huchuan.core.m1.DeviceIdentity;
 import app.huchuan.core.m1.Domains;
 import app.huchuan.core.m1.FileEntry;
@@ -28,6 +29,8 @@ import app.huchuan.core.m1.Unread;
 
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -45,6 +48,9 @@ public final class SelfTest {
     private static int checks = 0;
     private static final List<String> failures = new ArrayList<>();
 
+    /** 会话级限速那组真流量用例的体积：8 MiB 在 1024 KB/s 的限额下标称要 8 s，足够把「没限住」暴露出来。 */
+    private static final int RATE_TRANSFER_BYTES = 8 * 1024 * 1024;
+
     public static void main(String[] args) {
         // 同一轮 runId 前缀：selftest 的每一行也要能被断言认出是本轮产物。
         RunLog.install();
@@ -60,6 +66,7 @@ public final class SelfTest {
             seedingLedger();
             reconnectPolicy();
             memberDialPolicy();
+            sessionRateLimits();
             signBytes();
             json();
             framing();
@@ -686,6 +693,160 @@ public final class SelfTest {
         check("dial.backoff_is_reconnect_table",
                 ReconnectPolicy.INSTANCE.backoffMs(0) == 1000L
                         && ReconnectPolicy.INSTANCE.backoffMs(5) == 30000L);
+    }
+
+    // ---------------------------------------------------------------- 会话级限速（P7 全局限速）
+
+    /**
+     * 会话级（P7 全局）限速，三件事全部走生产代码（BtSession，真起一个 libtorrent 会话）：
+     *
+     *   ① 读回口径：设 512 → 读回 512（KB/s）；设 0 → 读回 0；连续改两次以最后一次为准。
+     *      读回读的是会话里**生效**的值（session::get_settings() 同步到会话线程再返回），不是我们的缓存。
+     *   ② 私网 / 回环对端必须也在限速范围内。libtorrent 默认把局域网与回环对端放进 local peer class，
+     *      而 upload_rate_limit / download_rate_limit 只作用在 global class 上 —— 只设这两个值时，
+     *      读数照样是「已设置」，本产品的全部流量（局域网 + 回环）却一点没慢。
+     *      实测（2.1.0-39，16 MiB loopback）：设 2048 KB/s 之后仍按 31 MB/s 跑完。
+     *   ③ 真流量：torrent 已经在会话里（不是新建会话才生效），限速后 loopback 传输必须真的慢下来。
+     */
+    private static void sessionRateLimits() {
+        File root = new File(System.getProperty("java.io.tmpdir"),
+                "huchuan-selftest-ratelimit-" + System.nanoTime());
+        root.mkdirs();
+        BtSession bt = null;
+        try {
+            bt = new BtSession(0, new File(root, "bt"), true);
+            int port = bt.start();
+            check("ratelimit.session_started (port=" + port + ")", port > 0);
+            check("ratelimit.local_peers_in_global_class", bt.localPeersRateLimited());
+
+            bt.setSessionUploadLimit(512);
+            check("ratelimit.upload_512_readback (got " + bt.sessionUploadLimitKbps() + ")",
+                    bt.sessionUploadLimitKbps() == 512);
+            bt.setSessionDownloadLimit(256);
+            check("ratelimit.download_256_readback (got " + bt.sessionDownloadLimitKbps() + ")",
+                    bt.sessionDownloadLimitKbps() == 256);
+            check("ratelimit.upload_survives_download_set (got " + bt.sessionUploadLimitKbps() + ")",
+                    bt.sessionUploadLimitKbps() == 512);
+
+            bt.setSessionUploadLimit(0);
+            check("ratelimit.upload_zero_readback (got " + bt.sessionUploadLimitKbps() + ")",
+                    bt.sessionUploadLimitKbps() == 0);
+            bt.setSessionDownloadLimit(0);
+            check("ratelimit.download_zero_readback (got " + bt.sessionDownloadLimitKbps() + ")",
+                    bt.sessionDownloadLimitKbps() == 0);
+
+            bt.setSessionUploadLimit(1024);
+            bt.setSessionUploadLimit(64);
+            check("ratelimit.last_write_wins (got " + bt.sessionUploadLimitKbps() + ")",
+                    bt.sessionUploadLimitKbps() == 64);
+            bt.setSessionDownloadLimit(3072);
+            bt.setSessionDownloadLimit(256);
+            check("ratelimit.last_write_wins_download (got " + bt.sessionDownloadLimitKbps() + ")",
+                    bt.sessionDownloadLimitKbps() == 256);
+        } catch (Throwable t) {
+            failures.add("ratelimit.readback_exception: " + t);
+            t.printStackTrace(System.out);
+        } finally {
+            if (bt != null) {
+                try {
+                    bt.stop();
+                } catch (Throwable ignored) {
+                    // 停不掉不影响断言结论
+                }
+            }
+        }
+
+        // ③ 真流量：不设限额 vs 设 1024 KB/s。8 MiB 在 1 MB/s 的限额下至少要 5 s（标称 8 s）。
+        try {
+            long baseline = transferMillis(root, "baseline", 0);
+            long limited = transferMillis(root, "limited", 1024);
+            check("ratelimit.baseline_transfer_completes (ms=" + baseline + ")", baseline > 0);
+            check("ratelimit.limit_slows_existing_torrent (baseline=" + baseline + "ms limited=" + limited + "ms)",
+                    limited >= 5000 && limited >= baseline);
+        } catch (Throwable t) {
+            failures.add("ratelimit.transfer_exception: " + t);
+            t.printStackTrace(System.out);
+        } finally {
+            deleteTree(root);
+        }
+    }
+
+    /** 一轮两内核 loopback 传输，返回从 connect_peer 到下载完成的毫秒数；limitKbps=0 表示不设限。 */
+    private static long transferMillis(File root, String tag, int limitKbps) throws Exception {
+        File share = new File(root, tag + "-share");
+        File save = new File(root, tag + "-save");
+        share.mkdirs();
+        save.mkdirs();
+        File payload = new File(share, "payload.bin");
+        writeRandom(payload, RATE_TRANSFER_BYTES);
+
+        BtSession seed = new BtSession(0, new File(root, tag + "-bt-seed"), true);
+        BtSession leech = new BtSession(0, new File(root, tag + "-bt-leech"), true);
+        try {
+            seed.start();
+            leech.start();
+            BtSession.SeededTorrent seeded = seed.createPrivateTorrent(payload);
+            seed.addSeed(seeded, share);
+            // 等做种就绪：否则片上校验的时间会被算进「传输耗时」，把不设限那一轮也拖慢。
+            long ready = System.currentTimeMillis();
+            while (!"finished".equals(seed.seedState(seeded.getFileId()))) {
+                if (System.currentTimeMillis() - ready > 20_000) {
+                    throw new IllegalStateException("seed not ready");
+                }
+                Thread.sleep(20);
+            }
+            leech.addDownload(seeded.getFileId(), seeded.getTorrentBytes(), save);
+            if (limitKbps > 0) {
+                // 限速在连 peer 之前设：torrent 已经在会话里（证明「对已存在的 torrent 生效」），
+                // 连接建立后带宽通道一开始就带着限额。
+                leech.setSessionDownloadLimit(limitKbps);
+                seed.setSessionUploadLimit(limitKbps);
+            }
+            long start = System.nanoTime();
+            leech.connectPeer(seeded.getFileId(), "127.0.0.1", seed.getListenPort());
+            while (!leech.isFinished(seeded.getFileId())) {
+                if (System.nanoTime() - start > 60_000_000_000L) {
+                    throw new IllegalStateException("transfer timeout (tag=" + tag + ")");
+                }
+                Thread.sleep(10);
+            }
+            return (System.nanoTime() - start) / 1_000_000L;
+        } finally {
+            try {
+                seed.stop();
+            } catch (Throwable ignored) {
+                // 同上
+            }
+            try {
+                leech.stop();
+            } catch (Throwable ignored) {
+                // 同上
+            }
+        }
+    }
+
+    private static void writeRandom(File file, int bytes) throws Exception {
+        byte[] chunk = new byte[64 * 1024];
+        Random random = new Random(11);
+        try (FileOutputStream out = new FileOutputStream(file)) {
+            int written = 0;
+            while (written < bytes) {
+                random.nextBytes(chunk);
+                int n = Math.min(chunk.length, bytes - written);
+                out.write(chunk, 0, n);
+                written += n;
+            }
+        }
+    }
+
+    private static void deleteTree(File file) {
+        if (file == null || !file.exists()) return;
+        File[] children = file.listFiles();
+        if (children != null) {
+            for (File child : children) deleteTree(child);
+        }
+        // Windows 上刚停掉的会话可能还占着句柄：删不掉就算了，临时目录不参与断言。
+        file.delete();
     }
 
     private static J field(J value, String key) {

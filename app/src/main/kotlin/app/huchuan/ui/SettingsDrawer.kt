@@ -6,8 +6,10 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -22,12 +24,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import app.huchuan.HuchuanState
 import app.huchuan.R
 import app.huchuan.core.Group
@@ -54,6 +59,8 @@ fun SettingsDrawer(
         else -> stringResource(R.string.p0_failed)
     }
 
+    // 限速要真的下发内核（session 级），调用一律离开界面线程；输入框每敲一位就下发一次。
+    val scope = rememberCoroutineScope()
     var name by remember(device.userName) { mutableStateOf(device.userName) }
     var uploadText by remember(device.uploadLimitKbps) {
         mutableStateOf(if (device.uploadLimitKbps > 0) device.uploadLimitKbps.toString() else "")
@@ -99,8 +106,7 @@ fun SettingsDrawer(
                     onValueChange = { input ->
                         val digits = input.filter { it.isDigit() }.take(6)
                         uploadText = digits
-                        state.device.setUploadLimit(digits.toIntOrNull() ?: 0)
-                        state.touch()
+                        scope.launch { state.setGlobalUploadLimit(digits.toIntOrNull() ?: 0) }
                     },
                     label = { Text(stringResource(R.string.p7_upload)) },
                     suffix = { Text(stringResource(R.string.unit_kbps)) },
@@ -114,8 +120,7 @@ fun SettingsDrawer(
                     onValueChange = { input ->
                         val digits = input.filter { it.isDigit() }.take(6)
                         downloadText = digits
-                        state.device.setDownloadLimit(digits.toIntOrNull() ?: 0)
-                        state.touch()
+                        scope.launch { state.setGlobalDownloadLimit(digits.toIntOrNull() ?: 0) }
                     },
                     label = { Text(stringResource(R.string.p7_download)) },
                     suffix = { Text(stringResource(R.string.unit_kbps)) },
@@ -125,16 +130,22 @@ fun SettingsDrawer(
                     modifier = Modifier.weight(1f),
                 )
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // 「不限」开关：关掉 → 按输入框里的值限速；打开 → 两项都按 0 下发（触及内核，不是只改一个布尔）。
+            // 整行可点（M3 的 Row + toggleable）：脚本按文案点这一行就够，不用去戳开关那一小块。
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = Spacing.rowMinHeight)
+                    .toggleable(
+                        value = device.unlimited,
+                        role = Role.Switch,
+                        onValueChange = { scope.launch { state.setGlobalUnlimited(it) } },
+                    ),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Text(stringResource(R.string.p7_unlimited))
                 Spacer(Modifier.weight(1f))
-                Switch(
-                    checked = device.unlimited,
-                    onCheckedChange = {
-                        state.device.setUnlimited(it)
-                        state.touch()
-                    },
-                )
+                Switch(checked = device.unlimited, onCheckedChange = null)
             }
 
             Text(

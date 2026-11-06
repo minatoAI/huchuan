@@ -209,7 +209,60 @@ class HuchuanState(
         }
         touch()
     }
+
+    /**
+     * P4 单文件限速（KB/s，0 = 不限）。走 [M1Runtime.limitDispatcher]：界面上每敲一个数字
+     * 下发一次，必须按输入顺序落地，而且要离开界面线程（内核要碰 libtorrent handle）。
+     */
+    suspend fun setFileUploadLimit(groupId: String, fileId: String, kbps: Int) {
+        val runtime = runtime
+        if (runtime == null) {
+            groups.setFileUploadLimit(groupId, fileId, kbps)
+        } else {
+            withContext(runtime.limitDispatcher) {
+                groups.setFileUploadLimit(groupId, fileId, kbps)
+            }
+        }
+        touch()
+    }
+
+    // ------------------------------------------------------------------ P7 全局限速（内核 session 级）
+
+    suspend fun setGlobalUploadLimit(kbps: Int) = applyGlobal(GlobalLimitKind.UPLOAD, kbps)
+
+    suspend fun setGlobalDownloadLimit(kbps: Int) = applyGlobal(GlobalLimitKind.DOWNLOAD, kbps)
+
+    suspend fun setGlobalUnlimited(unlimited: Boolean) {
+        val runtime = runtime
+        if (runtime == null) {
+            device.setUnlimited(unlimited)
+        } else {
+            withContext(runtime.limitDispatcher) { runtime.setGlobalUnlimited(unlimited) }
+        }
+        touch()
+    }
+
+    private suspend fun applyGlobal(kind: GlobalLimitKind, kbps: Int) {
+        val runtime = runtime
+        if (runtime == null) {
+            when (kind) {
+                GlobalLimitKind.UPLOAD -> device.setUploadLimit(kbps)
+                GlobalLimitKind.DOWNLOAD -> device.setDownloadLimit(kbps)
+            }
+        } else {
+            withContext(runtime.limitDispatcher) {
+                when (kind) {
+                    GlobalLimitKind.UPLOAD -> runtime.setGlobalUploadLimit(kbps)
+                    GlobalLimitKind.DOWNLOAD -> runtime.setGlobalDownloadLimit(kbps)
+                }
+            }
+        }
+        touch()
+    }
 }
+
+/** P7 全局限速的两个方向；界面上是两个输入框，下发路径相同。 */
+private enum class GlobalLimitKind { UPLOAD, DOWNLOAD }
 
 @Composable
 fun HuchuanApp(

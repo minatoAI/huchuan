@@ -1,0 +1,15 @@
+{
+  "name": "huchuan-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "互传 · Cloudflare Worker：BEP 3 tracker + WebRTC 信令 + 分享管理（零第三方运行时依赖）",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  }
+}

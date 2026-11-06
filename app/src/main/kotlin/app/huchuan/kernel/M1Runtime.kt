@@ -13,6 +13,8 @@ import app.huchuan.core.m1.KernelEvents
 import app.huchuan.core.m1.M1Kernel
 import app.huchuan.core.m1.OpRecord
 import app.huchuan.core.m1.SecretBox
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.asCoroutineDispatcher
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -73,6 +75,17 @@ class M1Runtime(context: Context) {
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var startRequested = false
+
+    /**
+     * 限速下发串行化。
+     *
+     * P4/P7 的输入框每敲一个数字就下发一次（5 → 51 → 512）：丢进同一个单线程，
+     * 保证「最后一次输入」也是最后一次落地，不会因为线程池乱序把旧值写回去。
+     */
+    private val limitThread = Executors.newSingleThreadExecutor { job ->
+        Thread(job, "huchuan-limits").apply { isDaemon = true }
+    }
+    val limitDispatcher: CoroutineDispatcher = limitThread.asCoroutineDispatcher()
 
     // ------------------------------------------------------------------ 内核事件 → 界面
 
@@ -149,6 +162,8 @@ class M1Runtime(context: Context) {
                 acquireMulticastLock()
                 kernel.start()
                 started = true
+                // 内核不持久化限速：设置留在 SharedPreferences，进程一起来就重新下发。
+                reapplyStoredLimits()
                 Log.i(
                     TAG,
                     "event=app_kernel_ready device_id=" + kernel.deviceId +
@@ -251,6 +266,77 @@ class M1Runtime(context: Context) {
         )
         requestUiRefresh()
         return cleared
+    }
+
+    // ------------------------------------------------------------------ 限速（P7 全局 / P4 单文件）
+
+    /**
+     * P7 全局限速：界面只改设置，真正生效的是内核 session 级限速。
+     *
+     * 单位 KB/s（界面上标的就是 KB/s），0 = 不限；「不限」开关打开时两项都按 0 下发。
+     * 每次输入后由界面调用，冷启动时由 [reapplyStoredLimits] 按落盘值再调一次。
+     */
+    fun applyGlobalLimits() {
+        val device = prefs.device()
+        val up = if (device.unlimited) 0 else device.uploadLimitKbps.coerceAtLeast(0)
+        val down = if (device.unlimited) 0 else device.downloadLimitKbps.coerceAtLeast(0)
+        Log.i(
+            TAG,
+            "event=global_limit_set up_kbps=" + up + " down_kbps=" + down +
+                " unlimited=" + device.unlimited,
+        )
+        pushSessionLimits(up, down)
+    }
+
+    fun setGlobalUploadLimit(kbps: Int) {
+        prefs.setUploadLimit(kbps)
+        applyGlobalLimits()
+    }
+
+    fun setGlobalDownloadLimit(kbps: Int) {
+        prefs.setDownloadLimit(kbps)
+        applyGlobalLimits()
+    }
+
+    fun setGlobalUnlimited(unlimited: Boolean) {
+        prefs.setUnlimited(unlimited)
+        applyGlobalLimits()
+    }
+
+    /**
+     * 下发到内核 session 级：M1Kernel.setSessionUploadLimit / setSessionDownloadLimit。
+     *
+     * 内核走 libtorrent 的 applySettings，运行期立即生效，对已经在传的 torrent 同样有效 ——
+     * 不是「逐个 torrent 下发」的近似（那样多文件同时传时总上限会变成 N 倍）。
+     * 下发完立刻读回**会话里生效的值**：读到的与要的不一样就记 ok=false，不假装成功。
+     */
+    private fun pushSessionLimits(upKbps: Int, downKbps: Int): Boolean {
+        kernel.setSessionUploadLimit(upKbps)
+        kernel.setSessionDownloadLimit(downKbps)
+        val up = kernel.sessionUploadLimitKbps()
+        val down = kernel.sessionDownloadLimitKbps()
+        val ok = up == upKbps && down == downKbps
+        Log.i(
+            TAG,
+            "event=global_limit_applied up_kbps=" + upKbps + " down_kbps=" + downKbps +
+                " session_up_kbps=" + up + " session_down_kbps=" + down + " ok=" + ok,
+        )
+        return ok
+    }
+
+    /** 冷启动：session 限速与每个文件的限速都按落盘值重新下发（内核不持久化这两项）。 */
+    private fun reapplyStoredLimits() {
+        applyGlobalLimits()
+        var files = 0
+        for (group in kernel.groups()) {
+            for (entry in group.files()) {
+                val kbps = prefs.fileUploadLimitKbps(entry.fileId)
+                if (kbps <= 0) continue
+                group.setUploadLimitKbps(entry.fileId, kbps)
+                files++
+            }
+        }
+        Log.i(TAG, "event=limits_restored files=" + files)
     }
 
     // ------------------------------------------------------------------ 事件出口

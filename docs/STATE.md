@@ -24,6 +24,8 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 - 邀请码 M1 只收后 8 位（40 bit）+ 在线限速；保留「P5 收全 16 位」的升级路径，协议零改动
 - mDNS 默认不广播群名与在线人数（只 v/gid/bt/r），隐私优先
 - 群规模上限 32 人
+- Cloudflare Worker 名 huchuan-relay，账号 autoai233@gmail.com（f72eb499…），免费 workers.dev 子域，SQLite DO 迁移
+- tracker 群注册是先到先得（TOFU），无账号体系；passkey 每小时轮换，客户端需每小时重新注册
 - 组队只做通告（队友数读 kernel.teammates），不做显式分片、不用 0x53 调度
 - super-seeding 不默认开启（省字节不省时间，小文件负收益）；若判据改为省流量可再评估，前提是修队友数口径
 - P0 是自检开屏页，不是诊断页：无检测项列表、无「进入」、无「重测」；成功自动进、降级显警告后自动进、失败停留给「重试」
@@ -45,9 +47,11 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 
 ## 在飞
 
-- 无（等 M2 排期）
+- APP-A 组队通告（P3/P4）与限速接线（全局 + 单文件）
+- APP-A 组队通告与限速接线（进行中）
 
 ## 已完成
+- WORKER Cloudflare 服务 → 已部署 https://huchuan-relay.autoai233.workers.dev（40/40 本地测试；线上 GET 经代理验证 /health 与 bencode 失败路径；正向注册+announce 因本机 workers.dev 被 DNS 污染/SNI 拦截未能实测）
 - CORETEAM 拨号缺陷与 E0 → hasPeers 短路修复（C1 向 C2 上传 183 MiB）、duplicate_link 竞态修复（mutant 自证）、kernel.teammates 读口、E0 D=1.1394 → 不做显式分片
 - SUPERSEED 对照 → super-seeding 能消掉重复上传（D 1.09→1.00），但 T_all 只改善 3.1%、小文件慢 59%、污染队友数 → 不默认开启
 - APPP6 P6 在线状态 → peersChanged 驱动、离线灰显、真机 39 checks PASS

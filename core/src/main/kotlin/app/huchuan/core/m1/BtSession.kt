@@ -48,6 +48,24 @@ class BtSession(
     private val lock = Any()
 
     /**
+     * 会话级（P7 全局限速）的目标值，单位 **KB/s**，0 = 不限。
+     *
+     * 会话没起来时先记在这里，[start] 建会话时带进 settings_pack；
+     * 会话起来了就走 [setSessionUploadLimit] / [setSessionDownloadLimit] 的 applySettings，
+     * **立即**作用到当前会话 —— 包括已经在传输的 torrent（见 §6 口径表）。
+     */
+    @Volatile
+    private var sessionUploadKbps = 0
+
+    @Volatile
+    private var sessionDownloadKbps = 0
+
+    /** 会话级限速写不进去、或 peer class 改不动时的原因（"" = 正常）。给内核打日志用。 */
+    @Volatile
+    var rateLimitError: String = ""
+        private set
+
+    /**
      * 下载完成告警出口：libtorrent 判定「这个 torrent 下完了」的**当场**回调（torrent_finished_alert）。
      *
      * 完成判定不再挂在 2 s 的巡查节拍上（缺口二：下完之后 P3 会停在「下载中 100%」等一拍）。
@@ -67,7 +85,11 @@ class BtSession(
         manager?.let { return listenPort }
         val candidates = ArrayList<Int>()
         if (portHint > 0) for (i in 0 until 100) candidates.add(portHint + i)
-        candidates.add(0)
+        // 兜底「系统分配端口」不能直接把 0 交给 libtorrent：实测 2.1.0-39 下
+        // listen_interfaces="0.0.0.0:0" 会报出 listen_port>0、is_listening=true，
+        // 但那个端口根本不接 TCP（从外部 connect 直接 ConnectException），
+        // 也就是兜底出来的会话收不到任何入向连接。先在 JVM 里要一个空闲端口再交下去。
+        for (i in 0 until FALLBACK_PORT_TRIES) freePort()?.let { candidates.add(it) }
 
         var lastError: Throwable? = null
         for (port in candidates) {
@@ -80,6 +102,9 @@ class BtSession(
                 if (actual > 0) {
                     manager = mgr
                     listenPort = actual
+                    // 建会话之后、任何 torrent / peer 之前：把私网段并进 global peer class，
+                    // 否则会话级限速在局域网上等于没设（见 bindLocalPeersToGlobalClass）。
+                    bindLocalPeersToGlobalClass(mgr)
                     attachFinishedListener(mgr)
                     return actual
                 }
@@ -278,6 +303,59 @@ class BtSession(
         handle.setUploadLimit(if (kbps <= 0) 0 else kbps * 1024)
     }
 
+    // ---------------------------------------------------------------- 会话级（P7 全局限速）
+
+    /**
+     * 会话级上行限速，入参 **KB/s**（0 = 不限）：内部 ×1024 交给 libtorrent（字节/秒）。
+     *
+     * 走 `SessionManager.applySettings`，所以**运行期立即生效**，不是只写进「下次建会话」的
+     * settings_pack：libtorrent 的 upload_rate_limit 是会话级带宽通道，当前会话里所有 torrent
+     * （含已经在传的）共用它，不需要逐个 torrent 重设。单文件限速（[setUploadLimit]）是另一层，
+     * 两者同时存在时每个 torrent 取更小的那个。
+     *
+     * 会话还没起来时先记下，[start] 时带进 settings_pack。
+     */
+    fun setSessionUploadLimit(kbps: Int) {
+        sessionUploadKbps = saneKbps(kbps)
+        applySessionLimits()
+    }
+
+    /** 会话级下行限速，口径同 [setSessionUploadLimit]。 */
+    fun setSessionDownloadLimit(kbps: Int) {
+        sessionDownloadKbps = saneKbps(kbps)
+        applySessionLimits()
+    }
+
+    /**
+     * 上行限速**真值**（KB/s）：读的是会话里生效的那个值（`session::get_settings()` 会同步到
+     * 会话线程再返回），不是本类自己的缓存。会话没起来时返回待生效的目标值。
+     */
+    fun sessionUploadLimitKbps(): Int = liveSessionLimit(upload = true)
+
+    /** 下行限速真值（KB/s），口径同 [sessionUploadLimitKbps]。 */
+    fun sessionDownloadLimitKbps(): Int = liveSessionLimit(upload = false)
+
+    /**
+     * 私网 / 回环对端是否也受会话级限速约束（读会话当前的 peer class filter）。
+     *
+     * libtorrent 默认把局域网与回环对端放进 local peer class，而 upload_rate_limit /
+     * download_rate_limit 只作用在 **global** peer class 上（settings_pack 原文：
+     * "By default peers on the local network are not rate limited."）。不并类的话，
+     * 本产品的全部流量（私有模式：局域网 + 回环）都不受限，读数却仍然是「已设置」。
+     * [bindLocalPeersToGlobalClass] 在 [start] 里把这个洞补掉，这里给出可断言的结果。
+     */
+    fun localPeersRateLimited(): Boolean {
+        val mgr = manager ?: return false
+        return try {
+            val filter = mgr.swig().get_peer_class_filter()
+            val globalBits = parseAddress(PROBE_NON_LOCAL)?.let { filter.access(it) } ?: return false
+            val localBits = parseAddress(PROBE_LOCAL)?.let { filter.access(it) } ?: return false
+            globalBits > 0L && (localBits and globalBits) == globalBits
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
     fun progress(fileId: String): Double {
         val st = status(fileId, true) ?: return 0.0
         return st.progress().toDouble()
@@ -384,6 +462,90 @@ class BtSession(
 
     // ------------------------------------------------------------------ 内部
 
+    /** 让操作系统给一个当前空闲的 TCP 端口（用完立刻释放，交给 libtorrent 再绑一次）。 */
+    private fun freePort(): Int? = try {
+        java.net.ServerSocket(0).use { it.localPort }
+    } catch (e: Throwable) {
+        null
+    }
+
+    /** KB/s → 字节/秒，顺带把负值归零、把会溢出的超大值夹到上限。 */
+    private fun saneKbps(kbps: Int): Int = kbps.coerceIn(0, MAX_KBPS)
+
+    private fun applySessionLimits() {
+        val mgr = manager ?: return // 还没起会话：值已经记下，start() 会带进 settings_pack
+        try {
+            // 两个限额放在同一个 pack 里下发：一次 apply_settings，不会出现「上行改了、下行还是旧的」的中间态。
+            val pack = SettingsPack()
+            pack.uploadRateLimit(sessionUploadKbps * 1024)
+            pack.downloadRateLimit(sessionDownloadKbps * 1024)
+            mgr.applySettings(pack)
+            rateLimitError = ""
+        } catch (e: Throwable) {
+            rateLimitError = e.toString()
+        }
+    }
+
+    private fun liveSessionLimit(upload: Boolean): Int {
+        val wanted = if (upload) sessionUploadKbps else sessionDownloadKbps
+        val mgr = manager ?: return wanted
+        return try {
+            val pack = mgr.settings()
+            (if (upload) pack.uploadRateLimit() else pack.downloadRateLimit()) / 1024
+        } catch (e: Throwable) {
+            rateLimitError = e.toString()
+            wanted
+        }
+    }
+
+    private fun parseAddress(text: String): org.libtorrent4j.swig.address? = try {
+        val ec = org.libtorrent4j.swig.error_code()
+        org.libtorrent4j.swig.address.from_string(text, ec)
+    } catch (e: Throwable) {
+        null
+    }
+
+    /**
+     * 把私网段与回环段的地址**同时**映射进 local 与 global 两个 peer class。
+     *
+     * 为什么非改不可：libtorrent 的 `upload_rate_limit` / `download_rate_limit` 只作用在
+     * global peer class 上，而私网 / 回环对端默认只挂 local class（`init_peer_class_filter(true)`），
+     * 于是「全局限速」在局域网与回环上完全不生效 —— 读数照样是设置过的值，骗人。
+     * 实测（2.1.0-39，16 MiB loopback）：设 2048 KB/s 之后仍然按 31 MB/s 跑完；
+     * 并类之后同样的流量被压到 ≈1.4 MB/s。
+     *
+     * 两个类都保留：local 类那一份带着「始终 unchoke、连接上限 150%」的属性，去掉会改变
+     * 局域网内的起步行为；两者的限额都参与 `request_bandwidth` 的额度计算（取最小）。
+     * 类位不写死，从会话当前的 filter 读回（`access()`）；读不到就什么都不做，只记错误。
+     */
+    private fun bindLocalPeersToGlobalClass(mgr: SessionManager) {
+        try {
+            val current = mgr.swig().get_peer_class_filter()
+            val probeGlobal = parseAddress(PROBE_NON_LOCAL) ?: return
+            val probeLocal = parseAddress(PROBE_LOCAL) ?: return
+            val globalBits = current.access(probeGlobal)
+            val localBits = current.access(probeLocal)
+            if (globalBits <= 0L || localBits <= 0L) return
+            if ((localBits and globalBits) == globalBits) return // 已经并好了
+            val ec = org.libtorrent4j.swig.error_code()
+            fun addr(text: String) = org.libtorrent4j.swig.address.from_string(text, ec)
+            val filter = org.libtorrent4j.swig.ip_filter()
+            // 顺序有意义：libtorrent 从后往前匹配，先全量给 global，再把私网段并成 global|local。
+            filter.add_rule(addr("0.0.0.0"), addr("255.255.255.255"), globalBits)
+            for (range in LOCAL_V4_RANGES) {
+                filter.add_rule(addr(range.first), addr(range.second), globalBits or localBits)
+            }
+            filter.add_rule(addr("::"), addr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), globalBits)
+            for (range in LOCAL_V6_RANGES) {
+                filter.add_rule(addr(range.first), addr(range.second), globalBits or localBits)
+            }
+            mgr.swig().set_peer_class_filter(filter)
+            rateLimitError = ""
+        } catch (e: Throwable) {
+            rateLimitError = e.toString()
+        }
+    }
+
     private fun addTorrent(ti: TorrentInfo, savePath: File, extraFlags: torrent_flags_t? = null): TorrentHandle {
         val mgr = manager ?: throw IllegalStateException("BT session not started")
         savePath.mkdirs()
@@ -408,8 +570,9 @@ class BtSession(
         s.setBoolean(settings_pack.bool_types.enable_ip_notifier.swigValue(), false)
         s.setBoolean(settings_pack.bool_types.allow_multiple_connections_per_ip.swigValue(), true)
         s.setString(settings_pack.string_types.listen_interfaces.swigValue(), "0.0.0.0:" + port)
-        s.uploadRateLimit(0)
-        s.downloadRateLimit(0)
+        // 会话级限速：建会话时按宿主设过的目标值带上（运行期改走 applySettings，见 setSessionUploadLimit）。
+        s.uploadRateLimit(sessionUploadKbps * 1024)
+        s.downloadRateLimit(sessionDownloadKbps * 1024)
         return s
     }
 
@@ -443,6 +606,31 @@ class BtSession(
 
         private const val BLOCK = 1L
         private const val ALLOW = 0L
+
+        /** KB/s 的上限：libtorrent 的限额是 int 字节/秒，再大就溢出了。 */
+        private const val MAX_KBPS = Int.MAX_VALUE / 1024
+
+        /** 「端口全被占」时向系统要空闲端口的次数。 */
+        private const val FALLBACK_PORT_TRIES = 5
+
+        /** peer class filter 的两个探针地址：非私网（global 类）、回环（local 类）。 */
+        private const val PROBE_NON_LOCAL = "8.8.8.8"
+        private const val PROBE_LOCAL = "127.0.0.1"
+
+        /** 默认落 local peer class 的地址段：限速要把它们并进 global 类，否则限速对它们无效。 */
+        private val LOCAL_V4_RANGES = listOf(
+            "127.0.0.0" to "127.255.255.255",
+            "10.0.0.0" to "10.255.255.255",
+            "172.16.0.0" to "172.31.255.255",
+            "192.168.0.0" to "192.168.255.255",
+            "169.254.0.0" to "169.254.255.255",
+        )
+
+        private val LOCAL_V6_RANGES = listOf(
+            "::1" to "::1",
+            "fc00::" to "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fe80::" to "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        )
 
         /**
          * `torrent_flags::super_seeding`（第 8 位，0x100）。
