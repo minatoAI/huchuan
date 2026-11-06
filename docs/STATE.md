@@ -51,10 +51,13 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 
 ## 在飞
 
-- E2E 公开种子端到端双进程验收
-- APPPUB Android P4「公开到群外」
+（无。目标项全部落地，见下）
 
 ## 已完成
+- E2E 公开种子端到端 → A 发布 32 MiB、B 纯磁力经 pubBtPort 取元数据并下载、SHA 一致；变异 16 条红（manager 复跑 PASS/FAIL）
+- APPPUB P4 公开到群外/取消公开 → 真机 27 条 CHECK
+- 交付物：app-debug.apk（26,195,145 B）、dist/Huchuan（35.12 MiB，离屏截图可渲染）
+- 最终回归：m1-headless PASS / e2e-public PASS / m1-windows PASS（全部在最后一次代码变更之后跑的）
 - PUBLISH 公开到群外 → 另建 private=0 v1 种子并做种、magnet、幂等、可取消；自检 376 条，反向变异 19 条红
 - WINPUB Windows 公开种子 UI → 离屏 19 张 + CDP 真实点击链路断言
 - 崩溃修复 → AlertType 表补洞（真机 filled=105,106,107）+ 公开会话收紧 mask；6 分钟存活、无 FATAL
