@@ -154,6 +154,38 @@ fun SettingsDrawer(
                 )
             }
 
+            // 跨网发现（自建 tracker）：关掉后内核不注册、不 announce，只剩局域网 mDNS 与手动 IP。
+            // 与「不限」同一个开关组件（整行可点，脚本按文案点这一行就够）。
+            // 内核只接受启动前的基址，所以这一项改的是下一次冷启动；改完还没重启时补一行状态。
+            if (state.trackerAvailable) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = Spacing.rowMinHeight)
+                        .toggleable(
+                            value = state.trackerDiscoveryEnabled,
+                            role = Role.Switch,
+                            onValueChange = { scope.launch { state.setTrackerDiscoveryEnabled(it) } },
+                        ),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(stringResource(R.string.p7_tracker))
+                    Spacer(Modifier.weight(1f))
+                    Switch(
+                        checked = state.trackerDiscoveryEnabled,
+                        onCheckedChange = null,
+                        colors = brandSwitchColors(),
+                    )
+                }
+                if (state.trackerRestartNeeded) {
+                    Text(
+                        text = stringResource(R.string.p7_tracker_restart),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
             Text(
                 text = stringResource(R.string.p7_notification),
                 style = MaterialTheme.typography.titleSmall,
