@@ -244,8 +244,13 @@ public final class DesktopPeer {
         }
 
         // ---------------------------------------------------------- 4. 等对端的评论
+        // control=<文件>：脚本按需往里写 download= / comment= 命令（见 §6）。这种对端是按
+        // 脚本节奏工作的，不该在"等对端评论"上空等 5 分钟 —— 否则手机侧切完档、写进控制文件
+        // 的命令要等 OP_TIMEOUT_MS 之后才被读到（实测：通知三档的第二步会卡死在这里）。
+        String controlPath = opts.getOrDefault("control", "");
         String reply = opts.getOrDefault("expect_comment", "");
-        long opDeadline = System.currentTimeMillis() + OP_TIMEOUT_MS;
+        long opWaitMs = (reply.isEmpty() && !controlPath.isEmpty()) ? 0L : OP_TIMEOUT_MS;
+        long opDeadline = System.currentTimeMillis() + opWaitMs;
         boolean gotReply = false;
         while (System.currentTimeMillis() < opDeadline) {
             Events.Received rec = EVENTS.ops.poll(200, TimeUnit.MILLISECONDS);
@@ -303,7 +308,6 @@ public final class DesktopPeer {
         //                       按脚本节奏一条条发评论（切档 → 发 → 断言 → 再切档），
         //                       每发一条就重起一个对端既慢又容易被别的 agent 的对端清理打断。
         // 每条命令行只执行一次（controlDone 按整行去重）。
-        String controlPath = opts.getOrDefault("control", "");
         java.util.Set<String> controlDone = new java.util.HashSet<>();
         long holdDeadline = System.currentTimeMillis() + holdSeconds * 1000L;
         while (System.currentTimeMillis() < holdDeadline) {
@@ -321,18 +325,60 @@ public final class DesktopPeer {
                         autoDownload(kernel, group, wanted);
                         continue;
                     }
+                    if (line.startsWith("share=")) {
+                        // 运行中再共享一个文件（"群内出现新文件"这条通知触发的验收要用：
+                        // 启动参数里的 share= 发生在手机入群之前，会被入群追赶窗口正确压掉）。
+                        String path = line.substring("share=".length()).trim();
+                        File file = new File(path);
+                        if (!file.isFile()) {
+                            System.out.println("PEER control_share_missing path=" + clean(path));
+                        } else {
+                            try {
+                                FileEntry added = group.addFile(file);
+                                System.out.println("PEER control_share file_id=" + added.getFileId()
+                                        + " name=" + clean(added.getName()) + " size=" + added.getSize());
+                            } catch (Throwable t) {
+                                System.out.println("PEER control_share_failed path=" + clean(path)
+                                        + " error=" + clean(t.toString()));
+                            }
+                        }
+                        System.out.flush();
+                        continue;
+                    }
                     if (line.startsWith("comment=")) {
-                        String body = line.substring("comment=".length()).trim();
-                        if (body.isEmpty() || remoteFileId == null) {
+                        // comment=<正文>              → 发到下载来的那个文件（remoteFileId）
+                        // comment=<文件名>|<正文>      → 按文件名找目标（含自己共享的文件）
+                        String spec = line.substring("comment=".length()).trim();
+                        String fileName = null;
+                        String body = spec;
+                        int bar = spec.indexOf('|');
+                        if (bar >= 0) {
+                            fileName = spec.substring(0, bar).trim();
+                            body = spec.substring(bar + 1).trim();
+                        }
+                        String target = null;
+                        if (fileName != null) {
+                            for (FileEntry candidate : group.files()) {
+                                if (candidate.getName().equals(fileName)) {
+                                    target = candidate.getFileId();
+                                    break;
+                                }
+                            }
+                        } else {
+                            target = remoteFileId;
+                        }
+                        if (body.isEmpty() || target == null) {
                             System.out.println("PEER control_comment_skipped body=" + clean(body)
-                                    + " reason=" + (remoteFileId == null ? "no_remote_file" : "empty_body"));
+                                    + " reason=" + (target == null
+                                            ? (fileName == null ? "no_remote_file" : "file_not_found:" + fileName)
+                                            : "empty_body"));
                             System.out.flush();
                             continue;
                         }
                         try {
-                            OpRecord op = group.comment(remoteFileId, body, null);
+                            OpRecord op = group.comment(target, body, null);
                             System.out.println("PEER control_comment_sent op_id=" + op.getOpId()
-                                    + " body=" + clean(body) + " file_id=" + remoteFileId);
+                                    + " body=" + clean(body) + " file_id=" + target);
                         } catch (Throwable t) {
                             System.out.println("PEER control_comment_failed body=" + clean(body)
                                     + " error=" + clean(t.toString()));

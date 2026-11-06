@@ -110,33 +110,41 @@ bash scripts/build-android.sh          # 出 app/build/outputs/apk/debug/app-deb
 bash scripts/verify-notify.sh          # 一条命令跑完，最后一行 PASS / FAIL
 ```
 
-`scripts/verify-notify.sh` 会自己装机（**不带 -g**，为了真看到 POST_NOTIFICATIONS 授权框）、
-起桌面 JVM 对端、跑三档 + 点击 + 撤权五组断言。证据写在 `artifacts/notify/`：
+`scripts/verify-notify.sh` 一条命令跑完，24 项断言，最后一行 PASS / FAIL：
+
+1. 清场装机（**不带 -g**，为了真看到 POST_NOTIFICATIONS 授权框）；
+2. 起桌面 JVM 对端 S（`app/tools/peer/DesktopPeer.java`，脚本现场 `javac`）：建群 + 做种 256 KiB 素材；
+3. 手机 P5 输后 8 位入群 → P4 激活（= 我参与该文件）→ 退回 P2，首次进 P2 弹授权框 → 点「允许」；
+4. S 按**控制文件**动作（`DesktopPeer.java` §6，一行一条命令，脚本按节奏追加）：
+   - `share=<路径>`：运行中再共享一个小文件 → 验「群内出现新文件」这条触发；
+   - `comment=<文件名>|<正文>`：在指定文件下发一条评论（可以就是 S 自己共享的素材）；
+   三档各发一条、每条之间切档并断言；最后 `pm revoke` 撤权再发一条，验「无系统通知但未读 +1」；
+5. 点通知（通知栏里真点）验证跳 P4。
+
+**为什么只用一条长连接**：撤权会杀进程，手机起来后只会重连 `state.json` 里存的 S（47300）；
+每档另起一个 join 对端的话，它只跟手机直连，手机一重启它的评论就发不到（2026-11-06 实测踩过两次）。
+S 被别的 agent 的对端清理脚本清掉这类事，脚本用 `logs/peer-watch.log` 留痕。
+
+`DesktopPeer` 的改动（app/tools/peer/DesktopPeer.java，向后兼容、只加不删）：
+控制文件新增 `share=` 与 `comment=<文件名>|<正文>`；带 `control=` 且没有 `expect_comment=` 时
+不再先空等 5 分钟（否则手机侧写进控制文件的命令要等 OP_TIMEOUT_MS 之后才被读到）。
+另外脚本编译的是改名后的 `NotifyPeer`（`sed` 生成副本，源码仍只有 DesktopPeer.java 一份）：
+`scripts/m1-device.sh` 与 `scripts/verify-targetsdk37.sh` 会按命令行里的 `*DesktopPeer*` 清
+所有 java 进程，那会把本脚本正在跑的对端中途杀掉。
+
+证据（`artifacts/notify/`）：
 
 ```
 artifacts/notify/
   run.log                    整轮输出（CHECK PASS/FAIL 逐条）
-  screenshots/               p2-notify-permission / p2-system-bubble / shade-system-bubble /
-                             p2-in-app / p2-muted / p4-from-notification ...
+  screenshots/               授权框 / P2 三档 / 通知栏三档 / 点通知后的 P4
   dumpsys/                   1-system-bubble / 2-in-app-only / 3-muted / 4-permission-denied
-  logs/                      desktop-S|D1..D4 的对端日志
+  logs/                      desktop-S 的对端日志 + peer-watch.log
   ui-dumps/                  各步骤的界面树
   payload/                   本轮随机素材
 ```
 
-**隔离构建**：主树的 `core/` 在别的 agent 手里改到编不过时，可以在
-`artifacts/notify/build-tree`（`git worktree add --detach artifacts/notify/build-tree HEAD`）
-里用同一份 `app/src` 出包：
-
-```bash
-git worktree add --detach artifacts/notify/build-tree HEAD
-rm -rf artifacts/notify/build-tree/app/src && cp -r app/src artifacts/notify/build-tree/app/src
-mkdir -p artifacts/notify/build-tree/artifacts/build-libtorrent/run5-sde1
-cp artifacts/build-libtorrent/run5-sde1/libtorrent4j.so artifacts/notify/build-tree/artifacts/build-libtorrent/run5-sde1/
-cd artifacts/notify/build-tree && bash scripts/build-android.sh
-```
-
-`verify-notify.sh` 会在两个 APK 里取修改时间更新的那个（`NOTIFY_APK=<path>` 可显式指定）。
+`NOTIFY_APK=<path>` 可以显式指定用哪个 APK；默认取主树产物与任何更新的构建里最新的那个。
 
 ## 9. 已知限制 / 未决
 
@@ -146,3 +154,5 @@ cd artifacts/notify/build-tree && bash scripts/build-android.sh
 - 没有做「通知点开后把整个群的未读清零」之外的清理策略：点通知进 P4 只清该文件未读，
   与在应用里点文件的行为一致。
 - 触发不覆盖「评论的回复链」细分：任何别人对我参与文件的评论都算（含回复）。
+- 撤权（`pm revoke`）会杀进程，重启后靠 `state.json` 里的对端地址重连；对端全部换了地址时
+  要等 mDNS / 手动加入才能恢复。这是内核既有行为，不是通知特性引入的。

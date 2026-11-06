@@ -7,8 +7,8 @@
 # 装置：
 #   S  桌面 JVM 对端：建群 + 做种 256 KiB 素材（hold 住整场）
 #   手机  加入该群 → 打开文件 P4 → 激活（开始下载，即"我参与了这个文件"）→ 退回 P2
-#   D1 桌面 JVM 对端（一条长连接跑完全场）：加入同群 → 下载素材 → 共享一个小文件
-#      （验"群内出现新文件"触发条件）→ 之后按控制文件一条条发评论（三档各一条 + 撤权一条）
+#   桌面端（S 这一条长连接跑完全场）按控制文件动作：中途共享一个小文件（验"群内出现新文件"
+#      触发条件）、再一条条发评论（三档各一条 + 撤权后一条）。S 是手机重启后唯一会重连的那一端。
 #
 # 断言（缺一条不算 PASS）：
 #   bubble.*  系统气泡：dumpsys 有该群的通知记录、渠道重要性 HIGH(4)、渠道带声音、日志 headsup=true，
@@ -37,8 +37,6 @@ ACTIVITY=".MainActivity"
 SERIAL="${NOTIFY_SERIAL:-5b94673a}"
 S_MSG_PORT="${NOTIFY_S_MSG:-47300}"
 S_BT_PORT="${NOTIFY_S_BT:-51570}"
-D1_MSG="${NOTIFY_D1_MSG:-47310}"
-D1_BT="${NOTIFY_D1_BT:-51571}"
 GROUP_NAME="${NOTIFY_GROUP_NAME:-通知验收群}"
 PAYLOAD_KIB="${NOTIFY_PAYLOAD_KIB:-256}"
 NEWFILE_KIB="${NOTIFY_NEWFILE_KIB:-64}"
@@ -234,6 +232,9 @@ peer_field() {
 # ------------------------------------------------------------------ 0. 目录 / 锁 / 收尾
 
 mkdir -p "$ART/screenshots" "$ART/ui-dumps" "$ART/logs" "$ART/dumpsys" "$ART/payload" "$ART/desktop"
+# 桌面对端的控制文件：S 启动时就要拿到路径（S 在步骤 2 起，比三档验收早）。
+S_CONTROL="$ART/desktop/control-S.txt"
+: > "$S_CONTROL"
 LOCK="$ART/.running"
 if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
   die "已有另一个 verify-notify.sh 在跑（pid $(cat "$LOCK")），先结束它"
@@ -241,10 +242,9 @@ fi
 echo $$ > "$LOCK"
 
 S_PID=""
-D1_PID=""
 cleanup() {
   local pid
-  for pid in "$D1_PID" "$S_PID"; do
+  for pid in "$S_PID"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null
       sleep 0.3
@@ -271,20 +271,10 @@ REL="$(sh_ getprop ro.build.version.release)"
 say "model     : $MODEL  Android $REL (API $SDK)"
 chk "env.device_api33" 1 "$SERIAL $MODEL API $SDK"
 
-# APK 取"最新的那个"：主树 app/build 是常规产物；主树的 core/ 可能正被别的 agent 改动、
-# 编不过时，用 artifacts/notify/build-tree 里的隔离构建（源码与主树 app/src 完全相同，
-# 见 docs/notify.md「构建」一节）。两者都以修改时间取新。
-MAIN_APK="$ROOT/app/build/outputs/apk/debug/app-debug.apk"
-TREE_APK="$ART/build-tree/app/build/outputs/apk/debug/app-debug.apk"
-APK="${NOTIFY_APK:-}"
-if [ -z "$APK" ]; then
-  APK="$MAIN_APK"
-  if [ -f "$TREE_APK" ] && { [ ! -f "$MAIN_APK" ] || [ "$TREE_APK" -nt "$MAIN_APK" ]; }; then
-    APK="$TREE_APK"
-    warn "主树 APK 比隔离构建旧，改用 $TREE_APK"
-  fi
-fi
-[ -f "$APK" ] || die "APK 不存在：$APK（本脚本不构建 app/，先跑 scripts/build-android.sh）"
+# APK：默认用主树产物（app/src 的唯一构建）；NOTIFY_APK=<path> 可显式指定（比如主树正在被
+# 别的 agent 重建时，用一份刚打好、内容相同的包）。本脚本不构建 app/。
+APK="${NOTIFY_APK:-$ROOT/app/build/outputs/apk/debug/app-debug.apk}"
+[ -f "$APK" ] || die "APK 不存在：$APK（先跑 scripts/build-android.sh，或设 NOTIFY_APK）"
 info "APK       : $APK ($(date -r "$APK" '+%m-%d %H:%M'))"
 MANIFEST="$ROOT/app/src/main/AndroidManifest.xml"
 if grep -q 'android.permission.POST_NOTIFICATIONS' "$MANIFEST"; then POSTPERM_DECL=1; else POSTPERM_DECL=0; fi
@@ -312,7 +302,7 @@ javac -encoding UTF-8 -cp "$PEER_CP" -d "$(w "$PEER_CLASSES")" "$(w "$PEER_SRC/N
 PEER_CP="$PEER_CP;$(w "$PEER_CLASSES")"
 
 # 端口必须空着：本机同时可能跑着别的 agent 的对端，抢端口会互相搅坏验证。
-for port in "$S_MSG_PORT" "$S_BT_PORT" "$D1_MSG" "$D1_BT"; do
+for port in "$S_MSG_PORT" "$S_BT_PORT"; do
   if netstat -ano 2>/dev/null | grep LISTENING | grep -qE "[:.]$port[[:space:]]"; then
     die "端口 $port 已被占用（另一个对端在跑？），换 NOTIFY_* 端口或先结束它"
   fi
@@ -367,7 +357,7 @@ java -Dlibtorrent4j.jni.path="$(w "$PEER_NATIVE")" -Dfile.encoding=UTF-8 -cp "$P
   data="$(w "$ART/desktop/S-data")" work="$(w "$ART/desktop")" \
   name="验收S" group_name="$GROUP_NAME" \
   msg_port="$S_MSG_PORT" bt_port="$S_BT_PORT" \
-  share="$(w "$PAYLOAD")" hold=3600 download=0 \
+  share="$(w "$PAYLOAD")" hold=3600 download=0 control="$(w "$S_CONTROL")" \
   > "$S_LOG" 2>&1 &
 S_PID=$!
 
@@ -458,43 +448,39 @@ chk "perm.post_notifications_granted" "$PERMISSION_GRANTED" \
 [ "$PERMISSION_GRANTED" = "1" ] || die "拿不到通知权限，后面的系统通知无从谈起"
 see_text "设置" 25000 || die "授权框之后没回到 P2"
 
-# ------------------------------------------------------------------ 6. 桌面对端（一条连接跑完三档）
+# ------------------------------------------------------------------ 6. 桌面对端（S 一条连接跑完三档）
 
-# 只用**一个**长连接对端 D1：它加入群、下载素材（= 手机之外的另一个人），然后按控制文件
-# 一条条发评论。三档验收是「切档 → 发一条 → 断言 → 再切档」，每发一条就重起一个对端既慢
-# （每次 join + 下载 20-40 s），又更容易被同机其它 agent 的对端清理脚本打断。
-# 控制文件语义见 app/tools/peer/DesktopPeer.java §6：download=<文件名> / comment=<正文>。
-CONTROL="$ART/desktop/control.txt"
-D1_LOG="$ART/logs/desktop-D1.log"
-: > "$CONTROL"
+# 用**群主 S 这条长连接**按控制文件驱动：S 是手机入群后一直连着的那一端，重启 App 之后
+# 手机也只会重连它（state.json 里存的 peer 地址就是 S），所以三档 + 撤权四步都靠它发评论。
+# 每发一条就重起一个 join 对端既慢（每次 join + 下载 20-40 s），2026-11-06 实测还多一层坑：
+# 新对端只跟手机直连，手机一重启（撤权测试）它就收不到转发，评论石沉大海。
+# 控制文件语义见 app/tools/peer/DesktopPeer.java §6：
+#   share=<路径>              运行中再共享一个文件（验"群内出现新文件"触发）
+#   comment=<文件名>|<正文>    在该文件下发一条评论（文件名可以是 S 自己共享的素材）
+s_control() { printf '%s\n' "$1" >> "$S_CONTROL"; }
 
-start_peer_d1() {
-  local data="$ART/desktop/D1-data"
-  rm -rf "$data"
-  mkdir -p "$data"
-  : > "$D1_LOG"
-  java -Dlibtorrent4j.jni.path="$(w "$PEER_NATIVE")" -Dfile.encoding=UTF-8 -cp "$PEER_CP" NotifyPeer join \
-    data="$(w "$data")" work="$(w "$ART/desktop")" \
-    name="验收D1" tail8="$TAIL8" manual="$PC_IP:$S_MSG" \
-    msg_port="$D1_MSG" bt_port="$D1_BT" download=1 hold=2400 \
-    comment="$BODY_BUBBLE" share="$(w "$NEWFILE")" control="$(w "$CONTROL")" \
-    > "$D1_LOG" 2>&1 &
-  D1_PID=$!
-}
-
-# 等 D1 把控制文件里的某条评论真的发出去。
-wait_control_comment() {
-  local body="$1" timeout="${2:-120}" start
+# 等 S 的日志里出现某条控制命令的回执。
+wait_s_log() {
+  local pattern="$1" timeout="${2:-120}" start
   start=$(date +%s)
   while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
-    if grep -F "PEER control_comment_sent" "$D1_LOG" 2>/dev/null | grep -qF "body=$body"; then return 0; fi
-    if grep -qF "RESULT=FAIL" "$D1_LOG" 2>/dev/null; then return 1; fi
+    if grep -qF -- "$pattern" "$S_LOG" 2>/dev/null; then return 0; fi
+    if grep -qF "RESULT=FAIL" "$S_LOG" 2>/dev/null; then return 1; fi
     sleep 1
   done
   return 1
 }
 
-control_comment() { printf 'comment=%s\n' "$1" >> "$CONTROL"; }
+wait_s_comment() {
+  local body="$1" timeout="${2:-120}" start
+  start=$(date +%s)
+  while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
+    if grep -F "PEER control_comment_sent" "$S_LOG" 2>/dev/null | grep -qF "body=$body"; then return 0; fi
+    if grep -qF "RESULT=FAIL" "$S_LOG" 2>/dev/null; then return 1; fi
+    sleep 1
+  done
+  return 1
+}
 
 wait_phone_op() {
   local body="$1" timeout="${2:-90}" start
@@ -509,19 +495,14 @@ wait_phone_op() {
 # ------------------------------------------------------------------ 7. 三档验收
 
 # ---------------- 档位一：系统气泡
-step "5/9 档位一「系统气泡」（默认档）：对端共享新文件 + 评论"
+step "5/9 档位一「系统气泡」（默认档）：桌面端共享新文件 + 发评论"
 NOTIFY_ALERTS_BEFORE="$(count_log "event=notify_alert")"
-start_peer_d1
-info "D1 pid=$D1_PID（等它下载完素材并发第一条评论）"
-START_OK=0
-for _ in $(seq 1 180); do
-  if grep -qF "PEER comment_sent" "$D1_LOG" 2>/dev/null; then START_OK=1; break; fi
-  if grep -qF "RESULT=FAIL" "$D1_LOG" 2>/dev/null; then break; fi
-  sleep 1
-done
-[ "$START_OK" = "1" ] || { tail -20 "$D1_LOG"; die "D1 没发出评论"; }
-say "D1        : $(grep -o 'PEER comment_sent.*' "$D1_LOG" | tail -1)"
-wait_phone_op "$BODY_BUBBLE" 90 || { applog | tail -15; die "手机没收到 D1 的评论"; }
+s_control "share=$(w "$NEWFILE")"
+s_control "comment=$PAYLOAD_NAME|$BODY_BUBBLE"
+wait_s_log "PEER control_share file_id=" 120 || { tail -20 "$S_LOG"; die "桌面端没共享新文件"; }
+wait_s_comment "$BODY_BUBBLE" 120 || { tail -20 "$S_LOG"; die "桌面端没发出评论"; }
+say "desktop   : $(grep -F 'control_comment_sent' "$S_LOG" | tail -1)"
+wait_phone_op "$BODY_BUBBLE" 90 || { applog | tail -15; die "手机没收到桌面端的评论"; }
 sleep 3
 
 BUBBLE_ALERTS="$(( $(count_log "event=notify_alert") - NOTIFY_ALERTS_BEFORE ))"
@@ -554,7 +535,7 @@ if printf '%s' "$BUBBLE_DECISION" | grep -q 'kind=comment'; then BUBBLE_COMMENT_
 chk "bubble.comment_trigger" "$BUBBLE_COMMENT_OK" "$(printf '%s' "$BUBBLE_DECISION" | cut -c1-140)"
 
 # ---------------- 档位二：仅应用内
-step "6/9 档位二「仅应用内」：P7 换档 → D2 评论 → 无系统通知 + P2 角标 +1"
+step "6/9 档位二「仅应用内」：P7 换档 → 桌面端评论 → 无系统通知 + P2 角标 +1"
 tap "设置"
 see_text "全局限速" 20000 || die "设置抽屉没打开"
 tap "仅应用内"
@@ -574,8 +555,8 @@ NOTIF_BEFORE_INAPP="$(notif_record_count)"
 ui_snapshot "p2-before-inapp" >/dev/null
 
 NOTIFY_ALERTS_BEFORE="$(count_log "event=notify_alert")"
-control_comment "$BODY_INAPP"
-wait_control_comment "$BODY_INAPP" 120 || { tail -20 "$D1_LOG"; die "对端没发出第 2 条评论"; }
+s_control "comment=$PAYLOAD_NAME|$BODY_INAPP"
+wait_s_comment "$BODY_INAPP" 120 || { tail -20 "$S_LOG"; die "桌面端没发出第 2 条评论"; }
 wait_phone_op "$BODY_INAPP" 90 || { applog | tail -15; die "手机没收到第 2 条评论"; }
 sleep 3
 
@@ -598,7 +579,7 @@ if printf '%s' "$INAPP_TEXTS" | grep -q '条新消息'; then INAPP_BADGE=1; else
 chk "inapp.unread_badge" "$INAPP_BADGE" "$(printf '%s' "$INAPP_TEXTS" | grep -o '[0-9]* 条新消息' | head -1)"
 
 # ---------------- 档位三：静音
-step "7/9 档位三「静音」：P7 换档 → D3 评论 → 发但静默（importance ≤ LOW）"
+step "7/9 档位三「静音」：P7 换档 → 桌面端评论 → 发但静默（importance ≤ LOW）"
 tap "设置"
 see_text "全局限速" 20000 || die "设置抽屉没打开"
 tap "静音"
@@ -610,8 +591,8 @@ text_gone "全局限速" 15000 || warn "抽屉可能没关掉（继续）"
 see_text "设置" 20000 || die "抽屉关掉后没回到 P2"
 
 NOTIFY_ALERTS_BEFORE="$(count_log "event=notify_alert")"
-control_comment "$BODY_MUTED"
-wait_control_comment "$BODY_MUTED" 120 || { tail -20 "$D1_LOG"; die "对端没发出第 3 条评论"; }
+s_control "comment=$PAYLOAD_NAME|$BODY_MUTED"
+wait_s_comment "$BODY_MUTED" 120 || { tail -20 "$S_LOG"; die "桌面端没发出第 3 条评论"; }
 wait_phone_op "$BODY_MUTED" 90 || { applog | tail -15; die "手机没收到第 3 条评论"; }
 sleep 3
 
@@ -678,6 +659,8 @@ chk "tap.opens_file_page" "$TAP_OK" "$(applog | grep -F 'event=notify_open' | ta
 step "9/9 撤销 POST_NOTIFICATIONS：对端再评论 → 无系统通知，应用内未读 +1"
 back_home || die "回不到 P2"
 KERNEL_READY_BEFORE="$(count_log "app_kernel_ready")"
+# 重启后消息层要重新绑定：用 event=peer_reconnected 当"连回来了"的判据（基线在杀进程前取）。
+RECONNECT_BASE="$(count_log "event=peer_reconnected")"
 sh_ pm revoke "$PKG" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1
 sleep 2
 sh_ am start -n "$PKG/$ACTIVITY" --es huchuan.debug.manual "$PC_IP:$S_MSG" >/dev/null 2>&1
@@ -692,22 +675,14 @@ tap "$GROUP_NAME"
 see_text "添加文件" 30000 || die "点群行没进 P3"
 back_home || die "回不到 P2"
 
-# 重启后消息层要重新绑定：等手机重新连回对端，否则评论发过来也收不到。
-PEER_EV_BASE="$(count_log "event=ui_peers_changed")"
+# 等手机重新连回对端（否则评论发过来也收不到）。判据是内核自己打的 event=peer_reconnected。
 PEER_ONLINE=0
-for _ in $(seq 1 45); do
-  if [ "$(count_log "event=ui_peers_changed")" -gt "$PEER_EV_BASE" ] &&
-     applog | grep -F "event=ui_peers_changed" | tail -1 | grep -q "online=true"; then
-    PEER_ONLINE=1
-    break
-  fi
-  sleep 1
-done
-info "peer      : 撤权重启后重连 online=$PEER_ONLINE"
+if wait_new_log "event=peer_reconnected" "$RECONNECT_BASE" 60000; then PEER_ONLINE=1; fi
+info "peer      : 撤权重启后重连 online=$PEER_ONLINE $(applog | grep -F 'event=peer_reconnected' | tail -1 | grep -o 'addr=[^ ]*')"
 
 NOTIFY_ALERTS_BEFORE="$(count_log "event=notify_alert")"
-control_comment "$BODY_DENIED"
-wait_control_comment "$BODY_DENIED" 120 || { tail -20 "$D1_LOG"; die "对端没发出第 4 条评论"; }
+s_control "comment=$PAYLOAD_NAME|$BODY_DENIED"
+wait_s_comment "$BODY_DENIED" 120 || { tail -20 "$S_LOG"; die "桌面端没发出第 4 条评论"; }
 wait_phone_op "$BODY_DENIED" 90 || { applog | tail -15; die "手机没收到第 4 条评论（重连 online=$PEER_ONLINE）"; }
 sleep 3
 
