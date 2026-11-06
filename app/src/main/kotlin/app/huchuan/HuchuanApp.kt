@@ -35,6 +35,7 @@ import app.huchuan.core.NetworkProbe
 import app.huchuan.core.NetworkReport
 import app.huchuan.core.NetworkStatus
 import app.huchuan.kernel.M1Runtime
+import app.huchuan.kernel.MagnetImport
 import app.huchuan.notify.NotifyPermission
 import app.huchuan.notify.NotifyRoute
 import app.huchuan.ui.FileScreen
@@ -246,6 +247,28 @@ class HuchuanState(
     /** P3「添加文件」：SAF URI → 私有目录副本 → 做种 → 广播 file.add。 */
     suspend fun shareDocument(groupId: String, uri: Uri): GroupFile? = withContext(Dispatchers.IO) {
         runtime?.importAndShare(groupId, uri)
+    }
+
+    /**
+     * P3 弹层「磁力链接」：内核要等元数据（默认 60 s），**必须离开界面线程**。
+     * 结果原样回给界面（一句话，显示在输入框下一行，不弹窗）。
+     */
+    suspend fun importMagnet(groupId: String, magnet: String): MagnetImport {
+        val result = withContext(Dispatchers.IO) {
+            runtime?.importPublicMagnet(groupId, magnet)
+                ?: MagnetImport(ok = false, reason = "", message = "", fileId = "")
+        }
+        touch()
+        return result
+    }
+
+    /**
+     * P4「移除」：只在本机藏起来（不广播、不删文件），正在跑的任务先休眠。
+     * 藏完之后这个条目就不在 [groupOrNull] 里了，P4 自己按「文件没了」退回 P3。
+     */
+    suspend fun removeLocalFile(groupId: String, fileId: String) {
+        withContext(Dispatchers.IO) { runtime?.removeLocalFile(groupId, fileId) }
+        touch()
     }
 
     /** P4 激活/休眠：真起真停 BT 任务。 */

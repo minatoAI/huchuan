@@ -1,5 +1,8 @@
 package app.huchuan.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -19,6 +22,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -32,6 +37,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -40,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import app.huchuan.HuchuanState
 import app.huchuan.R
 import app.huchuan.core.Comment
+import app.huchuan.core.FileScope
 import app.huchuan.core.FileState
 import app.huchuan.ui.theme.brandSwitchColors
 import kotlinx.coroutines.launch
@@ -74,8 +81,23 @@ fun FileScreen(
         mutableStateOf(if (file.uploadLimitKbps > 0) file.uploadLimitKbps.toString() else "")
     }
 
+    val context = LocalContext.current
+    val snackbarHostState = remember { SnackbarHostState() }
+    val copiedLabel = stringResource(R.string.p6_copied)
+
     PageScaffold(
         title = file.name,
+        // 「移除」只对公开条目出现（public-swarm §5.2）：私有条目行为不变。
+        actions = {
+            if (file.scope == FileScope.PUBLIC) {
+                TextButton(
+                    onClick = { scope.launch { state.removeLocalFile(groupId, file.id) } },
+                ) {
+                    Text(stringResource(R.string.p4_remove))
+                }
+            }
+        },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         // 输入行脱离正文流，固定到底部（见 docs/ui-notes.md §3）：正文再高也不把它挤走，
         // 正文自己 verticalScroll，两者互不影响。
         bottomBar = {
@@ -110,19 +132,47 @@ fun FileScreen(
                 horizontalArrangement = Arrangement.spacedBy(Spacing.item),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                if (file.scope == FileScope.PUBLIC) {
+                    StateChip(text = stringResource(R.string.p3_scope_public), highlighted = false)
+                }
                 StateChip(
-                    text = fileStateLabel(file.state),
+                    text = fileStateLabel(file),
                     highlighted = file.state != FileState.SLEEPING,
                 )
-                Text(
-                    text = formatSize(file.sizeBytes),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                // 元数据没到手时没有尺寸可写：左上的状态 chip 已经是「等待来源」，
+                // 这里不再重复一遍（public-swarm §3.1：不是 0 B）。
+                if (!file.awaitingSource()) {
+                    Text(
+                        text = formatSize(file.sizeBytes),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Text(
                     text = stringResource(R.string.p4_source, file.sourceMember),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            // 公开条目的磁力摘要：一行，点一下复制整条链接（public-swarm §6.1 的 P4 信息区）。
+            if (file.scope == FileScope.PUBLIC && file.magnet.isNotEmpty()) {
+                Text(
+                    text = magnetDigest(file.magnet),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            val clipboard =
+                                context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            clipboard?.setPrimaryClip(
+                                ClipData.newPlainText(file.magnet, file.magnet),
+                            )
+                            scope.launch { snackbarHostState.showSnackbar(copiedLabel) }
+                        }
+                        .padding(vertical = 4.dp),
                 )
             }
 

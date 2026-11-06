@@ -139,7 +139,10 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
                 platform = record.platform,
             )
         }
-        val files = entries.map { toGroupFile(group, it) }
+        // P4「移除」过的条目不再出现（public-swarm §5.2：只从本机列表消失，内核清单不变）。
+        val files = entries.mapNotNull { entry ->
+            if (rt.prefs.isFileHidden(group.groupId, entry.fileId)) null else toGroupFile(group, entry)
+        }
         return Group(
             id = group.groupId,
             name = group.name,
@@ -204,6 +207,11 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
             downloadRateBps = if (state == FileState.DOWNLOADING) group.downloadRateBps(entry.fileId) else 0L,
             uploadRateBps = if (state == FileState.SEEDING) group.uploadRateBps(entry.fileId) else 0L,
             comments = comments,
+            // 公开条目（M3）：P3 的「公开」chip、P4 的磁力摘要都只读这三个字段；
+            // 私有条目仍是 FileScope.PRIVATE / "" / 0，行为不变。
+            scope = entry.scope,
+            magnet = entry.magnet,
+            pieceSize = entry.pieceSize,
         )
     }
 

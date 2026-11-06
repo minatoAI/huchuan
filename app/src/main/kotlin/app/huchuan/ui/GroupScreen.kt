@@ -18,7 +18,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -27,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import app.huchuan.HuchuanState
 import app.huchuan.R
+import app.huchuan.core.FileScope
 import app.huchuan.core.FileState
 import app.huchuan.core.GroupFile
 
@@ -67,6 +72,9 @@ fun GroupScreen(
         }
     }
 
+    // 「添加文件」一个入口两项（public-swarm §6.1）：本机文件走现流程，磁力链接在同一个弹层里填。
+    var adding by remember { mutableStateOf(false) }
+
     PageScaffold(
         title = group.name,
         actions = {
@@ -84,7 +92,7 @@ fun GroupScreen(
                 .fillMaxSize(),
         ) {
             BrandButton(
-                onClick = { picker.launch(arrayOf("*/*")) },
+                onClick = { adding = true },
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = Spacing.pageHorizontal, vertical = 8.dp),
@@ -111,6 +119,22 @@ fun GroupScreen(
             }
         }
     }
+
+    if (adding) {
+        AddFileSheet(
+            onPickLocal = {
+                adding = false
+                picker.launch(arrayOf("*/*"))
+            },
+            onImportMagnet = { magnet -> state.importMagnet(groupId, magnet) },
+            onImported = { fileId ->
+                adding = false
+                // spec §4.4：添加完成后直接进 P4（磁力导入成功与选文件一样）。
+                onOpenFile(fileId)
+            },
+            onDismiss = { adding = false },
+        )
+    }
 }
 
 @Composable
@@ -126,11 +150,14 @@ private fun FileRow(file: GroupFile, onClick: () -> Unit) {
         },
         supportingContent = {
             Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
-                Text(
-                    text = formatSize(file.sizeBytes),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                // 公开条目在元数据到手前 size = 0：不显示「0 B」（public-swarm §3.1）。
+                if (file.sizeBytes > 0) {
+                    Text(
+                        text = formatSize(file.sizeBytes),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Text(
                     text = stringResource(R.string.p3_seeders, file.seeders),
                     style = MaterialTheme.typography.bodyMedium,
@@ -150,8 +177,13 @@ private fun FileRow(file: GroupFile, onClick: () -> Unit) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                // 「公开」只在公开条目出现，位置固定在状态 chip 左侧（public-swarm §6.2）；
+                // 私有条目没有任何补位 chip，不出现「私有」字样。
+                if (file.scope == FileScope.PUBLIC) {
+                    StateChip(text = stringResource(R.string.p3_scope_public), highlighted = false)
+                }
                 StateChip(
-                    text = fileStateLabel(file.state),
+                    text = fileStateLabel(file),
                     highlighted = file.state != FileState.SLEEPING,
                 )
                 // 队友 ≥ 1 才有这一枚次级 chip；0 队友时整枚不出现（不是显示「组队 1 人」）。

@@ -47,6 +47,15 @@
 
     <!-- P3 群组 -->
     <string name="p3_add_file">添加文件</string>
+    <!-- P3「添加文件」弹层（public-swarm §6.1）：同一入口两项 —— 本机文件 / 磁力链接 -->
+    <string name="p3_add_local">本机文件</string>
+    <string name="p3_add_magnet">磁力链接</string>
+    <string name="p3_magnet_hint">粘贴磁力链接</string>
+    <string name="p3_magnet_import">导入</string>
+    <string name="p3_magnet_importing">导入中</string>
+    <!-- 公开条目（M3）：行内「公开」chip；元数据未到手时状态说「等待来源」 -->
+    <string name="p3_scope_public">公开</string>
+    <string name="p3_waiting_source">等待来源</string>
     <string name="p3_members">成员（%1$d 人）</string>
     <string name="p3_state_seeding">做种中</string>
     <string name="p3_state_sleeping">休眠</string>
@@ -75,6 +84,8 @@
     <string name="p4_connecting">正在连接做种者</string>
     <string name="p4_connect_failed">连不上做种者，重试</string>
     <string name="p4_offline">离线，等待上线</string>
+    <!-- 公开条目的本地移除（public-swarm §5.2：只从本机列表消失，不广播、不删文件） -->
+    <string name="p4_remove">移除</string>
 
     <!-- P5 新群组 -->
     <string name="p5_title">新群组</string>

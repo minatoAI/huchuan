@@ -312,15 +312,21 @@ announce 记的 peer 地址来自 `cf-connecting-ip`（`worker/src/util.js:118`�
 修法：加 `pages/public/404.html`。加完重测：`/nope` → 404，`/api` → 404，`/` → 200，`/health` → 200
 （见 `raw/01-local-curl.txt` 的 [3]，那份是修正后重录的）。
 
-### 5.3 额度大概要按两倍估
+### 5.3 额度不按两倍算（本节 2026-11-06 更正）
 
-一次客户端请求 = 1 次 Pages Function 调用 + 1 次 Worker 调用。
-官方说 service binding 的子请求不计额外请求费（问题是这段写在 Workers 的 Standard 定价模型下，
-[Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/)），
-而免费层的计量口径没有单独写。保守按两次算：10 万/天 → 约 5 万次客户端请求，
-比 `docs/deploy-cloudflare.md` §1 那张表乐观值砍一半。
+原写法「一次客户端请求 = Pages 1 次 + Worker 1 次，按两倍估」是错的。
 
-**未核实**：没有可用的账户计量接口可查，只能在 dashboard 的 Usage 里看。上线前核一次。
+官方原文（[Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/)，Service bindings 一节）：
+"Requests made from your Worker to another worker via a Service Binding do not incur additional request fees"，
+请求表脚注 1 同时覆盖 Free 与 Standard 两列。Pages Functions 按 Workers 计费并走 Standard 模型。
+
+**真正的消耗大头是 Durable Object**：每次 announce 是 DO 的 2 读 1 写，
+免费额度 10 万 DO 请求/天 + 13,000 GB-s/天 + 10 万行写/天。
+一个常驻对象全天不休约 11,000 GB-s，几乎吃满时长额度——所以压额度的杠杆在
+announce 间隔（600→1800 s 约 3 倍）、DO 行写、以及确认 WebSocket 走休眠，
+不在网关这一层。
+
+详见 `docs/reports/quota-and-entry.md`。
 
 ## 六、风险与未决
 

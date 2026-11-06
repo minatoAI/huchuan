@@ -20,6 +20,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.huchuan.R
+import app.huchuan.core.FileScope
 import app.huchuan.core.FileState
 import app.huchuan.core.GroupFile
 import app.huchuan.ui.theme.BrandJade
@@ -118,11 +119,33 @@ fun formatSize(bytes: Long): String {
 /** 速率：2.4 MB/s。 */
 fun formatRate(bytesPerSecond: Long): String = formatSize(bytesPerSecond) + "/s"
 
+/**
+ * 公开条目的元数据还没到手：内核把 size 记 0，等 ut_metadata 回来再本地回填
+ * （public-swarm §1.1 / §3.1）。只看它一个字段，不去猜状态机。
+ */
+fun GroupFile.awaitingSource(): Boolean = scope == FileScope.PUBLIC && sizeBytes <= 0
+
+/**
+ * 状态文案。三种原有状态不变；公开条目多出的唯一状态是「等待来源」（public-swarm §6.2）——
+ * 没有元数据就既不能下载也不能做种，说「休眠」等于撒谎。
+ */
 @Composable
-fun fileStateLabel(state: FileState): String = when (state) {
-    FileState.SEEDING -> stringResource(R.string.p3_state_seeding)
-    FileState.DOWNLOADING -> stringResource(R.string.p3_state_downloading)
-    FileState.SLEEPING -> stringResource(R.string.p3_state_sleeping)
+fun fileStateLabel(file: GroupFile): String = when {
+    file.awaitingSource() -> stringResource(R.string.p3_waiting_source)
+    file.state == FileState.SEEDING -> stringResource(R.string.p3_state_seeding)
+    file.state == FileState.DOWNLOADING -> stringResource(R.string.p3_state_downloading)
+    else -> stringResource(R.string.p3_state_sleeping)
+}
+
+/**
+ * 磁力摘要（P4 一行）：只留 xt 的前 16 位 infohash，够认出是哪一条；点一下复制整条。
+ * 认不出的形状原样返回，不假装截断过。
+ */
+fun magnetDigest(magnet: String): String {
+    val prefix = "magnet:?xt=urn:btih:"
+    if (!magnet.startsWith(prefix, ignoreCase = true)) return magnet
+    val infohash = magnet.substring(prefix.length).substringBefore('&')
+    return if (infohash.length > 16) "btih:" + infohash.take(16) + "…" else magnet
 }
 
 /**

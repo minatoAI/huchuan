@@ -27,6 +27,21 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
+ * 磁力导入的界面口径：成功与否 + 内核的失败 reason + 一句中文（成功时为空）+ 条目 id。
+ *
+ * 界面不认内核的类型（[app.huchuan.core.m1.PublicMagnetResult]），只认这四项。
+ */
+data class MagnetImport(
+    val ok: Boolean,
+    /** 内核的 reason："" 成功，其余见 PublicMagnetResult 的常量。 */
+    val reason: String,
+    /** 内核给的一句中文，直接显示，界面不改写。 */
+    val message: String,
+    /** 入库条目的 fileId；链接非法 / 重复时为空串。 */
+    val fileId: String,
+)
+
+/**
  * Android 侧的 M1 内核宿主：进程内嵌内核 + 组播锁 + 日志出口 + SAF 导入。
  *
  * 生命周期跟 Application 走（整个进程只起一个内核）；界面通过 [store] 读数据。
@@ -334,6 +349,50 @@ class M1Runtime(context: Context) {
         }
         val entry = group.addFile(file)
         return store.toGroupFile(group, entry)
+    }
+
+    /**
+     * P3 弹层「磁力链接」：交给内核的公开会话导入（public-swarm §3）。
+     *
+     * 内核默认**阻塞 60 s** 等元数据（§3.6），调用方必须已经在工作线程上
+     * （HuchuanState.importMagnet 走 withContext(IO)）。内核永不抛异常，五种失败各一句中文，
+     * 这里原样交给界面显示在输入框下一行，不弹窗、不要求重试（§3.1）。
+     */
+    fun importPublicMagnet(groupId: String, magnet: String): MagnetImport {
+        val result = kernel.addPublicMagnet(groupId, magnet)
+        Log.i(
+            TAG,
+            "event=ui_magnet_import group_id=" + groupId +
+                " ok=" + result.ok +
+                " reason=" + result.reason.ifEmpty { "ok" } +
+                " file_id=" + result.fileId +
+                " message=" + (if (result.message.isEmpty()) "-" else clean(result.message)),
+        )
+        requestUiRefresh()
+        return MagnetImport(result.ok, result.reason, result.message, result.fileId)
+    }
+
+    /**
+     * P4「移除」（public-swarm §5.2）：只从本机列表消失 —— 不广播 file.del（M2 才有）、
+     * 不删磁盘文件。本机正在做种 / 下载的先休眠，否则「移除」之后公开会话还在替它上传。
+     *
+     * 只对公开条目开放（私有条目行为不变），调用方已经离开界面线程。
+     */
+    fun removeLocalFile(groupId: String, fileId: String) {
+        val group = kernel.group(groupId) ?: return
+        val entry = group.file(fileId) ?: return
+        if (!entry.isPublic) return
+        val role = group.localRole(fileId)
+        val wasActive = role != GroupRuntime.LocalRole.NONE
+        if (wasActive) group.stopFile(fileId)
+        prefs.hideFile(groupId, fileId)
+        Log.i(
+            TAG,
+            "event=ui_file_remove_local group_id=" + groupId + " file_id=" + fileId +
+                " scope=" + entry.scope.wire + " was_active=" + wasActive +
+                " file_kept=" + (group.savedFile(fileId)?.isFile == true),
+        )
+        requestUiRefresh()
     }
 
     fun isCompleted(fileId: String): Boolean = completed.contains(fileId)

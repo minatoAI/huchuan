@@ -70,6 +70,20 @@ class AppPrefs(context: Context) : LocalDeviceStore {
         }
         .toMap()
 
+    /**
+     * P4「移除」的本地隐藏标记（public-swarm §5.2）：**只影响本机列表**，不广播 file.del
+     * （M2 才有）、不删磁盘文件。
+     *
+     * 内核没有「本地移除」这个动作，所以隐藏记在宿主侧：M1GroupStore 投影时跳过被隐藏的条目，
+     * 重启后仍然不显示。屏蔽 infohash（§5.2 同一次操作顺带写的那张表）没有实现，见 docs/public-ui.md。
+     */
+    fun hideFile(groupId: String, fileId: String) {
+        prefs.edit().putBoolean(KEY_HIDDEN + groupId + "." + fileId, true).apply()
+    }
+
+    fun isFileHidden(groupId: String, fileId: String): Boolean =
+        prefs.getBoolean(KEY_HIDDEN + groupId + "." + fileId, false)
+
     // ------------------------------------------------------------------ 跨网发现（P7）
 
     /** tracker 基址。默认就是已部署的那个 Worker 地址（内核里没有写死任何线上地址）。 */
@@ -123,6 +137,7 @@ class AppPrefs(context: Context) : LocalDeviceStore {
         private const val KEY_NOTIFY = "notify."
         private const val KEY_NOTIFY_PERMISSION_ASKED = "notify_permission_asked"
         private const val KEY_FILE_LIMIT = "file_limit."
+        private const val KEY_HIDDEN = "hidden."
         private const val KEY_TRACKER_BASE = "tracker_base_url"
         private const val KEY_TRACKER_DISCOVERY = "tracker_discovery"
 
