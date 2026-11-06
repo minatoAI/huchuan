@@ -24,6 +24,10 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 - 邀请码 M1 只收后 8 位（40 bit）+ 在线限速；保留「P5 收全 16 位」的升级路径，协议零改动
 - mDNS 默认不广播群名与在线人数（只 v/gid/bt/r），隐私优先
 - 群规模上限 32 人
+- libtorrent4j 许可为 MIT（Maven POM 与源仓 LICENSE.md 均为 MIT），旧文档写成 BSD-3 的一律以 MIT 为准
+- 默认 tracker 暂保留项目自带实例；README 已声明其为共享演示实例、额度有限、可关闭，用户自建见 docs/deploy-cloudflare.md
+- 跨网仍未打通：ip_filter 只放行私网段，需并入群成员公网地址（M2 首项）
+- P7 文案口径定为「重启后生效」（规格为准，Android 的「下次启动生效」待改）
 - Cloudflare Worker 名 huchuan-relay，账号 autoai233@gmail.com（f72eb499…），免费 workers.dev 子域，SQLite DO 迁移
 - tracker 群注册是先到先得（TOFU），无账号体系；passkey 每小时轮换，客户端需每小时重新注册
 - 组队只做通告（队友数读 kernel.teammates），不做显式分片、不用 0x53 调度
@@ -47,11 +51,12 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 
 ## 在飞
 
-- A1 Android 接跨网发现配置（worktree，OPPO）
-- A3 Windows 接跨网发现（worktree，重试中）
-- PUB 公开种子社区设计（已交付，待并入）
+- PUB-CORE 内核公开种子会话
+- NOTIFY 群级通知三档
 
 ## 已完成
+- OSS 开源材料 → LICENSE(MIT) + THIRD_PARTY_NOTICES(13 项逐个核实) + README(76 行)
+- TV tracker 接线完整验收 → 47/47 PASS（3m40s）；确认此前 21/2 是单独跑 phase b 的假失败
 - TEAMVERIFY 组队通告真机验证 → MIX 上 9/9 PASS：P3「组队 2 人」、P4「正在组队 · 2 人」、100% 后消失、logcat teammates_changed count=1
 - PUB 公开种子社区设计 → docs/design/public-swarm.md（240 行，独立 PublicBtSession，六条已拍）
 - WORKER Cloudflare 服务 → 已部署 https://huchuan-relay.autoai233.workers.dev（40/40 本地测试；线上 GET 经代理验证 /health 与 bencode 失败路径；正向注册+announce 因本机 workers.dev 被 DNS 污染/SNI 拦截未能实测）

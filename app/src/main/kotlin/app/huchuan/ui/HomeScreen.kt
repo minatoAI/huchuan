@@ -24,6 +24,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -52,6 +53,10 @@ fun HomeScreen(
     onNewGroup: () -> Unit,
     onOpenGroup: (String) -> Unit,
 ) {
+    // 首次进入 P2 请求通知权限（Android 13+）。只弹一次：runtime 里按 notifyPermissionAsked 去重，
+    // 用户拒绝之后不再打扰，应用内未读照常。
+    LaunchedEffect(Unit) { state.requestNotifyPermission("home") }
+
     var query by rememberSaveable { mutableStateOf("") }
     val groups = state.groupList.filter { group ->
         query.isBlank() || group.name.contains(query.trim(), ignoreCase = true)

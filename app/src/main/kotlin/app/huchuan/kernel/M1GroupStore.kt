@@ -38,12 +38,31 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
     override fun joinGroup(tail8: String): Group? {
         val clean = tail8.trim().uppercase()
         if (clean.length != 8) return null
-        val group = rt.kernel.joinByTail8(clean, rt.manualCandidates, JOIN_TIMEOUT_MS) ?: return null
+        // 入群时对端会把已有的文件清单/历史 op 一起推过来：这些不是"刚发生的新事"，
+        // 通知侧要把整段追赶窗口压掉（见 M1Runtime.beginJoinCatchup）。
+        rt.beginJoinCatchup()
+        val group = try {
+            rt.kernel.joinByTail8(clean, rt.manualCandidates, JOIN_TIMEOUT_MS)
+        } finally {
+            rt.endJoinCatchup()
+        } ?: return null
         return toGroup(group)
     }
 
+    /**
+     * P7 的通知档：先落盘，再把该群渠道的重要性改成新档位。
+     *
+     * 创建渠道用的是同一个 channel id（含 groupId），系统侧这就是"更新"而不是重建 ——
+     * 不删渠道，用户对这个渠道做过的其它设置与已有通知都不会被清掉。
+     */
     override fun setNotificationLevel(groupId: String, level: NotificationLevel) {
         rt.prefs.setNotificationLevel(groupId, level)
+        val name = try {
+            rt.kernel.group(groupId)?.name.orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+        rt.notifier.syncChannel(groupId, name, level)
     }
 
     override fun setFileActive(groupId: String, fileId: String, active: Boolean) {

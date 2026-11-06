@@ -67,6 +67,7 @@ public final class SelfTest {
             reconnectPolicy();
             memberDialPolicy();
             sessionRateLimits();
+            publicSwarm();
             tracker();
             signBytes();
             json();
@@ -94,6 +95,16 @@ public final class SelfTest {
      */
     private static void tracker() {
         TrackerSelfTest.run(SelfTest::check);
+    }
+
+    /**
+     * 公开种子社区（public-swarm）：公开会话 DHT 开 / LSD 关 / uTP 开 / 端口 6881 起、
+     * per-torrent flags 显式清零、会话归属（公开拒 private、私有拒 public）、
+     * 磁力加种进公开会话 + 五种失败各一句话、同 infohash 两种 scope 的去重（正反两种顺序）。
+     * 会真起两个 libtorrent 会话，断言全在 [PublicSwarmSelfTest] 里。
+     */
+    private static void publicSwarm() {
+        PublicSwarmSelfTest.run(SelfTest::check);
     }
 
     private static void check(String name, boolean ok) {

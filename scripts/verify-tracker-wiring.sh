@@ -22,8 +22,14 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ART="$SCRIPT_DIR"
+# 两种位置都要能用：scripts/ 下（仓库内）与 artifacts/tracker-wiring/ 下（原始落点）
+if [ -d "$SCRIPT_DIR/../tools/devkit" ]; then
+  ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+else
+  ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+fi
+ART="$ROOT/artifacts/tracker-wiring"
+mkdir -p "$ART"
 DEVKIT="$ROOT/tools/devkit/devkit.mjs"
 PKG="app.huchuan"
 OPPO="${TW_OPPO:-3B1F5HEADK1TXSF0}"

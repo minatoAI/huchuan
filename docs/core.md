@@ -3,6 +3,7 @@
 - 版本：2026-11-06 · 内核 agent · 对应协议 v0（docs/design/protocol.md，唯一事实源）
 - 状态：**M1 全流程在桌面 JVM 上用两个独立进程跑通**（建群 → 后 8 位加入 → 32 MiB 共享/下载/SHA 一致 → 评论 3 s 内入库 → 全程 dht_nodes=0）
 - 本轮（M1.6 跨网发现）：内核接上自建 tracker（协议 §3.2）—— 建群 / 入群时登记 `groupHash20`，每群一条线程按**服务端下发的 interval**（默认 600 s、下限 300 s）announce；passkey 每小时轮换（`hex(HMAC-SHA256(kGrp, "huchuan/trk1/v1"‖gid‖小时整数))`），换小时先重新注册（带 `prevPasskey` 做连续性证明）再 announce；回来的 peers 进候选表，与 mDNS / 手动地址按 §3.4 合并去重、**优先级最低**（`CandidateMerge`）。配置项 `trackerBaseUrl` 为空 = 整个功能关闭：只失去跨网那一档，局域网照常，不报错、零请求。私有群的 infohash 仍然不进 DHT / PEX / LSD（协议 §8 不变），上报给 tracker 的只有伪 swarm 的 `groupHash20`；日志里 passkey 只留前 4 字符。接口与口径见 §3.5，常量见 §6
+- 本轮（M3 公开种子内核）：按 `docs/design/public-swarm.md`（pub2）实现内核部分 —— ① `FileEntry` / `GroupFile` 加 `scope`（缺省 private，旧 state.json 零迁移）与 magnet、size/pieceSize 允许 0（未知），同群内按 fileId 去重且同一 infohash 只留 private；② 新增独立 `PublicBtSession`（DHT 开、PEX 开、LSD 关、uTP 开、端口 6881 起、`<data>/public`、独立 `pub_*` 日志），加种前一律按 `TorrentInfo.isPrivate` 选会话，公开会话拒绝 private 种子、私有会话拒绝 public 种子；③ `addPublicMagnet`：建 torrent → 等元数据 → 落 .torrent，五种失败各一句中文且不抛异常；④ 公开条目复用同一条 file.add 广播（带 magnet、不带内联种子、**不新增 0x53**），不按 btPort 拨号（pubBtPort 属协议侧）。接口与断言见 §3.6
 - 上一轮（P7 全局限速接线前置）：内核补**会话级（全局）限速** —— `setSessionUploadLimit` / `setSessionDownloadLimit` / `sessionUploadLimitKbps` / `sessionDownloadLimitKbps`，运行期改立刻生效、对会话里**已存在**的 torrent 同样生效；入参 KB/s，内部 ×1024 字节/秒，0 = 不限（口径见 §6）。**踩到的坑**：libtorrent 默认把局域网与回环对端排除在全局限速之外（`upload_rate_limit` 只作用在 global peer class 上），只设那两个值时读数一切正常、局域网上一点没慢（实测 16 MiB loopback：设 2048 KB/s 仍按 31 MB/s 跑完）；内核在建会话时把私网段并进 global peer class 修掉（同一流量压到 ≈1.4 MB/s）。顺带修掉「端口兜底用 0」的缺陷（见 §8-2）。app 侧接线不在本轮
 - M1.5（上一轮）：三件事 —— ① **修「组队不成立」的缺陷**：`connectSeeders` 原来「有 1 条 peer 就整轮不拨」，单做种者先被连上后多个下载者永不互连；现在按「每成员一次拨号」，幂等去重 + 复用冷启动重连的退避与预算（`MemberDialPolicy`）。② **修「两端同时拨号永远连不上」的缺陷**：被 `duplicate_link` 裁决关掉的一侧原来只会退避重拨；现在认出「同一成员已有活链路」并直接沿用（`settleOnExistingLink`），僵尸链路不再参与裁决。③ **新增队友数观测读口** `kernel.teammates(gid, fileId)`（数据来自 libtorrent 的 peer 列表，无新协议字段、不用 0x53）。E0 实测 `D=1.1394 / T_all=301.7s / peers=2/2` → 结论「只做通告，不做分片」，见 docs/reports/e0-team.md
 - M1.4（上一轮）：补两个内核缺口 —— ① 冷启动后主动重连群成员（mDNS + 落盘的手动地址 + 上次连过的端点，指数退避 1/2/4/8/16/30 s、每群并发 3），完成后暴露 `KernelEvents.peersChanged` 给 P6；② 完成判定不再等 2 s 巡查节拍，libtorrent 的 `torrent_finished_alert` + 200 ms 兜底巡查当场推 `fileCompleted`（实测：事件比「本进程第一次看到 isComplete」只早 51 ms，另一次跑早 135 ms）。见 §3.3
@@ -21,12 +22,12 @@ bash scripts/m1-headless.sh
 
 1. `./gradlew :core:jar :core:m1Deps :core:m1Native`（构建内核 + 拉依赖 + 解出 `libtorrent4j.dll`）
 2. `javac` 编译 harness（`harness/src/main/java`）
-3. 跑字节层自检 `SelfTest`（219 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃）
+3. 跑字节层自检 `SelfTest`（274 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃；**本轮新增公开种子一组 55 条**（§3.6：公开会话 DHT 开 / 私有会话 DHT 关、端口 ≥ 6881、per-torrent flags 清零与 0x380000、公开拒 private 与私有拒 public、磁力加种落进公开会话、五种失败文案、同 infohash 两种 scope 正反两种顺序去重））
 4. 起 A、B 两个 JVM 进程跑 M1 全流程，然后只用 grep 复核日志
 
 产物：`artifacts/m1/log-A.log`、`log-B.log`、`selftest.log`、`a-data/`、`b-data/`（含 `state.json`、`identity.txt`、`downloads/`）。`artifacts/` 不进版本库。
 
-一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **1 分 40 秒左右**（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；本轮跨网发现里要起两个真内核 + 两个本机 mock tracker，再多花 ~8 s）；脚本的 35 条 CHECK 全 PASS（自检 219 条另计，其中跨网发现一组 68 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
+一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **1 分 40 秒左右**（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；本轮跨网发现里要起两个真内核 + 两个本机 mock tracker，再多花 ~8 s）；脚本的 35 条 CHECK 全 PASS（自检 274 条另计，其中公开种子一组 55 条、跨网发现一组 68 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
 
 本轮新增的三条硬断言在 harness 里。`scripts/m1-headless.sh` 本轮不动，它仍然只看 harness 的退出码（`process.rc_0_0` / `catchup.process_rc_0_0_0`）：harness 判 FAIL 即整轮 FAIL，脚本输出里也有对应的证据行。
 
@@ -83,9 +84,14 @@ G1/G3/G4 的运行时验证不在这条脚本里（脚本本轮不动），用�
 | `PeerServer.kt` | 消息层监听（端口顺延）、TLS 握手、每条连接一个线程 | §5 |
 | `KernelEvents.kt` | 宿主事件出口 + 加入状态 + join 限速器 | §8 |
 | `Reconnect.kt` | 冷启动重连（缺口一）：退避与候选编排 `ReconnectPolicy`（1/2/4/8/16/30 s、每群并发 3）+ 驱动 `PeerReconnector`（mDNS / 落盘端点 / 手动地址三处候选，连上即 hello 绑定，不重新 join）。另含 ① 成员间 BT 拨号编排 `MemberDialPolicy`（每成员一次、幂等、同一套退避与预算）；② 撞车兜底开关 `LinkRaceGuard`（`-Dhuchuan.mutants=no_link_fallback` 只给反向验证用） | §3.1 §3.3 §3.4 §11 |
-| `M1Kernel.kt` | 门面：生命周期、建群/加入、公钥登记、持久化、后台巡查（心跳/补连/进度）、完成判定快通道、重连器装配 | §11 |
+| `M1Kernel.kt` | 门面：生命周期、建群/加入、公钥登记、持久化、后台巡查（心跳/补连/进度）、完成判定快通道、重连器装配、**公开会话装配与磁力导入**（`addPublicMagnet` / `sessionOf`，见 §3.6） | §11 |
+| `PublicBtSession.kt` | 公开会话（独立 SessionManager）：DHT 开 / LSD 关 / uTP 开 / PEX 开（per-torrent flags 显式清零）/ 不设 ip_filter / 端口 6881 起 / `<data>/public` / 按需启停 | 公开 swarm（public-swarm §2.3） |
+| `PublicMagnet.kt` | 磁力解析与规范化 `MagnetLink` + 导入结果 `PublicMagnetResult`（五种失败各一句中文） | BEP 9（public-swarm §3） |
+| `LocalSession.kt` | 私有 / 公开两个会话共用的读口，配合 `M1Kernel.sessionOf` 让「这文件在本机走到哪了」只有一套读数 | — |
+| `EntryScope.kt` | 条目去重 `FileEntryMerge`：同一 infohash 同时存在 private 与 public 时只留 private（file.add 与 file.list 同一处） | 公开条目（public-swarm §1.1） |
 
-数据落在 `<dataDir>`：`identity.txt`（PKCS8 + X509 公钥）、`state.json`（群/成员/文件/评论/公钥）、`bt/`、`downloads/`。
+数据落在 `<dataDir>`：`identity.txt`（PKCS8 + X509 公钥）、`state.json`（群/成员/文件/评论/公钥）、`bt/`、`downloads/`；
+公开会话另有自己的目录 `public/data`（公开下载落盘）与 `public/meta/<infohash>.torrent`（元数据缓存），与 `bt/` 完全隔离。
 
 `state.json` 里的群密钥不按明文写：`M1Kernel(secretBox = ...)` 决定包裹方案，落盘两个字段 —— `keySeed`（token）+ `keySeedProt`（方案名）。桌面 harness 用 `PlaintextSecretBox`（token 就是 hex，与 M1 早期的 `state.json` 兼容）；Android 的 `M1Runtime` 传 `KeystoreSecretBox`（Android Keystore AES-GCM），Keystore 不可用时退到 `IdentitySecretBox`（身份私钥派生）。方案名认不出、或 token 打不开（刷机 / 恢复出厂 / 密钥被系统清掉）时**跳过该群，绝不回退明文**，日志是 `state_key_scheme_unknown` / `state_key_unseal_failed`。
 
@@ -437,6 +443,58 @@ group.candidates()       // 候选表快照：manual/peer → lan → tracker，
 零请求那一条用 JVM 的 `ProxySelector` 记账（每次 `HttpURLConnection` 都会被问到），所以「没发请求」是可证伪的，
 不是「我没看见」。
 
+### 3.6 公开种子（public-swarm 内核，本轮）
+
+设计依据：`docs/design/public-swarm.md`（pub2，六条裁决已定）。这一节只写**内核做了什么**，UI 另派。
+
+**两套会话，一个模型。** 同一个 `FileEntry` / `GroupFile` 加 `scope` 一个判别字段（缺省 private），
+公开条目多一个必填 `magnet`、`size`/`pieceSize` 允许为 0（元数据未知）。会话归属**不看 scope 字段**：
+加种前一律按种子自身的 private 位（BEP 27）决定用哪个会话 —— `SessionRoute.of(ti.isPrivate)`。
+
+| 文件 | 职责 |
+|---|---|
+| `LocalSession.kt` | 两个会话共用的读口（has / progress / isFinished / savedFile / peers / seedState / 速率 / removeTorrent / 单文件限速 / super-seeding）。`M1Kernel.sessionOf(fileId)` 先问私有会话（常驻）再问公开会话（按需），公开任务的进度、完成判定、做种对账都走这一条，不会被私有会话答成「没有这个 torrent」 |
+| `PublicBtSession.kt` | 公开会话：**独立 SessionManager**（不复用 `BtSession`，它加种无条件 `or_` 0x380000）。DHT 开、LSD 关、uTP 显式开、**不设 ip_filter**、端口 6881 起顺延 100、数据 `<data>/public/{data,meta}`、日志事件名 `pub_*` + 字段 `sess=pub`。per-torrent flags 从一个**显式清零**的常量出发（`publicFlagsBits() == 0`），PEX 因此是开的 |
+| `PublicMagnet.kt` | `MagnetLink`（只认 `xt=urn:btih:`，40 hex 与 32 位 base32 两种写法都归一成 40 hex；tr 原样保留，我们自己从不加 tracker）+ `PublicMagnetResult`（五种失败各一句中文，`messageFor` 是纯函数） |
+| `EntryScope.kt` | `FileEntryMerge`：同群内按 fileId 去重，**同一 infohash 同时存在 private 与 public 时只留 private**（public 先到时 PROMOTE、private 先到时 DROP）。file.add 与 file.list 两条路都只调它，日志 `file_scope_dedup action=drop|promote` |
+
+```kotlin
+// 磁力导入（内核侧）：建 torrent → 等 MetadataReceivedAlert → 落 .torrent → 建公开条目并广播
+val r = kernel.addPublicMagnet(gid, "magnet:?xt=urn:btih:<40hex>&dn=...", name = null, timeoutMs = 60_000)
+r.ok           // 元数据到手（能下载 / 能做种）
+r.reason       // "" | invalid_link | duplicate | no_source | timeout | bad_metadata
+r.message      // 一句中文，直接显示；成功时为 ""
+r.entry        // 入库的公开条目（invalid_link / duplicate 时为 null）
+r.metadataPath // <data>/public/meta/<infohash>.torrent
+
+group.addFile(file)                       // 私有：v1 私有种 → 私有会话 → 广播 file.add（不变）
+group.startDownload(fileId)               // 公开条目：先找 <data>/public/meta 的缓存，没有就把磁力挂进公开会话
+kernel.sessionOf(fileId)                  // 这个 torrent 现在在哪个会话里（读口统一入口）
+```
+
+| 失败 | 触发 | 一句话 | 条目 |
+|---|---|---|---|
+| `invalid_link` | 链接不是磁力 / 没有 v1 xt / v2（btmh） | 链接无法识别 | 不建 |
+| `duplicate` | 群清单里已有这个 infohash | 这个种子已经在群里 | 不建 |
+| `no_source` | 等满超时且 `numPeers=0` | 找不到来源，先挂着等别人上线 | 建（状态「等待来源」） |
+| `timeout` | 等满超时有 peer 但元数据没到 | 等文件信息超时，会继续重试 | 建 |
+| `bad_metadata` | `MetadataFailedAlert`，或元数据 infohash / v1 校验不过 | 文件信息无效 | 建（torrent 摘掉） |
+
+- **不抛异常**：五种失败都是返回值；除 invalid_link / duplicate 外条目照建（`无元数据不报错`，§3.1）。
+- 元数据只从 swarm 取（BEP 9 ut_metadata，libtorrent 内置），不接索引站；.torrent 落 <data>/public/meta/<infohash>.torrent，
+  重启直接按它挂种。后台补元数据那条路（磁力早超时、torrent 留在会话里继续找源）同样会落缓存并回填条目（`pub_background_metadata`）。
+- 公开条目也走同一条 0x12 file.add 广播，带 `scope=public` 与 magnet、**不带**内联 .torrent、**不新增 0x53**；
+  peer.announce 原样复用（`pubBtPort` 属协议侧，本轮未加，所以公开条目不按 btPort 拨号）。
+- 公开会话按需启停：有非休眠公开条目才起，全部休眠 / 移除即停（`public_session_started` / `public_session_stopped`）；
+  端口映射默认关（`setPortMapping`），限速与私有会话各自封顶（§7.2 裁决 3）。
+
+验收（`harness/PublicSwarmSelfTest.java`，挂在 `SelfTest` 里，正向证据行 `selftest.public checks=55 failures=0`）：
+公开会话 `enable_dht=true` 且 `is_dht_running=true`、私有会话两者皆 false；公开端口 ≥ 6881；
+公开 per-torrent flags 为 0（PEX 未被禁）、私有仍是 0x380000；公开会话拒绝 private 种子、私有会话拒绝 public 种子；
+磁力加种后 torrent 在**公开**会话里而不在私有会话里（内核级：真起一个内核 + 真建一个群，`kernel.publicTorrentCount()==1`、`kernel.privateTorrentCount()==0`、公开会话端口 ≥ 6881、日志里有 `pub_magnet_added`，且条目 `scope=public`、magnet 非空、不内联 .torrent）；重复 / 非法链接各有固定文案；五种失败文案齐全且互不相同；
+同一 infohash 两种 scope 的正反两种到达顺序各断言一次（PROMOTE / DROP），旧 JSON 缺 scope 读回是 private。
+本组做过三次反向变异，都当场变红：把公开会话的 DHT 与 flags 换回私有那套 → 5 条红；把 DROP 改成 KEEP → 2 条红；让内核磁力导入不落进公开会话 → 3 条红。
+
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。
@@ -513,6 +571,11 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 | 完成事件与日志的顺序（M1.5） | `completeFile` **先写 `download_completed` 日志行、再推 `fileCompleted` 事件**：宿主常在回调里立刻读 `source`，反过来写会出现「事件已到、source 还是空」的窗口（harness 因此把快通道误判成慢通道过一次） | `M1Kernel.completeFile` |
 | 在线成员事件（M1.4） | `KernelEvents.peersChanged(group, dev, online)`：只在连接表变化（`attach` / `detach`）时回调，重连成功同样是一次 `online=true`；宿主据此重读 P6 | `KernelEvents.peersChanged`、`GroupRuntime.attach/detach` |
 | 冷启动重连的落盘 | `state.json` 每群多两个字段：`peerAddrs`（`[{dev, addr}]`，只记本机拨出去并绑定成功的端点）与 `manual`（`[host:port]`，join 时用过的手动地址）。旧库缺这两个字段 → 重连改走 mDNS | `GroupRuntime.toStoreJson`、`M1Kernel.loadState` |
+| 公开会话参数（M3） | `enable_dht=true`、`enable_lsd=false`、`enable_incoming/outgoing_utp=true`、UPnP/NAT-PMP 默认关（`setPortMapping` 按需开）、`connections_limit=200` / `active_downloads=3` / `active_seeds=20`、**不设 ip_filter**、`listen_interfaces=0.0.0.0:6881` 起顺延 100（不与私有 51413 段重叠） | `PublicBtSession.settings` |
+| 公开 per-torrent flags（M3） | **显式清零**（`publicFlagsBits()==0`）：DISABLE_DHT / DISABLE_LSD / DISABLE_PEX 一个都不设 —— PEX 没有会话级开关，不设就是开。私有侧仍是 `PRIVATE_FLAGS` = 0x380000 | `PublicBtSession.publicFlags`、`BtSession.PRIVATE_FLAGS` |
+| 会话归属（M3） | 加种前只看 `TorrentInfo.isPrivate`（BEP 27），不看条目上的 `scope`：private=1 进私有会话、private=0 进公开会话，两边都拒绝异类（公开会话 `accepts(true)=false`）。传输面的 scope 可被转发方篡改，所以判别归判别、安全归安全 | `SessionRoute`、`BtSession.accepts`、`PublicBtSession.accepts` |
+| 条目 scope / magnet（M3） | `FileEntry.scope`（`private`/`public`，缺字段 = private，**不进 file1 签名域**）、公开条目 magnet 必填、size/pieceSize 允许 0（元数据未知，到手后本地回填、不回广播）。去重口径只有 `FileEntryMerge` 一处：同一 infohash 同时存在 private 与 public 时只留 private | `FileEntry`、`FileEntryMerge`、`GroupRuntime.onFileEntry/onFileListEntry` |
+| 磁力导入（M3） | `addPublicMagnet` → `parse_magnet_uri` → 公开会话加种 → `MetadataReceivedAlert` → `save_resume_data`(`SAVE_INFO_DICT`) → `<data>/public/meta/<infohash>.torrent`。失败五种（invalid_link / duplicate / no_source / timeout / bad_metadata）各一句中文、不抛异常；除前两种外条目照建 | `PublicBtSession.addMagnet`、`PublicMagnetResult`、`M1Kernel.addPublicMagnet` |
 | 重启续种（原 G2） | `state.json` 的 `seeding` 数组（`{fileId, path}`）。逐条判定「条目在、inline torrent 在、文件在、大小对」才挂种；其余降级为休眠，日志 `seed_resumed` / `seed_resume_failed reason=entry_missing\|no_torrent\|file_missing\|size_mismatch\|activate_failed`。只续做种，未完成的下载不续传 | `SeedRestore`、`GroupRuntime.resumeSeeds`、`M1Kernel.start` |
 
 ## 7. 协议缺口与实现取舍（请协议 owner 裁决）
@@ -527,7 +590,7 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 6. **keySeed 落盘方案。** 包裹接口 `SecretBox` 已落地（见 §2）：Android 走 `KeystoreSecretBox`（`state.json` 里只放 token + 方案名），桌面 harness 仍是 `PlaintextSecretBox`，Windows 桌面 daemon 的 PKCS12 未做。真机上「keySeed 不落明文」这条已满足（`m1-device.sh` 断言 `keyseed_box=keystore-aes-gcm-1`）；Windows 侧排 M1.5。
 7. **ip_filter 走 swig 的 session_params 注入**（best-effort）：libtorrent4j 2.1.0-39 的高层 `SessionManager` 没有直接入口，实现里用 `session_params.setIp_filter` 在启动前塞进去；失败就退回「私有种子 + DHT/PEX/LSD 全关」。
 8. **kind（u8）在 signBytes 里按 8 字节整数编码**，遵循 §1.2「整数固定 8 字节」；如果将来要严格 u8，需要协议明确。
-9. **magnet 加种未实现。** M1 只用 file.add 的内联 .torrent（32 MiB / 64 KiB 片 ≈ 15 KB base64，远低于 47 KiB 上限）。§11-14 要求两条路径都支持，M2 补 magnet（需要 ut_metadata 先拿到元数据才能 `connect_peer`）。
+9. ~~magnet 加种未实现~~ **公开侧已收敛（M3 内核）**：`kernel.addPublicMagnet` 走 BEP 9 `ut_metadata`（libtorrent 内置）拿元数据、落 `<data>/public/meta/<infohash>.torrent`，见 §3.6。**私有侧仍只用 file.add 的内联 .torrent**（32 MiB / 64 KiB 片 ≈ 15 KB base64，远低于 47 KiB 上限）；私有 magnet 加种未做，也不该做（私有群只走消息层分发的种子）。
 10. **成员平台与做种数走 0x30 的两个可选字段，且不进签名域。** 协议 §10 的 peer1 域固定在 `[dev, gid, btPort, ts]`，同一条消息里的 `btHost` 本来就不进签名；本轮把 `plat`（android/windows/unknown）与 `seeds`（自报本群做种数）按同一口径补在 0x30，已写进 protocol.md §10。代价是这两个值自报、不防篡改（能被改的只是 P6 上显示的数字）；收益是不动既有签名域，老实现的 sig 仍然验得过，不需要动帧版本位。成员表里另有「谁是成员」这条判定，始终由 join.ok / 消息层链路决定，不看这两个字段。
 
 ## 8. 退化点（实现里真实存在，不是设想）
@@ -559,6 +622,8 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 - **成员平台 / 做种数是自报值。** `peer.announce` 的 `plat` / `seeds` 不进签名域、收端不验、不参与任何准入或传输判定，只用于 P6 显示。离线成员在被删除前一直显示重启前那一刻的值，重启后、重新握手前显示 `unknown` / 0。
 - **未读数按「可见 op」算。** 游标只记「上次读到哪条 op」，不存每条 op 的已读标记：墓碑到达后该条（及被墓碑指向的那条）从可见集合消失，未读数会跟着变小，这是刻意的口径。同一台设备上的两个群各自维护游标，没有全局未读。
 - **退群不删用户数据。** `removeGroup` 只从会话与本地库里摘掉群，磁盘上已下载的文件保持原样；群不在本地库里，重启时也就没有它的做种集合可恢复，所以退群不会去动 `downloads/`。
+- **公开种子只做了内核，没接 UI 与拨号。** ① 公开条目不会按 `peer.announce.btPort` 拨号（那是私有会话端口，拨过去会连到错误会话）；`pubBtPort` 属协议侧，落地前公开条目只靠 DHT / 自带 tracker 找 peer。② 公开条目的「激活」路径只保证把 torrent 挂进公开会话（缓存优先、磁力兜底），完成事件与做种集合按 `sessionOf` 路由后可用，但**没有真机 / 群外设备验证**（pub2 §9 第 7 条要求「群外设备纯磁力下完、两端 SHA-1 一致」，本轮未做）。③ DHT 冷启动要几秒到几十秒，第一次激活会慢一拍（pub2 §7.1）；线程 / 内存是否随 `stop` 完全释放也还没测。
+- **公开会话与私有会话各占一份限速预算。** `upload_rate_limit` / `download_rate_limit` 是会话级的，libtorrent 没有跨会话共享令牌桶（pub2 §7.2 裁决 3）：设 512 KB/s 时最坏总峰值 2×。公开会话的 `setSessionUploadLimit` / `setSessionDownloadLimit` 与私有侧各自封顶。
 - **`app/` 与 `daemon/` 还没接 G1/G3/G4。** core 侧接口与落盘都已就绪（§3.1 有签名），UI 上这三块空白要等下一轮接线。
 
 ## 10. 下一步
@@ -566,5 +631,6 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 1. 接 UI：P2/P3/P4/P5 换成 `M1Kernel` + `GroupRuntime`，把 `InMemoryGroupStore` 降级成空实现；顺便按 §3.1 接上 G1（退群入口）、G3（成员平台/做种数）、G4（P2 未读角标 + P4 打开即清零）；P6 挂 `KernelEvents.peersChanged` 刷新在线状态（§3.3）。
 2. Android 侧：自编 arm64 .so 换掉 `compileOnly` 的桌面制品，加 MulticastLock，`keySeed` 进 Keystore。
 3. 跨网接线：`daemon/` 把 `trackerBaseUrl` 从配置（daemon 自己的设置落盘处）读出来交给 `M1Kernel`（`app/` 已完成，见 `docs/reports/tracker-wiring.md`）；然后把拨号器从 `PeerReconnector` 里拆出来，让运行中的群也能按 tracker 的 peers 立刻重拨（本轮只喂候选表）。
-4. M2 剩余：换码换钥 group.rotate、删除（log.del/file.del）、magnet 路径、可达性分层（`docs/design/nat-traversal.md` §8 的阶梯）。
+4. M2 剩余：换码换钥 group.rotate、删除（log.del/file.del）、可达性分层（`docs/design/nat-traversal.md` §8 的阶梯）。私有侧 magnet 加种明确不做（私有群只走消息层分发的种子）。
+5. 公开种子接 UI（另派）：P3 行「公开」chip、P3「导入磁力」弹层、P4「公开到群外」/「移除」+ 本地 infohash 屏蔽；内核侧 `addPublicMagnet` / `GroupFile.scope` / `GroupFile.magnet` / `file_scope_dedup` 已就绪（§3.6）。协议侧补 `peer.announce.pubBtPort` 之后再接「公开条目对每个成员各拨一次」。
 5. 协议修订：把 §7 剩下没写死的地方（第 1 条的 hello 两阶段、第 5 条的多群 hello）写进协议，否则第三方实现没法互通；§7 的 2/3/4 已按 §10 实现完，protocol.md §13 的第 2/3/4 行可以结案（该表归设计 agent 维护，本轮未改）。

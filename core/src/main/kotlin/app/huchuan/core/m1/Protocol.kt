@@ -1,5 +1,6 @@
 package app.huchuan.core.m1
 
+import app.huchuan.core.FileScope
 import java.io.DataInputStream
 import java.net.URLEncoder
 
@@ -148,7 +149,7 @@ object Frames {
  * file.add 把它放在帧级 sig 字段（§10 的例子），file.list 的每条 entry 原样再带一份（§7）；
  * 两处都读：签名跟着条目走，接手的成员按 [addedBy] 的公钥就能独立验，不必信任转发通道。
  */
-data class FileEntry(
+data class FileEntry @JvmOverloads constructor(
     val fileId: String,
     val name: String,
     val size: Long,
@@ -158,7 +159,18 @@ data class FileEntry(
     val magnet: String = "",
     val torrent: String = "",
     val sig: String = "",
+    /**
+     * 私有 / 公开（public-swarm §1.1）。缺省 [FileScope.PRIVATE]：旧 state.json 与旧对端发来的
+     * entry 都没有这个字段，读回来一律按私有处理，不需要迁移。
+     *
+     * 它**不进** file1 签名域（§1.2）：转发方改了它最多影响列表归属与 UI，加种时按种子自身的
+     * private 位选会话，不看这个字段。公开条目的 size / pieceSize 允许是 0（元数据未知）。
+     */
+    val scope: FileScope = FileScope.PRIVATE,
 ) {
+    /** 公开条目：走公开 swarm，磁力必填、.torrent 不内联（public-swarm §1.1）。 */
+    val isPublic: Boolean get() = scope == FileScope.PUBLIC
+
     fun toJson(): J.Obj = jobj(
         "fileId" to jstr(fileId),
         "name" to jstr(name),
@@ -169,6 +181,7 @@ data class FileEntry(
         "magnet" to jstr(magnet),
         "torrent" to jstr(torrent),
         "sig" to jstr(sig),
+        "scope" to jstr(scope.wire),
     )
 
     /** 参与 file1 签名的字段，顺序写死（协议 §1.2）。 */
@@ -192,6 +205,8 @@ data class FileEntry(
             magnet = o.str("magnet") ?: "",
             torrent = o.str("torrent") ?: "",
             sig = o.str("sig") ?: "",
+            // 缺字段 / 认不出的值一律 private（旧库零迁移，public-swarm §1.1）。
+            scope = FileScope.parse(o.str("scope")),
         )
     }
 }

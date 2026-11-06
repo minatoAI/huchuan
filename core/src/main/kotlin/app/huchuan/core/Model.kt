@@ -12,6 +12,28 @@ enum class FileState {
     SEEDING,
 }
 
+/**
+ * 文件作用域（docs/design/public-swarm.md §1.1）：私有 = 只在群内传；公开 = 走公网 swarm。
+ *
+ * 它是**判别字段**，不是安全边界：加种前一律按种子自身的 private 位（BEP 27）选会话，
+ * 传输中的 scope 可被转发方篡改，最多影响列表归属与 UI（§1.2）。
+ * 缺省 private —— 旧 state.json 里没有这个字段的条目读回来就是私有，零迁移。
+ */
+enum class FileScope {
+    PRIVATE,
+    PUBLIC,
+    ;
+
+    /** 落盘 / 上线的写法（file.add / file.list 的 entry.scope）。 */
+    val wire: String get() = if (this == PUBLIC) "public" else "private"
+
+    companion object {
+        /** 认不出的值一律当 private：一个未知字符串不该把私有条目变成公开条目。 */
+        fun parse(raw: String?): FileScope =
+            if (raw?.trim()?.lowercase() == PUBLIC.wire) PUBLIC else PRIVATE
+    }
+}
+
 /** 通知档（spec §1、P7）：系统气泡 / 仅应用内 / 静音。 */
 enum class NotificationLevel {
     SYSTEM_BUBBLE,
@@ -62,6 +84,7 @@ data class Comment(
 data class GroupFile(
     val id: String,
     val name: String,
+    /** 字节数；0 = 未知（公开条目在元数据到手前就是 0，P3 行不显示大小，public-swarm §3.1）。 */
     val sizeBytes: Long,
     val sourceMember: String,
     val state: FileState,
@@ -73,6 +96,12 @@ data class GroupFile(
     val downloadRateBps: Long,
     val uploadRateBps: Long,
     val comments: List<Comment> = emptyList(),
+    /** 私有 / 公开（public-swarm §1.1）。缺省 private；P3 行上的「公开」chip 只看它。 */
+    val scope: FileScope = FileScope.PRIVATE,
+    /** 公开条目的磁力（xt=urn:btih:<40 hex>）；私有条目为空串。 */
+    val magnet: String = "",
+    /** 分片大小；0 = 未知（公开条目在元数据到手前就是 0）。 */
+    val pieceSize: Int = 0,
 ) {
     /** 组队只存在于「部分」（下载中）；队友数 = 同时下载的同组成员 − 1。 */
     val inTeam: Boolean get() = state == FileState.DOWNLOADING && teammates > 0

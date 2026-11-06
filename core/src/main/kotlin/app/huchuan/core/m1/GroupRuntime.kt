@@ -1,5 +1,6 @@
 package app.huchuan.core.m1
 
+import app.huchuan.core.FileScope
 import java.io.File
 import java.util.Base64
 
@@ -220,9 +221,120 @@ class GroupRuntime internal constructor(
         return signed
     }
 
+    /**
+     * 去重留痕：只有 DROP / PROMOTE 两种才是「同 infohash 撞了 scope」，KEEP / ADD 是日常流量，不打日志。
+     *
+     * 日志名 `file_scope_dedup`，字段 action=drop|promote —— 验收脚本按它判「同一 fileId 两种 scope
+     * 同时到达时只留 private」（public-swarm §9 的第四条断言）。
+     */
+    private fun logScopeMerge(incoming: FileEntry, action: FileEntryMerge.Action, channel: String) {
+        if (action != FileEntryMerge.Action.DROP && action != FileEntryMerge.Action.PROMOTE) return
+        kernel.events.log(
+            "file_scope_dedup",
+            mapOf(
+                "group_id" to groupId,
+                "file_id" to incoming.fileId,
+                "action" to action.wire,
+                "incoming_scope" to incoming.scope.wire,
+                "channel" to channel,
+            ),
+        )
+    }
+
+    /**
+     * 公开条目入库并广播（public-swarm §1.1 / §4）。
+     *
+     * 与 [addFile] 的差别只有三样，全在数据上：
+     *  - `scope=public`，内联 .torrent 为空（群内只传磁力，帧上限 65533 B 装不下大种子的 .torrent）；
+     *  - 本机不建种、不挂会话：公开条目的数据来自公网 swarm，本机可能是纯下载方；
+     *  - `size` / `pieceSize` 允许是 0（元数据未知），拿到之后由 [backfillPublicMetadata] 本地回填。
+     *
+     * 广播的仍是同一条 0x12 file.add（protocol §9「M3 私有层零变更」），只是多了 scope 与 magnet
+     * 两个字段；磁力只带发布者自己写的 xt/dn/xl，不带我们自己加的 tracker（§2.2）。
+     */
+    internal fun addPublicEntry(
+        fileId: String,
+        magnet: String,
+        name: String,
+        size: Long,
+        pieceSize: Int,
+    ): FileEntry {
+        val entry = FileEntry(
+            fileId = fileId,
+            name = name,
+            size = size,
+            pieceSize = pieceSize,
+            addedBy = kernel.deviceId,
+            addedAt = System.currentTimeMillis(),
+            magnet = magnet,
+            torrent = "",
+            scope = FileScope.PUBLIC,
+        )
+        val sig = kernel.identity.sign(Domains.FILE, entry.signFields())
+        val signed = entry.copy(sig = sig)
+        val merged = synchronized(lock) {
+            val result = FileEntryMerge.merge(files[fileId], signed)
+            result.entry?.let { files[fileId] = it }
+            result
+        }
+        logScopeMerge(signed, merged.action, "local_public")
+        if (merged.action == FileEntryMerge.Action.DROP) {
+            // 同 infohash 已经是私有条目（裁决 5：只留 private）：本地不换行，也不再往外广播这条公开条目。
+            return synchronized(lock) { files[fileId] } ?: signed
+        }
+        kernel.events.log(
+            "file_public_added",
+            mapOf(
+                "group_id" to groupId,
+                "file_id" to fileId,
+                "name" to name,
+                "size" to size.toString(),
+                "piece_size" to pieceSize.toString(),
+                "scope" to FileScope.PUBLIC.wire,
+                "action" to merged.action.wire,
+            ),
+        )
+        broadcast(MsgType.FILE_ADD, jobj("entry" to signed.toJson(), "sig" to jstr(sig)), null)
+        kernel.saveState()
+        kernel.events.fileAdded(this, merged.entry ?: signed)
+        return merged.entry ?: signed
+    }
+
+    /**
+     * 元数据到手后本地回填 size / pieceSize / 名字（public-swarm §1.1）：
+     * **不改签名、不回广播** —— 尺寸由 info 字典自身保证，谁都能解析自查，不需要信任发布者。
+     */
+    internal fun backfillPublicMetadata(fileId: String, name: String, size: Long, pieceSize: Int) {
+        val changed = synchronized(lock) {
+            val old = files[fileId] ?: return@synchronized false
+            if (old.scope != FileScope.PUBLIC) return@synchronized false
+            files[fileId] = old.copy(
+                name = name.ifBlank { old.name },
+                size = if (size > 0) size else old.size,
+                pieceSize = if (pieceSize > 0) pieceSize else old.pieceSize,
+            )
+            true
+        }
+        if (changed) {
+            kernel.events.log(
+                "file_public_metadata",
+                mapOf(
+                    "group_id" to groupId,
+                    "file_id" to fileId,
+                    "name" to name,
+                    "size" to size.toString(),
+                    "piece_size" to pieceSize.toString(),
+                ),
+            )
+            kernel.saveStateIfStarted()
+        }
+    }
+
     /** 「激活」：加种/加 peer 开始下载（协议 §11 第 13-14 步）。 */
     fun startDownload(fileId: String): Boolean {
         val entry = synchronized(lock) { files[fileId] } ?: return false
+        // 公开条目走公开会话（public-swarm §1.2）：它没有内联 .torrent，只能按磁力 / 元数据缓存加种。
+        if (entry.scope == FileScope.PUBLIC) return kernel.startPublicDownload(this, entry)
         if (entry.torrent.isEmpty()) {
             kernel.events.log("download_no_torrent", mapOf("file_id" to fileId))
             return false
@@ -240,6 +352,7 @@ class GroupRuntime internal constructor(
                     "name" to entry.name,
                     "size" to entry.size.toString(),
                     "save_path" to kernel.downloadsDir.absolutePath,
+                    "sess" to "priv",
                 ),
             )
         }
@@ -261,6 +374,9 @@ class GroupRuntime internal constructor(
     fun connectSeeders(fileId: String) {
         // 没挂进会话就没有可 connect_peer 的 torrent
         if (!isLocalTask(fileId)) return
+        // 公开条目不在这个通道上拨号：peer.announce 里还没有公开会话端口（pubBtPort，public-swarm §4.1
+        // 由协议侧跟进），拿私有 btPort 去拨只会连到对方的私有会话上。M3 之前公开条目只靠 DHT / tracker。
+        if (synchronized(lock) { files[fileId] }?.scope == FileScope.PUBLIC) return
         val targets = synchronized(lock) {
             btEndpoints.entries
                 .filter { it.key != kernel.deviceId }
@@ -379,11 +495,11 @@ class GroupRuntime internal constructor(
         return liveMembers(fileId).values.count { !it.seed }
     }
 
-    fun progress(fileId: String): Double = kernel.bt.progress(fileId)
+    fun progress(fileId: String): Double = kernel.sessionOf(fileId).progress(fileId)
 
-    fun isComplete(fileId: String): Boolean = kernel.bt.isFinished(fileId)
+    fun isComplete(fileId: String): Boolean = kernel.sessionOf(fileId).isFinished(fileId)
 
-    fun savedFile(fileId: String): File? = kernel.bt.savedFile(fileId)
+    fun savedFile(fileId: String): File? = kernel.sessionOf(fileId).savedFile(fileId)
 
     // ------------------------------------------------------------------ 宿主（Android UI / 桌面 daemon）读口
 
@@ -401,13 +517,13 @@ class GroupRuntime internal constructor(
 
     /** 0–100 的整数进度；没挂进会话时返回 0。 */
     fun percent(fileId: String): Int =
-        (kernel.bt.progress(fileId) * 100.0).toInt().coerceIn(0, 100)
+        (kernel.sessionOf(fileId).progress(fileId) * 100.0).toInt().coerceIn(0, 100)
 
-    fun downloadRateBps(fileId: String): Long = kernel.bt.downloadRate(fileId)
+    fun downloadRateBps(fileId: String): Long = kernel.sessionOf(fileId).downloadRate(fileId)
 
-    fun uploadRateBps(fileId: String): Long = kernel.bt.uploadRate(fileId)
+    fun uploadRateBps(fileId: String): Long = kernel.sessionOf(fileId).uploadRate(fileId)
 
-    fun peerCount(fileId: String): Int = kernel.bt.peers(fileId)
+    fun peerCount(fileId: String): Int = kernel.sessionOf(fileId).peers(fileId)
 
     // ------------------------------------------------------------------ 未读数（缺口 G4）
 
@@ -476,8 +592,10 @@ class GroupRuntime internal constructor(
             connectedEndpoints.clear()
             true
         }
-        kernel.bt.removeTorrent(fileId)
+        kernel.sessionOf(fileId).removeTorrent(fileId)
         kernel.events.log("file_stopped", mapOf("group_id" to groupId, "file_id" to fileId))
+        // 最后一条非休眠公开条目被摘掉 → 公开会话停掉（按需启停的另一半）。
+        kernel.maybeStopPublicSession()
         // 做种数变了，重新自报一次（协议 §10 的 peer.announce.seeds）
         broadcastPeerAnnounce(null)
         kernel.saveState()
@@ -486,13 +604,14 @@ class GroupRuntime internal constructor(
 
     /** 单文件限速（协议 §4：一文件一 torrent + setUploadLimit）。 */
     /** super-seeding 的真值：读 libtorrent 的 `torrent::flags()`，不是本项目自报的开关。 */
-    fun superSeeding(fileId: String): Boolean = kernel.bt.superSeeding(fileId)
+    fun superSeeding(fileId: String): Boolean = kernel.sessionOf(fileId).superSeeding(fileId)
 
     /** 运行中开关 super-seeding（BEP 16 允许中途切）；成没成用 [superSeeding] 读回。 */
-    fun setSuperSeeding(fileId: String, on: Boolean): Boolean = kernel.bt.setSuperSeeding(fileId, on)
+    fun setSuperSeeding(fileId: String, on: Boolean): Boolean =
+        kernel.sessionOf(fileId).setSuperSeeding(fileId, on)
 
     fun setUploadLimitKbps(fileId: String, kbps: Int) {
-        kernel.bt.setUploadLimit(fileId, kbps)
+        kernel.sessionOf(fileId).setUploadLimit(fileId, kbps)
     }
 
     /** 发评论：kind=0 新增 / kind=1 回复（协议 §6）。 */
@@ -517,6 +636,19 @@ class GroupRuntime internal constructor(
 
     internal fun isLocalTask(fileId: String): Boolean = synchronized(lock) { localTasks.contains(fileId) }
 
+    /** 把一条已经在会话里挂好的任务记进本地任务表（公开条目「激活」时由内核调）。 */
+    internal fun markLocalTask(fileId: String) {
+        synchronized(lock) { localTasks.add(fileId) }
+    }
+
+    /**
+     * 还有没有「非休眠的公开条目」—— 公开会话按需启停的唯一判据（public-swarm §7.1）。
+     * 只数本机真挂了任务的（休眠的公开条目不该让 DHT 常驻）。
+     */
+    internal fun hasActivePublicTask(): Boolean = synchronized(lock) {
+        localTasks.any { id -> files[id]?.scope == FileScope.PUBLIC }
+    }
+
     internal fun isLocalSeed(fileId: String): Boolean = synchronized(lock) { seeding.isSeeding(fileId) }
 
     /** [markCompleted] 的结果：事件只按 first 发一次，peer.announce 只按 seeding 变化发。 */
@@ -535,7 +667,7 @@ class GroupRuntime internal constructor(
      * 本地路径取自 BT 会话（下载的落在 downloads/，共享的落在原目录），重启续种要用它。
      */
     internal fun markCompleted(fileId: String): CompletionResult {
-        val path = kernel.bt.savedFile(fileId)?.absolutePath ?: ""
+        val path = kernel.sessionOf(fileId).savedFile(fileId)?.absolutePath ?: ""
         val result = synchronized(lock) {
             val first = completed.add(fileId)
             val entered = if (path.isNotEmpty()) seeding.enter(fileId, path) else false
@@ -579,9 +711,21 @@ class GroupRuntime internal constructor(
         for ((fileId, path) in pending) {
             val entry = file(fileId)
             val localFile = File(path)
+            // 公开条目没有内联 .torrent：种子字节在 <data>/public/meta/<infohash>.torrent（元数据到手那天落的）。
+            val inline = if (entry != null && entry.torrent.isNotEmpty()) {
+                Base64.getDecoder().decode(entry.torrent)
+            } else {
+                null
+            }
+            val cached = if (entry != null && entry.scope == FileScope.PUBLIC) {
+                kernel.publicCachedTorrent(fileId)
+            } else {
+                null
+            }
+            val torrentBytes = inline ?: cached?.readBytes()
             val decision = SeedRestore.decide(
                 hasEntry = entry != null,
-                hasTorrent = entry != null && entry.torrent.isNotEmpty(),
+                hasTorrent = torrentBytes != null,
                 fileExists = localFile.isFile,
                 sizeMatches = entry != null && localFile.length() == entry.size,
             )
@@ -590,11 +734,26 @@ class GroupRuntime internal constructor(
             if (decision == SeedRestore.Decision.RESUME && entry != null) {
                 activated = try {
                     // 直接按原始 torrent 字节挂种：infohash 与群里其他人看到的一致（见 SeedRestore）。
-                    val bytes = Base64.getDecoder().decode(entry.torrent)
-                    kernel.bt.addSeed(
-                        BtSession.SeededTorrent(entry.fileId, entry.name, entry.size, entry.pieceSize, bytes),
-                        localFile.parentFile ?: kernel.downloadsDir,
-                    )
+                    // 会话按种子自身的 private 位选（public-swarm §1.2）：公开条目在公开会话里续种。
+                    val bytes = torrentBytes ?: ByteArray(0)
+                    if (kernel.sessionRoute(entry) == SessionRoute.PUBLIC) {
+                        // 公开会话按需启停：续种就是「有非休眠公开条目」的那一刻，先把它起起来。
+                        val pub = kernel.ensurePublicSession()
+                            ?: throw IllegalStateException("public session unavailable")
+                        if (!pub.addTorrent(
+                                org.libtorrent4j.TorrentInfo(bytes),
+                                localFile.parentFile ?: kernel.publicDataDir(),
+                                true,
+                            )
+                        ) {
+                            throw IllegalStateException("public session refused torrent")
+                        }
+                    } else {
+                        kernel.bt.addSeed(
+                            BtSession.SeededTorrent(entry.fileId, entry.name, entry.size, entry.pieceSize, bytes),
+                            localFile.parentFile ?: kernel.downloadsDir,
+                        )
+                    }
                     synchronized(lock) {
                         localTasks.add(fileId)
                         seeding.enter(fileId, localFile.absolutePath)
@@ -651,7 +810,7 @@ class GroupRuntime internal constructor(
                     // 数据不完整（片上校验没过）：不能当作做种，否则对端会连上一个拿不到数据的种子。
                     // 刚挂种时状态是 checking / pending，这时候不下判断，等它对账成 finished 或 incomplete。
                     // 连续两拍异常才降级，避开挂种瞬间的状态抖动。
-                    val state = kernel.bt.seedState(fileId)
+                    val state = kernel.sessionOf(fileId).seedState(fileId)
                     if (state == "incomplete" || state == "missing") {
                         val bad = synchronized(lock) {
                             val n = (unhealthySeeds[fileId] ?: 0) + 1
@@ -679,8 +838,9 @@ class GroupRuntime internal constructor(
             dials.keys.removeIf { it.startsWith(fileId + "@") }
             seeding.leave(fileId)
         }
-        kernel.bt.removeTorrent(fileId)
+        kernel.sessionOf(fileId).removeTorrent(fileId)
         kernel.events.log("seed_stopped", mapOf("group_id" to groupId, "file_id" to fileId, "reason" to reason))
+        kernel.maybeStopPublicSession()
         if (changed) broadcastPeerAnnounce(null)
         kernel.saveState()
     }
@@ -707,21 +867,15 @@ class GroupRuntime internal constructor(
             )
             return false
         }
-        val isNew = synchronized(lock) {
-            if (files.containsKey(entry.fileId)) {
-                val old = files.getValue(entry.fileId)
-                files[entry.fileId] = old.copy(
-                    torrent = if (entry.torrent.isNotEmpty()) entry.torrent else old.torrent,
-                    magnet = if (entry.magnet.isNotEmpty()) entry.magnet else old.magnet,
-                    sig = if (entry.sig.isNotEmpty()) entry.sig else old.sig,
-                )
-                false
-            } else {
-                files[entry.fileId] = entry
-                true
-            }
+        // 去重口径只有一个实现（FileEntryMerge）：同一 infohash 同时存在 private 与 public 时只留 private。
+        val merged = synchronized(lock) {
+            val result = FileEntryMerge.merge(files[entry.fileId], entry)
+            result.entry?.let { files[entry.fileId] = it }
+            result
         }
         kernel.saveStateIfStarted()
+        logScopeMerge(entry, merged.action, "file_list")
+        val isNew = merged.action == FileEntryMerge.Action.ADD
         if (isNew) {
             kernel.events.log(
                 "file_list_entry",
@@ -1011,23 +1165,15 @@ class GroupRuntime internal constructor(
         }
         // 签名跟着条目一起存：之后转发 file.list 要原样带上它（协议 §7）。
         val stored = entry.copy(sig = sig)
-        val isNew = synchronized(lock) {
-            val existing = files[entry.fileId]
-            if (existing == null) {
-                files[entry.fileId] = stored
-                true
-            } else {
-                // 幂等：同 fileId 只更新元信息（协议 §7）。
-                files[entry.fileId] = existing.copy(
-                    name = if (entry.name.isNotEmpty()) entry.name else existing.name,
-                    torrent = if (entry.torrent.isNotEmpty()) entry.torrent else existing.torrent,
-                    magnet = if (entry.magnet.isNotEmpty()) entry.magnet else existing.magnet,
-                    sig = if (sig.isNotEmpty()) sig else existing.sig,
-                )
-                false
-            }
+        // 去重口径与 file.list 完全同一处（public-swarm §1.1：同一 infohash 只留 private 那一行）。
+        val merged = synchronized(lock) {
+            val result = FileEntryMerge.merge(files[entry.fileId], stored)
+            result.entry?.let { files[entry.fileId] = it }
+            result
         }
         kernel.saveState()
+        logScopeMerge(stored, merged.action, "file_add")
+        val isNew = merged.action == FileEntryMerge.Action.ADD
         if (isNew) {
             kernel.events.log(
                 "file_add",

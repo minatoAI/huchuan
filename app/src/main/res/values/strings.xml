@@ -116,6 +116,11 @@
     <string name="p7_network_diagnostics">网络诊断</string>
     <string name="p7_network_status">网络：%1$s</string>
     <string name="p7_notify_bubble">系统气泡</string>
+    <!-- 通知渠道（按群分，渠道名用群名）与系统通知正文 -->
+    <string name="notify_channel_desc">群内新文件与新评论</string>
+    <string name="notify_channel_fallback">群组</string>
+    <string name="notify_new_file">新文件：%1$s</string>
+    <string name="notify_comment">%1$s：%2$s</string>
     <string name="p7_notify_in_app">仅应用内</string>
     <string name="p7_notify_muted">静音</string>
     <string name="p7_reading">读取中</string>

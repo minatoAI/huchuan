@@ -21,12 +21,16 @@ import java.io.File
  * 私有 BT 会话（协议 §8）：DHT / LSD / UPnP / NAT-PMP / ip_notifier 全关，
  * 每 torrent 强制 flags = DISABLE_DHT | DISABLE_LSD | DISABLE_PEX = 0x380000。
  * 建种只用 v1（AGENTS.md §9）。
+ *
+ * **公开种子不进这个会话**（public-swarm §2.1）：加种前按种子自身的 private 位（BEP 27）选会话，
+ * 私有会话只收 private=1 的种子，public 会话只收 private=0 的。加参数复用本类等于把「忘了传」
+ * 变成隐私事故（BtSession.kt:555 无条件 or_ 0x380000），所以公开侧另起 [PublicBtSession]。
  */
 class BtSession(
     private val portHint: Int,
     private val saveRoot: File,
     private val ipFilterEnabled: Boolean = true,
-) {
+) : LocalSession {
     class SeededTorrent(
         val fileId: String,
         val name: String,
@@ -80,6 +84,30 @@ class BtSession(
         private set
 
     val isRunning: Boolean get() = manager?.isRunning == true
+
+    /**
+     * 会话归属判定：private 位（BEP 27）为真才属于本会话（public-swarm §1.2）。
+     *
+     * 这是「加种前一律按 TorrentInfo.priv() 决定用哪个会话」的唯一判据的函数形式；
+     * [addTorrent] 也走它，所以「忘了校验」不会变成一个可选项。
+     */
+    fun accepts(privateTorrent: Boolean): Boolean = privateTorrent
+
+    /** 这个 fileId 的 torrent 是否挂在本会话里。 */
+    override fun has(fileId: String): Boolean = synchronized(lock) { tasks.containsKey(fileId) }
+
+    /** 会话里的 torrent 数（诊断与验收读口）。 */
+    fun torrentCount(): Int = synchronized(lock) { tasks.size }
+
+    /**
+     * settings_pack 里 enable_dht 的真值（自检断言「私有会话 DHT 为关」用）。
+     * 会话没起来时返回 false。
+     */
+    fun enableDhtSetting(): Boolean = try {
+        manager?.settings()?.isEnableDht ?: false
+    } catch (e: Throwable) {
+        false
+    }
 
     fun start(): Int {
         manager?.let { return listenPort }
@@ -223,7 +251,7 @@ class BtSession(
      * libtorrent/src/torrent.cpp），所以读回 true 同时说明两件事：参数进了 native、
      * 且这份 native 库把这个特性编译进来了。编译掉的库里这一位恒为 0，不会静默骗人。
      */
-    fun superSeeding(fileId: String): Boolean {
+    override fun superSeeding(fileId: String): Boolean {
         val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return false
         return try {
             (handle.flags.to_int() and SUPER_SEEDING_BIT) != 0
@@ -233,7 +261,7 @@ class BtSession(
     }
 
     /** 运行中改 super-seeding（BEP 16 允许中途开关）。成功与否用 [superSeeding] 读回判定。 */
-    fun setSuperSeeding(fileId: String, on: Boolean): Boolean {
+    override fun setSuperSeeding(fileId: String, on: Boolean): Boolean {
         val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return false
         return try {
             val flag = superSeedingFlag()
@@ -282,7 +310,7 @@ class BtSession(
     }
 
     /** 把 torrent 从会话里摘掉（休眠 / 取消）。文件留在盘上。 */
-    fun removeTorrent(fileId: String): Boolean {
+    override fun removeTorrent(fileId: String): Boolean {
         val task = synchronized(lock) { tasks.remove(fileId) } ?: return false
         try {
             manager?.remove(task.handle)
@@ -292,11 +320,11 @@ class BtSession(
         return true
     }
 
-    fun downloadRate(fileId: String): Long = status(fileId, true)?.downloadPayloadRate()?.toLong() ?: 0L
+    override fun downloadRate(fileId: String): Long = status(fileId, true)?.downloadPayloadRate()?.toLong() ?: 0L
 
-    fun uploadRate(fileId: String): Long = status(fileId, true)?.uploadPayloadRate()?.toLong() ?: 0L
+    override fun uploadRate(fileId: String): Long = status(fileId, true)?.uploadPayloadRate()?.toLong() ?: 0L
 
-    fun setUploadLimit(fileId: String, kbps: Int) {
+    override fun setUploadLimit(fileId: String, kbps: Int) {
         val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return
         // 单位是 KB/s（P4 的「单文件限速」标的就是 KB/s）：直接乘 1024 得字节/秒。
         // 早先写成 *1024/8 是按 kbit/s 算的，实际限速只有标称值的 1/8。
@@ -356,17 +384,17 @@ class BtSession(
         }
     }
 
-    fun progress(fileId: String): Double {
+    override fun progress(fileId: String): Double {
         val st = status(fileId, true) ?: return 0.0
         return st.progress().toDouble()
     }
 
-    fun isFinished(fileId: String): Boolean {
+    override fun isFinished(fileId: String): Boolean {
         val st = status(fileId, false) ?: return false
         return st.isFinished
     }
 
-    fun peers(fileId: String): Int {
+    override fun peers(fileId: String): Int {
         val st = status(fileId, false) ?: return 0
         return st.numPeers()
     }
@@ -436,7 +464,7 @@ class BtSession(
      *
      * 判定顺序有意义：`isFinished` 先看，避免「校验已过但 state 还停在 downloading」被误判成缺片。
      */
-    fun seedState(fileId: String): String {
+    override fun seedState(fileId: String): String {
         val st = status(fileId, false) ?: return "missing"
         if (st.isFinished) return "finished"
         return when (st.state()) {
@@ -446,7 +474,7 @@ class BtSession(
         }
     }
 
-    fun savedFile(fileId: String): File? {
+    override fun savedFile(fileId: String): File? {
         val task = synchronized(lock) { tasks[fileId] } ?: return null
         return File(task.savePath, task.name)
     }
@@ -547,6 +575,10 @@ class BtSession(
     }
 
     private fun addTorrent(ti: TorrentInfo, savePath: File, extraFlags: torrent_flags_t? = null): TorrentHandle {
+        // 归属校验放在最前面：private=0 的种子属于公开会话，进到这里就是路由写错了。
+        require(accepts(ti.isPrivate)) {
+            "public torrent must go to PublicBtSession (private session only takes private=1)"
+        }
         val mgr = manager ?: throw IllegalStateException("BT session not started")
         savePath.mkdirs()
         val atp = org.libtorrent4j.swig.add_torrent_params()

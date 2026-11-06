@@ -1,18 +1,26 @@
 package app.huchuan
 
 import android.net.Uri
+import android.util.Log
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import app.huchuan.core.Group
 import app.huchuan.core.GroupFile
 import app.huchuan.core.GroupStore
@@ -27,6 +35,8 @@ import app.huchuan.core.NetworkProbe
 import app.huchuan.core.NetworkReport
 import app.huchuan.core.NetworkStatus
 import app.huchuan.kernel.M1Runtime
+import app.huchuan.notify.NotifyPermission
+import app.huchuan.notify.NotifyRoute
 import app.huchuan.ui.FileScreen
 import app.huchuan.ui.GroupScreen
 import app.huchuan.ui.HomeScreen
@@ -36,6 +46,7 @@ import app.huchuan.ui.NewGroupScreen
 import app.huchuan.ui.SettingsDrawer
 import app.huchuan.ui.UserNameScreen
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -131,21 +142,25 @@ class HuchuanState(
 
     fun push(destination: Destination) {
         stack.add(destination)
+        syncActiveView()
     }
 
     fun pop() {
         if (stack.size > 1) stack.removeAt(stack.lastIndex)
+        syncActiveView()
     }
 
     fun enterHome() {
         stack.clear()
         stack.add(Destination.Home)
+        syncActiveView()
     }
 
     /** 首次启动且无群组：P1 保存后直接进 P5，此页无返回（spec §3 P5 出口）。 */
     fun enterNewGroupFirstLaunch() {
         stack.clear()
         stack.add(Destination.NewGroup(firstLaunch = true))
+        syncActiveView()
     }
 
     /** 加入或创建成功 → P3，且 P3 的系统返回必须落到 P2。 */
@@ -153,6 +168,37 @@ class HuchuanState(
         stack.clear()
         stack.add(Destination.Home)
         stack.add(Destination.GroupPage(groupId))
+        syncActiveView()
+    }
+
+    /** 点通知进 P4：P2 是返回栈底，系统返回一次落到 P3、再一次落到 P2。 */
+    fun openFile(groupId: String, fileId: String) {
+        stack.clear()
+        stack.add(Destination.Home)
+        stack.add(Destination.GroupPage(groupId))
+        stack.add(Destination.FilePage(groupId, fileId))
+        syncActiveView()
+    }
+
+    /**
+     * 把「人在哪一页」告诉内核：系统通知只在人不在该群/该文件页时才发
+     * （M1Runtime.isViewing）。P6 成员页不算"在该群页面"——那里看不到新评论。
+     */
+    private fun syncActiveView() {
+        val runtime = runtime ?: return
+        when (val destination = current) {
+            is Destination.GroupPage -> runtime.setActiveView(destination.groupId, null)
+            is Destination.FilePage -> runtime.setActiveView(destination.groupId, destination.fileId)
+            else -> runtime.setActiveView(null, null)
+        }
+    }
+
+    /**
+     * 请界面层弹一次 POST_NOTIFICATIONS 授权框（Android 13+）。
+     * 首次进入 P2 走这里；首次要发通知但没权限时由 M1Runtime 自己发同一个信号。
+     */
+    fun requestNotifyPermission(reason: String) {
+        runtime?.requestNotifyPermission(reason)
     }
 
     fun touch() {
@@ -325,6 +371,70 @@ fun HuchuanApp(
     DisposableEffect(state, runtime) {
         val detach = runtime?.attachUiRefresh { state.touch() }
         onDispose { detach?.invoke() }
+    }
+
+    // 通知权限（Android 13+）：首次进 P2 或首次要发通知时由 runtime 发信号，这里弹一次系统框。
+    // 全局只在 HuchuanApp 里放一个 launcher：Popup 在哪个页面被触发不重要，宿主 Activity 只有一个。
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var notifyRequestSeq by remember { mutableIntStateOf(0) }
+    LaunchedEffect(runtime) {
+        runtime?.notifyRequests?.collect { notifyRequestSeq = it }
+    }
+    val notificationPermission = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        NotifyPermission.log(if (granted) "granted" else "denied", "source=prompt")
+    }
+    LaunchedEffect(notifyRequestSeq) {
+        val rt = runtime ?: return@LaunchedEffect
+        if (notifyRequestSeq <= 0) return@LaunchedEffect
+        if (!NotifyPermission.enforced) return@LaunchedEffect
+        if (NotifyPermission.isGranted(context)) return@LaunchedEffect
+        // 后台不能弹系统框：等下一次前台（比如进 P2）再说，信号不消费。
+        if (!lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            return@LaunchedEffect
+        }
+        rt.prefs.notifyPermissionAsked = true
+        NotifyPermission.log("request", "source=prompt seq=" + notifyRequestSeq)
+        notificationPermission.launch(NotifyPermission.PERMISSION)
+    }
+
+    // 前后台：退到后台就不再压制通知（人已经不在看那个页面了）。
+    DisposableEffect(lifecycleOwner, runtime) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> runtime?.setAppVisible(true)
+                Lifecycle.Event.ON_STOP -> runtime?.setAppVisible(false)
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // 点系统通知进来：冷启动时内核还没读完 state.json，群数据要等一会儿才有；
+    // 直接跳会让 P3/P4 因为 group == null 立刻弹回 P2，所以最多等 15 s。
+    val notifyTarget = NotifyRoute.pending
+    LaunchedEffect(notifyTarget, runtime) {
+        val target = notifyTarget ?: return@LaunchedEffect
+        var waitedMs = 0
+        while (runtime != null && state.groupOrNull(target.groupId) == null && waitedMs < 15_000) {
+            delay(500)
+            waitedMs += 500
+        }
+        NotifyRoute.consume()
+        if (target.fileId != null) {
+            state.openFile(target.groupId, target.fileId)
+        } else {
+            state.openGroup(target.groupId)
+        }
+        Log.i(
+            M1Runtime.TAG,
+            "event=notify_open group_id=" + target.groupId +
+                " file_id=" + (target.fileId ?: "-") +
+                " waited_ms=" + waitedMs,
+        )
     }
 
     fun goBack() {

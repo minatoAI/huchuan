@@ -11,7 +11,8 @@ import app.huchuan.core.NotificationLevel
  *
  * 两份限速都落盘、都由宿主在设置变化时立刻下发内核，内核自己不做持久化：
  * 全局限速是 session 级（[M1Runtime.applyGlobalLimits]），单文件限速挂在 torrent handle 上
- * （[M1GroupStore.setFileUploadLimit]）。通知档仍只有本地含义，等 M2 的通知通道。
+ * （[M1GroupStore.setFileUploadLimit]）。通知档（逐群三档）落盘后由宿主同步到该群的
+ * 通知渠道并据此决定发不发系统通知（notify/GroupNotifier.kt）。
  *
  * 跨网发现（tracker）的两项不一样：内核只接受「start() 之前」给一次基址，
  * 所以这里只负责落盘，由 [M1Runtime.start] 在内核起来之前读一次（见 [trackerBaseUrlForKernel]）。
@@ -102,12 +103,25 @@ class AppPrefs(context: Context) : LocalDeviceStore {
         prefs.edit().putString(KEY_NOTIFY + groupId, level.name).apply()
     }
 
+    /**
+     * POST_NOTIFICATIONS 是否已经自动请求过一次（Android 13+）。
+     *
+     * 只自动问一次：用户拒绝之后就是明确的"不要系统通知"，再弹会被系统静默吞掉，
+     * 也会变成骚扰。想要就自己去系统设置里开 —— 应用内未读那时已经正常工作。
+     */
+    var notifyPermissionAsked: Boolean
+        get() = prefs.getBoolean(KEY_NOTIFY_PERMISSION_ASKED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_NOTIFY_PERMISSION_ASKED, value).apply()
+        }
+
     companion object {
         private const val KEY_USER_NAME = "user_name"
         private const val KEY_UPLOAD_LIMIT = "upload_limit_kbps"
         private const val KEY_DOWNLOAD_LIMIT = "download_limit_kbps"
         private const val KEY_UNLIMITED = "unlimited"
         private const val KEY_NOTIFY = "notify."
+        private const val KEY_NOTIFY_PERMISSION_ASKED = "notify_permission_asked"
         private const val KEY_FILE_LIMIT = "file_limit."
         private const val KEY_TRACKER_BASE = "tracker_base_url"
         private const val KEY_TRACKER_DISCOVERY = "tracker_discovery"

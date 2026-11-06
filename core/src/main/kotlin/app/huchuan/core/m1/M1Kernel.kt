@@ -1,5 +1,6 @@
 package app.huchuan.core.m1
 
+import app.huchuan.core.FileScope
 import java.io.File
 import java.net.InetSocketAddress
 import java.security.SecureRandom
@@ -51,6 +52,14 @@ class M1Kernel @JvmOverloads constructor(
         private set
 
     internal lateinit var bt: BtSession
+        private set
+
+    /**
+     * 公开会话（public-swarm §2.3，AGENTS §9）：**按需启停** —— 对象在 [start] 里建好但不起，
+     * 有非休眠公开条目（磁力导入 / 激活公开条目）时才 [PublicBtSession.start]，
+     * 全部休眠或移除就 [PublicBtSession.stop]，顺带撤端口映射。
+     */
+    internal lateinit var publicBt: PublicBtSession
         private set
 
     val downloadsDir: File get() = File(dataDir, "downloads")
@@ -138,6 +147,11 @@ class M1Kernel @JvmOverloads constructor(
         bt.onTorrentFinished = { fileId -> onTorrentFinishedAlert(fileId) }
         bt.start()
 
+        // 公开会话：先只建对象（数据目录 <data>/public，端口从 6881 起），真正起来按需（§7.1）。
+        publicBt = PublicBtSession(File(dataDir, PUBLIC_DIR), PublicBtSession.DEFAULT_PORT, events)
+        publicBt.onTorrentFinished = { fileId -> onTorrentFinishedAlert(fileId) }
+        publicBt.onMetadataArrived = { arrival -> onPublicMetadata(arrival) }
+
         // 重启续种（缺口 G2）：state.json 里记着「上次在做种」的条目，会话一起来就按判定挂回去。
         // 放在 PeerServer / mDNS 之前：先让本机有东西可做种，再开始对外通告端口。
         resumeSeeds()
@@ -179,6 +193,9 @@ class M1Kernel @JvmOverloads constructor(
                 "session_limit_local_scope" to bt.localPeersRateLimited().toString(),
                 "tracker" to if (trackerEnabled) "on" else "off",
                 "tracker_base" to trackerBaseUrl,
+                // 公开会话按需启停：日志里留一条「它现在是什么状态」，断言不用去猜。
+                "public_session" to if (publicBt.isRunning) "on" else "off",
+                "public_port_hint" to PublicBtSession.DEFAULT_PORT.toString(),
             ),
         )
     }
@@ -204,6 +221,7 @@ class M1Kernel @JvmOverloads constructor(
         tracker = null
         try { server?.stop() } catch (_: Throwable) {}
         try { lanDiscovery.close() } catch (_: Throwable) {}
+        try { if (this::publicBt.isInitialized) publicBt.stop() } catch (_: Throwable) {}
         try { if (this::bt.isInitialized) bt.stop() } catch (_: Throwable) {}
         try { saveState() } catch (_: Throwable) {}
         events.log("kernel_stopped", mapOf("device_id" to deviceId))
@@ -259,6 +277,212 @@ class M1Kernel @JvmOverloads constructor(
     }
 
     internal fun localBtPortLong(): Long = localBtPort().toLong()
+
+    // ------------------------------------------------------------------ 公开会话（public-swarm）
+
+    /** 公开会话是否在跑（按需启停，见 §3.6）。诊断与验收读口。 */
+    val publicSessionRunning: Boolean get() = this::publicBt.isInitialized && publicBt.isRunning
+
+    /** 公开会话的监听端口；没起来返回 0。 */
+    fun publicSessionPort(): Int = if (this::publicBt.isInitialized) publicBt.listenPort else 0
+
+    /** 公开会话里的 torrent 数（诊断与验收读口）。 */
+    fun publicTorrentCount(): Int = if (this::publicBt.isInitialized) publicBt.torrentCount() else 0
+
+    /** 私有会话里的 torrent 数（诊断与验收读口）。 */
+    fun privateTorrentCount(): Int = if (this::bt.isInitialized) bt.torrentCount() else 0
+
+    /** 公开条目的 .torrent 缓存（`<data>/public/meta/<infohash>.torrent`）；没有返回 null。 */
+    internal fun publicCachedTorrent(fileId: String): File? =
+        if (this::publicBt.isInitialized) publicBt.cachedTorrent(fileId) else null
+
+    /** 公开会话的落盘目录（`<data>/public/data`）；会话还没建好时按同一约定算。 */
+    internal fun publicDataDir(): File =
+        if (this::publicBt.isInitialized) publicBt.dataDir else File(File(dataDir, PUBLIC_DIR), "data")
+
+    /**
+     * 本机某个 fileId 的 torrent 在哪个会话里。
+     *
+     * 先问私有会话（常驻、绝大多数任务在这里），再问公开会话（按需起来）；
+     * 两个都没有时返回私有会话 —— 调用方拿到的读数全是「没有这个 torrent」，与旧行为一致。
+     */
+    internal fun sessionOf(fileId: String): LocalSession {
+        val priv: LocalSession? = if (this::bt.isInitialized) bt else null
+        if (priv != null && priv.has(fileId)) return priv
+        val pub: LocalSession? = if (this::publicBt.isInitialized) publicBt else null
+        if (pub != null && pub.has(fileId)) return pub
+        return priv ?: checkNotNull(pub) { "kernel not started" }
+    }
+
+    /**
+     * 加种前一律按种子自身的 private 位（BEP 27）决定会话，**不信条目上的 scope 字段**
+     * （public-swarm §1.2）。没有内联种子的公开条目只能走公开会话。
+     */
+    internal fun sessionRoute(entry: FileEntry): String {
+        if (entry.torrent.isNotEmpty()) {
+            val privateTorrent = try {
+                org.libtorrent4j.TorrentInfo(java.util.Base64.getDecoder().decode(entry.torrent)).isPrivate
+            } catch (e: Throwable) {
+                entry.scope != FileScope.PUBLIC
+            }
+            return SessionRoute.of(privateTorrent)
+        }
+        return if (entry.scope == FileScope.PUBLIC) SessionRoute.PUBLIC else SessionRoute.PRIVATE
+    }
+
+    /** 公开条目「激活」：先在 `<data>/public/meta` 找 .torrent 缓存，没有就把磁力挂进公开会话。 */
+    internal fun startPublicDownload(group: GroupRuntime, entry: FileEntry): Boolean {
+        val pub = ensurePublicSession() ?: return false
+        val cached = pub.cachedTorrent(entry.fileId)
+        val ok = if (cached != null) {
+            try {
+                pub.addTorrent(org.libtorrent4j.TorrentInfo(cached), pub.dataDir)
+            } catch (e: Throwable) {
+                events.log("public_download_bad_torrent", mapOf("file_id" to entry.fileId, "error" to e.toString()))
+                false
+            }
+        } else if (entry.magnet.isEmpty()) {
+            // 公开条目没有磁力：既没有缓存种子也没有可加的东西（对端发来的坏条目）。
+            events.log("public_download_no_magnet", mapOf("file_id" to entry.fileId))
+            false
+        } else {
+            // 没有元数据缓存：把磁力重新挂进公开会话（0 = 不阻塞宿主，元数据由后台继续找）。
+            pub.addMagnet(entry.magnet, pub.dataDir, 0L)
+            pub.has(entry.fileId)
+        }
+        if (!ok) {
+            events.log("public_download_failed", mapOf("file_id" to entry.fileId, "magnet" to entry.magnet.length.toString()))
+            return false
+        }
+        group.markLocalTask(entry.fileId)
+        events.log(
+            "download_start",
+            mapOf(
+                "group_id" to group.groupId,
+                "file_id" to entry.fileId,
+                "name" to entry.name,
+                "size" to entry.size.toString(),
+                "save_path" to pub.dataDir.absolutePath,
+                "sess" to "pub",
+                "from_cache" to (cached != null).toString(),
+            ),
+        )
+        return true
+    }
+
+    /**
+     * 磁力导入（public-swarm §3）：插进公开会话 → 等元数据 → 落 .torrent → 建公开条目并广播。
+     *
+     * **永不抛异常**。五种失败各一句话（[PublicMagnetResult.messageFor]）：非法链接 / 重复 /
+     * 无源 / 超时 / 元数据无效。除前两种外都建条目（§3.1「无元数据不报错」：条目正常存在、
+     * 状态「等待来源」，周期重试）。
+     *
+     * @param timeoutMs 等元数据的上限；M3 默认 60 s，自检与自动化用短超时（0 = 不阻塞）。
+     */
+    @JvmOverloads
+    fun addPublicMagnet(
+        groupId: String,
+        magnet: String,
+        name: String? = null,
+        timeoutMs: Long = PublicBtSession.DEFAULT_METADATA_WAIT_MS,
+    ): PublicMagnetResult {
+        val group = group(groupId) ?: run {
+            val reason = PublicMagnetResult.NO_GROUP
+            events.log("public_magnet_rejected", mapOf("gid" to groupId, "reason" to reason))
+            return PublicMagnetResult(false, "", reason, PublicMagnetResult.messageFor(reason), null, "")
+        }
+        val parsed = MagnetLink.parse(magnet) ?: run {
+            val reason = PublicMagnetResult.INVALID_LINK
+            events.log("public_magnet_rejected", mapOf("gid" to groupId, "reason" to reason))
+            return PublicMagnetResult(false, "", reason, PublicMagnetResult.messageFor(reason), null, "")
+        }
+        // 同群内按 fileId 去重（§1.1 / 裁决 5）：已经有这个 infohash 就是「重复」，不再建第二次。
+        if (group.file(parsed.fileId) != null) {
+            val reason = PublicMagnetResult.DUPLICATE
+            events.log("public_magnet_rejected", mapOf("gid" to groupId, "file_id" to parsed.fileId, "reason" to reason))
+            return PublicMagnetResult(false, parsed.fileId, reason, PublicMagnetResult.messageFor(reason), null, "")
+        }
+        val pub = ensurePublicSession() ?: run {
+            val reason = PublicMagnetResult.SESSION_ERROR
+            events.log("public_magnet_rejected", mapOf("gid" to groupId, "reason" to reason))
+            return PublicMagnetResult(false, parsed.fileId, reason, PublicMagnetResult.messageFor(reason), null, "")
+        }
+        val result = pub.addMagnet(parsed.normalized, pub.dataDir, timeoutMs)
+        // 条目名：调用方给的名字 > 元数据 / dn > 未命名种子（§3.1 的默认文案）。
+        val entryName = name?.trim()?.takeIf { it.isNotEmpty() }
+            ?: result.name.ifBlank { parsed.displayName }
+                .ifBlank { "未命名种子" }
+        val entry = group.addPublicEntry(
+            fileId = parsed.fileId,
+            magnet = parsed.normalized,
+            name = entryName,
+            size = result.size,
+            pieceSize = result.pieceSize,
+        )
+        events.log(
+            "public_magnet",
+            mapOf(
+                "gid" to groupId,
+                "file_id" to parsed.fileId,
+                "name" to entryName,
+                "ok" to result.ok.toString(),
+                "reason" to result.reason,
+                "size" to result.size.toString(),
+                "metadata_path" to result.metadataPath,
+                "port" to pub.listenPort.toString(),
+                "torrents" to pub.torrentCount().toString(),
+            ),
+        )
+        return result.copy(entry = entry)
+    }
+
+    /** 起公开会话（幂等）。失败只记日志、返回 null —— 公开功能缺席，其余内核功能照旧。 */
+    internal fun ensurePublicSession(): PublicBtSession? {
+        if (!this::publicBt.isInitialized) return null
+        if (publicBt.isRunning) return publicBt
+        return try {
+            publicBt.setSessionUploadLimit(sessionUploadKbps)
+            publicBt.setSessionDownloadLimit(sessionDownloadKbps)
+            publicBt.start()
+            events.log(
+                "public_session_started",
+                mapOf(
+                    "port" to publicBt.listenPort.toString(),
+                    "dht_nodes" to publicBt.dhtNodes().toString(),
+                    "dht_running" to publicBt.isDhtRunning().toString(),
+                ),
+            )
+            publicBt
+        } catch (e: Throwable) {
+            events.log("public_session_error", mapOf("error" to e.toString()))
+            null
+        }
+    }
+
+    /** 没有任何非休眠公开条目时停掉公开会话（按需启停的另一半，§7.1）。 */
+    internal fun maybeStopPublicSession() {
+        if (!this::publicBt.isInitialized || !publicBt.isRunning) return
+        if (allGroups().any { it.hasActivePublicTask() }) return
+        publicBt.stop()
+        events.log("public_session_stopped", mapOf("reason" to "no_active_public_entry"))
+    }
+
+    /** 公开会话的元数据到手（含后台补元数据）：只回填本地条目，不改签名、不回广播。 */
+    private fun onPublicMetadata(arrival: PublicBtSession.MetadataArrival) {
+        for (g in allGroups()) g.backfillPublicMetadata(arrival.fileId, arrival.name, arrival.size, arrival.pieceSize)
+        events.log(
+            "public_metadata_arrived",
+            mapOf(
+                "file_id" to arrival.fileId,
+                "name" to arrival.name,
+                "size" to arrival.size.toString(),
+                "private" to arrival.privateTorrent.toString(),
+                "torrent_path" to arrival.torrentPath,
+            ),
+        )
+    }
+
+    // ------------------------------------------------------------------ 会话选择
 
     /**
      * 设置 tracker 基址（只能在内核起来之前调用）。
@@ -1116,7 +1340,22 @@ class M1Kernel @JvmOverloads constructor(
          * 告警当场到达时这条兜底不会触发；告警拿不到时最坏也就是这一档的时延。
          */
         const val COMPLETION_TICK_MS = 200L
+
+        /** 公开会话的数据根：`<data>/public`（session 内部再分 data / meta）。 */
+        const val PUBLIC_DIR = "public"
     }
+}
+
+/**
+ * 会话归属（public-swarm §1.2）：加种前**只看**种子自身的 private 位（BEP 27），
+ * 不看条目上的 scope 字段 —— 传输中的 scope 可以被转发方篡改，传输面按它走就会走错会话。
+ */
+object SessionRoute {
+    const val PRIVATE = "private"
+    const val PUBLIC = "public"
+
+    @JvmStatic
+    fun of(privateTorrent: Boolean): String = if (privateTorrent) PRIVATE else PUBLIC
 }
 
 /** tracker 基址的规范化：去首尾空白与尾部斜杠（`https://x/` 与 `https://x` 是同一个基址）。 */

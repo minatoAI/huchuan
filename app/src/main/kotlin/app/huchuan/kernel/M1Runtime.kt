@@ -6,15 +6,22 @@ import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import app.huchuan.R
 import app.huchuan.core.GroupFile
+import app.huchuan.core.NotificationLevel
 import app.huchuan.core.m1.FileEntry
 import app.huchuan.core.m1.GroupRuntime
 import app.huchuan.core.m1.KernelEvents
 import app.huchuan.core.m1.M1Kernel
 import app.huchuan.core.m1.OpRecord
 import app.huchuan.core.m1.SecretBox
+import app.huchuan.notify.GroupNotifier
+import app.huchuan.notify.NotifyPermission
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -57,6 +64,48 @@ class M1Runtime(context: Context) {
     )
 
     val store: M1GroupStore = M1GroupStore(this)
+
+    // ------------------------------------------------------------------ 通知（P7 三档）
+
+    /** 系统通知的落地实现：按群分渠道 + 三档语义（见 notify/GroupNotifier.kt）。 */
+    val notifier: GroupNotifier = GroupNotifier(app, TAG)
+
+    /**
+     * 通知判定与投递都在这一条线程上：内核事件线程只排队。
+     *
+     * 单个线程保证「先把档位改成静音、再收到这条评论」这种顺序不会乱：渠道更新与 notify
+     * 都在同一队列里按到达顺序执行。内核回调里做 Binder IPC 也会把消息层线程拖慢。
+     */
+    private val notifyThread = Executors.newSingleThreadExecutor { job ->
+        Thread(job, "huchuan-notify").apply { isDaemon = true }
+    }
+
+    /** 当前界面位置（主线程写，通知线程读）；空串 = 不在任何群/文件页。 */
+    @Volatile
+    private var activeGroupId: String = ""
+
+    @Volatile
+    private var activeFileId: String = ""
+
+    /** 应用是否在前台（ON_START/ON_STOP）。退到后台就不再压通知。 */
+    @Volatile
+    private var appVisible: Boolean = false
+
+    /**
+     * 加入群组时的"追赶"窗口。
+     *
+     * 入群那一刻拿到的 file.list / 历史 op 不是"刚发生的新事"，它们只是这个群本来就有；
+     * 逐条按新文件推通知会变成入群即刷屏（实测：入群瞬间就为那份 256 KiB 素材弹了一次，
+     * 还顺手把 POST_NOTIFICATIONS 授权框顶到了 P3 上面）。窗口从发起加入开始，
+     * 到 joined 回调后再留 [JOIN_CATCHUP_TAIL_MS]，覆盖随后的 sync 补齐。
+     */
+    private val joinCatchup = AtomicBoolean(false)
+    private val joinCatchupUntil = java.util.concurrent.atomic.AtomicLong(0L)
+
+    private val _notifyRequests = MutableStateFlow(0)
+
+    /** 权限请求信号：界面层收这个数，涨了就弹一次系统授权框（见 HuchuanApp）。 */
+    val notifyRequests: StateFlow<Int> = _notifyRequests.asStateFlow()
 
     /** adb 调试 extra 给的手动候选（ip:port）；界面上没有入口。 */
     @Volatile
@@ -168,6 +217,8 @@ class M1Runtime(context: Context) {
                 started = true
                 // 内核不持久化限速：设置留在 SharedPreferences，进程一起来就重新下发。
                 reapplyStoredLimits()
+                // 通知渠道不随进程消失，但群名/档位可能在上次运行后改过：同 id 更新一次（不重建）。
+                restoreNotifyChannels()
                 Log.i(
                     TAG,
                     "event=app_kernel_ready device_id=" + kernel.deviceId +
@@ -297,6 +348,11 @@ class M1Runtime(context: Context) {
     fun markGroupRead(groupId: String): Int {
         val cleared = kernel.markGroupRead(groupId)
         Log.i(TAG, "event=ui_mark_read scope=group group_id=" + groupId + " cleared=" + cleared)
+        // 人已经在这个群里了：该群的通知没有留存意义。
+        try {
+            notifier.cancel(groupId)
+        } catch (_: Throwable) {
+        }
         requestUiRefresh()
         return cleared
     }
@@ -309,6 +365,10 @@ class M1Runtime(context: Context) {
             "event=ui_mark_read scope=file group_id=" + groupId + " file_id=" + fileId +
                 " cleared=" + cleared,
         )
+        try {
+            notifier.cancel(groupId)
+        } catch (_: Throwable) {
+        }
         requestUiRefresh()
         return cleared
     }
@@ -384,6 +444,254 @@ class M1Runtime(context: Context) {
         Log.i(TAG, "event=limits_restored files=" + files)
     }
 
+    // ------------------------------------------------------------------ 通知：三档判定
+
+    /** 发起加入群组：这段时间进来的文件/评论都算"群本来就有"，不推通知。 */
+    fun beginJoinCatchup() {
+        joinCatchup.set(true)
+        joinCatchupUntil.set(System.currentTimeMillis() + JOIN_CATCHUP_MAX_MS)
+    }
+
+    /** 加入结束（成功或失败）：保留一小段尾巴，覆盖 join.ok 之后的 sync 补齐。 */
+    fun endJoinCatchup() {
+        joinCatchup.set(false)
+        joinCatchupUntil.set(System.currentTimeMillis() + JOIN_CATCHUP_TAIL_MS)
+    }
+
+    private fun inJoinCatchup(): Boolean =
+        joinCatchup.get() || System.currentTimeMillis() < joinCatchupUntil.get()
+
+    /** 当前界面位置（P3 群页 / P4 文件页），由 HuchuanState 每次导航时写入。 */
+    fun setActiveView(groupId: String?, fileId: String?) {
+        activeGroupId = groupId ?: ""
+        activeFileId = fileId ?: ""
+        logActiveView()
+    }
+
+    /** 前后台切换：退到后台后即使还停在 P4 也要通知（人已经不看了）。 */
+    fun setAppVisible(visible: Boolean) {
+        if (appVisible == visible) return
+        appVisible = visible
+        logActiveView()
+    }
+
+    private fun logActiveView() {
+        Log.i(
+            TAG,
+            "event=ui_view group_id=" + activeGroupId.ifEmpty { "-" } +
+                " file_id=" + activeFileId.ifEmpty { "-" } +
+                " visible=" + appVisible,
+        )
+    }
+
+    /**
+     * 这条通知该不该压住：人正在看这个群 / 这个文件就不发。
+     *
+     * 「在群页面」= P3（activeFileId 为空）；「在该文件页面」= P4 且文件对得上。
+     * 在**别的**文件页上时，这个群的新评论仍然要通知。应用退到后台时一律不发压制。
+     */
+    private fun isViewing(groupId: String, fileId: String): Boolean {
+        if (!appVisible) return false
+        if (activeGroupId != groupId) return false
+        return activeFileId.isEmpty() || activeFileId == fileId
+    }
+
+    /**
+     * 请求 POST_NOTIFICATIONS（Android 13+）。
+     *
+     * 两个入口共用：首次进入 P2（HomeScreen 的 LaunchedEffect）与首次要发通知但没有权限
+     * （[dispatchNotify]）。这里只发信号不弹窗 —— 系统授权框必须在界面层由
+     * ActivityResultLauncher 弹（见 HuchuanApp）。已经问过一次就不再自动问
+     * （AppPrefs.notifyPermissionAsked），用户拒绝后由系统设置接管；拒绝不影响应用内未读。
+     */
+    fun requestNotifyPermission(reason: String) {
+        if (!NotifyPermission.enforced) return
+        if (NotifyPermission.isGranted(app)) return
+        if (prefs.notifyPermissionAsked) return
+        _notifyRequests.value = _notifyRequests.value + 1
+        Log.i(
+            TAG,
+            "event=notify_permission state=request reason=" + reason +
+                " sdk=" + android.os.Build.VERSION.SDK_INT,
+        )
+    }
+
+    /** 冷启动把每个群的渠道按落盘的档位同步一次（群名可能改过，档位也可能换过）。 */
+    private fun restoreNotifyChannels() {
+        try {
+            var n = 0
+            for (group in kernel.groups()) {
+                notifier.syncChannel(group.groupId, group.name, prefs.notificationLevel(group.groupId))
+                n++
+            }
+            Log.i(TAG, "event=notify_channels_restored n=" + n)
+        } catch (t: Throwable) {
+            Log.w(TAG, "event=notify_channels_restored error=" + t)
+        }
+    }
+
+    /** 触发条件一：群内出现别人加的新文件。 */
+    private fun notifyFileAdded(group: GroupRuntime, entry: FileEntry) {
+        val groupId = group.groupId
+        if (inJoinCatchup()) {
+            Log.i(
+                TAG,
+                "event=notify_skip group_id=" + groupId + " file_id=" + entry.fileId +
+                    " kind=file reason=catchup",
+            )
+            return
+        }
+        if (entry.addedBy == kernel.deviceId) {
+            Log.i(
+                TAG,
+                "event=notify_skip group_id=" + groupId + " file_id=" + entry.fileId +
+                    " kind=file reason=self",
+            )
+            return
+        }
+        if (isViewing(groupId, entry.fileId)) {
+            Log.i(
+                TAG,
+                "event=notify_skip group_id=" + groupId + " file_id=" + entry.fileId +
+                    " kind=file reason=viewing",
+            )
+            return
+        }
+        val text = app.getString(R.string.notify_new_file, entry.name)
+        dispatchNotify(groupId, group.name, entry.fileId, "file", text)
+    }
+
+    /** 触发条件二：收到别人对我参与文件的评论（"参与"的口径见 [participates]）。 */
+    private fun notifyComment(group: GroupRuntime, op: OpRecord) {
+        val groupId = group.groupId
+        if (op.author == kernel.deviceId) return
+        if (inJoinCatchup()) {
+            Log.i(
+                TAG,
+                "event=notify_skip group_id=" + groupId + " file_id=" + op.fileId +
+                    " kind=comment reason=catchup",
+            )
+            return
+        }
+        val entry = try {
+            group.file(op.fileId)
+        } catch (_: Throwable) {
+            null
+        }
+        if (entry == null) {
+            Log.i(
+                TAG,
+                "event=notify_skip group_id=" + groupId + " file_id=" + op.fileId +
+                    " kind=comment reason=file_missing",
+            )
+            return
+        }
+        if (!participates(group, entry)) {
+            Log.i(
+                TAG,
+                "event=notify_skip group_id=" + groupId + " file_id=" + op.fileId +
+                    " kind=comment reason=not_participating",
+            )
+            return
+        }
+        if (isViewing(groupId, op.fileId)) {
+            Log.i(
+                TAG,
+                "event=notify_skip group_id=" + groupId + " file_id=" + op.fileId +
+                    " kind=comment reason=viewing",
+            )
+            return
+        }
+        val author = group.memberName(op.author).ifBlank { shortDevice(op.author) }
+        val text = app.getString(R.string.notify_comment, author, preview(op.body))
+        dispatchNotify(groupId, group.name, op.fileId, "comment", text)
+    }
+
+    /**
+     * 「我参与的文件」：我加的 / 我在做种或下载 / 我下过（本地有副本）/ 我评论过。
+     *
+     * 只看群内所有人的新文件不构成通知条件 —— 那样每个群都等于全量推送，跟"三档"要表达的
+     * "只提醒跟我有关的事"相反（spec §3 P7「群级提醒」）。
+     */
+    private fun participates(group: GroupRuntime, entry: FileEntry): Boolean {
+        if (entry.addedBy == kernel.deviceId) return true
+        if (completed.contains(entry.fileId)) return true
+        val role = try {
+            group.localRole(entry.fileId)
+        } catch (_: Throwable) {
+            GroupRuntime.LocalRole.NONE
+        }
+        if (role != GroupRuntime.LocalRole.NONE) return true
+        val saved = try {
+            group.savedFile(entry.fileId)
+        } catch (_: Throwable) {
+            null
+        }
+        if (saved != null && saved.isFile) return true
+        return try {
+            group.visibleOps(entry.fileId).any { it.author == kernel.deviceId }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * 三档的真正分叉点。
+     *
+     * - 仅应用内：一条系统通知都不发（未读由内核累加，P2 角标自己会变）；
+     * - 系统气泡 / 静音：走 GroupNotifier（重要性分别是 HIGH / LOW）；
+     * - 没有权限：不发、不假装发出去，记 notify_blocked 并顺手要一次权限。
+     */
+    private fun dispatchNotify(
+        groupId: String,
+        groupName: String,
+        fileId: String,
+        kind: String,
+        text: String,
+    ) {
+        notifyThread.execute {
+            try {
+                val level = prefs.notificationLevel(groupId)
+                if (level == NotificationLevel.IN_APP_ONLY) {
+                    Log.i(
+                        TAG,
+                        "event=notify_decision group_id=" + groupId + " file_id=" + fileId +
+                            " kind=" + kind + " level=in_app_only action=in_app_only text=" + clean(text),
+                    )
+                    return@execute
+                }
+                if (!notifier.canPost()) {
+                    Log.i(
+                        TAG,
+                        "event=notify_blocked group_id=" + groupId + " file_id=" + fileId +
+                            " kind=" + kind + " level=" + level.name.lowercase() +
+                            " reason=permission_denied",
+                    )
+                    requestNotifyPermission("notify")
+                    return@execute
+                }
+                val posted = notifier.post(level, groupId, groupName, fileId, text)
+                Log.i(
+                    TAG,
+                    "event=notify_decision group_id=" + groupId + " file_id=" + fileId +
+                        " kind=" + kind + " level=" + level.name.lowercase() +
+                        " action=" + (if (posted) "post" else "drop"),
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "event=notify_failed group_id=" + groupId + " error=" + t)
+            }
+        }
+    }
+
+    /** 通知正文里的一行预览：空格压成下划线（日志口径），超长截断。 */
+    private fun preview(body: String): String {
+        val text = clean(body)
+        return if (text.length > 60) text.take(60) + "…" else text
+    }
+
+    private fun shortDevice(deviceId: String): String =
+        if (deviceId.length > 6) deviceId.takeLast(6) else deviceId
+
     // ------------------------------------------------------------------ 事件出口
 
     /**
@@ -402,6 +710,8 @@ class M1Runtime(context: Context) {
 
         override fun joined(group: GroupRuntime) {
             Log.i(TAG, "event=ui_joined group_id=" + group.groupId + " name=" + clean(group.name))
+            // 入群成功：追赶窗口进入尾巴阶段（见 beginJoinCatchup）。
+            endJoinCatchup()
             requestUiRefresh()
         }
 
@@ -432,6 +742,7 @@ class M1Runtime(context: Context) {
                     " name=" + clean(entry.name) + " size=" + entry.size,
             )
             requestUiRefresh()
+            notifyFileAdded(group, entry)
         }
 
         override fun fileCompleted(group: GroupRuntime, entry: FileEntry) {
@@ -445,6 +756,7 @@ class M1Runtime(context: Context) {
         }
 
         // 未读数不在这里累加：内核按「可见 op 与读游标」现算，这里只让界面重读一次。
+        // 系统通知（P7 三档）在同一个回调里分叉，见 notifyComment。
         override fun opReceived(group: GroupRuntime, op: OpRecord) {
             Log.i(
                 TAG,
@@ -452,6 +764,7 @@ class M1Runtime(context: Context) {
                     " op_id=" + op.opId + " author=" + op.author + " body=" + clean(op.body),
             )
             requestUiRefresh()
+            notifyComment(group, op)
         }
 
         private fun format(event: String, fields: Map<String, String>): String {
@@ -469,6 +782,12 @@ class M1Runtime(context: Context) {
         const val MSG_PORT = 47100
         const val BT_PORT = 51413
         private const val LOCK_TAG = "huchuan-mdns"
+
+        /** 加入群组的追赶窗口上限（比内核的加入超时略长即可）。 */
+        private const val JOIN_CATCHUP_MAX_MS = 180_000L
+
+        /** joined 之后的尾巴：覆盖 join.ok 之后才到的 sync 补齐。 */
+        private const val JOIN_CATCHUP_TAIL_MS = 10_000L
 
         fun clean(value: String): String = value.replace(Regex("[\\s]+"), "_")
     }
