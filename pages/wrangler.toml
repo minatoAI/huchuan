@@ -1,0 +1,21 @@
+# 互传 · Cloudflare Pages 网关（中国大陆的入口）
+#
+# 存在的唯一理由：中国大陆网络打不开 *.workers.dev（DNS 污染 + SNI 阻断），
+# 但 *.pages.dev 是通的。所以让用户只看见 pages.dev，Worker 藏在后面。
+#
+# 转发走 service binding（下面的 [[services]]）：请求不出 Cloudflare 网络，
+# 不经公网、不加实名跳，也不受客户端所在网络的任何限制。
+# Worker 那边的 workers_dev 保持原样，不做改动。
+#
+# 部署：npx --yes wrangler@3 pages deploy   （本目录下执行）
+# 说明见 docs/deploy-cloudflare.md「中国大陆访问：pages.dev 入口」。
+
+name = "huchuan"
+pages_build_output_dir = "./public"
+compatibility_date = "2025-06-01"
+
+# 目标是已有的 Worker，名字必须与 worker/wrangler.toml 的 name 一致。
+# 顺序上 Worker 要先部署，因为 service binding 是按名字找的。
+[[services]]
+binding = "RELAY"
+service = "huchuan-relay"
