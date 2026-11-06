@@ -19,6 +19,14 @@ dependencies {
     implementation(libs.libtorrent4j.windows)
     implementation(libs.jmdns)
     implementation(libs.slf4j.nop)
+
+    // 链接分享的发送端（W1）：桌面 WebRTC。版本与 docs/spikes/webrtc-link.md 的验证版本一致。
+    //
+    // 主 POM 用 ${platform.classifier} 引原生包，Gradle 不认这个 Maven profile 占位符，
+    // 所以关掉传递依赖、显式声明 windows-x86_64 原生 jar（spike 也是这么写的）。
+    // 这里不写进 gradle/libs.versions.toml：本轮只改 daemon/，版本号就留在这条依赖旁边。
+    implementation("dev.onvoid.webrtc:webrtc-java:1.0.0") { isTransitive = false }
+    runtimeOnly("dev.onvoid.webrtc:webrtc-java:1.0.0:windows-x86_64")
 }
 
 application {
@@ -76,11 +84,19 @@ val verifyDaemonJar = tasks.register("verifyDaemonJar") {
         require(jar.isFile) { "daemon.jar 不存在：" + jar }
         ZipFile(jar).use { zip ->
             val names = zip.entries().toList().map { it.name }
-            val required = listOf("web/index.html", "web/js/data.js", "web/js/app.js", "lib/x86_64/libtorrent4j.dll")
+            val required = listOf(
+                "web/index.html",
+                "web/js/data.js",
+                "web/js/app.js",
+                "lib/x86_64/libtorrent4j.dll",
+                // 链接分享（WebRTC）的原生库：缺了只能在运行期降级成「链接分享不可用」，
+                // 打包时就必须失败，别等用户点了分享才发现。
+                "webrtc-java-windows-x86_64.dll",
+            )
             for (r in required) {
                 require(names.contains(r)) { "daemon.jar 缺少 " + r }
             }
-            println("[daemon] " + jar.name + " " + jar.length() + " 字节，条目 " + names.size + " 个（含 web/ 与 native dll）")
+            println("[daemon] " + jar.name + " " + jar.length() + " 字节，条目 " + names.size + " 个（含 web/ 与两份 native dll）")
         }
     }
 }

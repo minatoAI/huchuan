@@ -15,6 +15,7 @@ import app.huchuan.core.m1.KernelEvents
 import app.huchuan.core.m1.M1Kernel
 import app.huchuan.core.m1.OpRecord
 import app.huchuan.core.m1.SecretBox
+import app.huchuan.link.LinkShareController
 import app.huchuan.notify.GroupNotifier
 import app.huchuan.notify.NotifyPermission
 import kotlinx.coroutines.CoroutineDispatcher
@@ -95,6 +96,9 @@ class M1Runtime(context: Context) {
     )
 
     val store: M1GroupStore = M1GroupStore(this)
+
+    /** 链接分享（P8/P9）：创建 / 信令 / WebRTC 发送 / 撤销。进程级持有，Activity 重建不影响。 */
+    val link: LinkShareController by lazy { LinkShareController(this) }
 
     // ------------------------------------------------------------------ 通知（P7 三档）
 

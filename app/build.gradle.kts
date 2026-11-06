@@ -81,4 +81,11 @@ dependencies {
     implementation(libs.compose.ui.graphics)
     implementation(libs.compose.material3)
     debugImplementation(libs.compose.ui.tooling)
+
+    // 链接分享（P8/P9）：WebRTC DataChannel（spike 已真机验证）、信令 WebSocket、二维码。
+    // 不进版本目录：这三项只服务 app，不污染 core/daemon 的依赖表。
+    implementation("io.github.webrtc-sdk:android:150.7871.01")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // zxing 只用来出 BitMatrix，二维码由 Compose Canvas 自己画（link-share.md §4.2）。
+    implementation("com.google.zxing:core:3.5.3")
 }

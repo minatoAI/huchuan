@@ -47,6 +47,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import app.huchuan.Destination
 import app.huchuan.HuchuanState
 import app.huchuan.R
 import app.huchuan.core.Comment
@@ -141,6 +142,16 @@ fun FileScreen(
                             onClick = {
                                 menuOpen = false
                                 scope.launch { state.unpublishPublic(groupId, file.id) }
+                            },
+                        )
+                    }
+                    // 链接分享（link-share §3 P8）：没配置分享服务时这一项不出现。
+                    if (state.linkAvailable) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.p4_share_link)) },
+                            onClick = {
+                                menuOpen = false
+                                state.push(Destination.NewLink(groupId, file.id))
                             },
                         )
                     }

@@ -256,7 +256,7 @@ class LocalHttpServer(
             append("Cache-Control: no-store\r\n")
             append("Connection: close\r\n")
             append("Access-Control-Allow-Origin: *\r\n")
-            append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
+            append("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n")
             append("Access-Control-Allow-Headers: Content-Type\r\n")
             append("Access-Control-Allow-Private-Network: true\r\n")
             for ((k, v) in response.extra) append(k).append(": ").append(v).append("\r\n")

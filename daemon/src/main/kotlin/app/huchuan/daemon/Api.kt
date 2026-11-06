@@ -1,6 +1,7 @@
 package app.huchuan.daemon
 
 import app.huchuan.core.FileScope
+import app.huchuan.core.link.LinkDefaults
 import app.huchuan.core.m1.GroupRuntime
 import app.huchuan.core.m1.J
 import app.huchuan.core.m1.PublicMagnetResult
@@ -9,6 +10,9 @@ import app.huchuan.core.m1.jbool
 import app.huchuan.core.m1.jnum
 import app.huchuan.core.m1.jobj
 import app.huchuan.core.m1.jstr
+import app.huchuan.daemon.link.LinkCreateResult
+import app.huchuan.daemon.link.LinkService
+import app.huchuan.daemon.link.LinkStore
 import java.io.File
 
 /** 统一的错误响应体：{"ok":false,"code":"E_...","error":"人话"}。 */
@@ -46,6 +50,7 @@ class Api(private val daemon: Daemon) {
                 "shutdown" -> shutdownRoute(request)
                 "logs" -> logsRoute(request)
                 "groups" -> groupsRoute(request, segments.drop(2))
+                "shares" -> sharesRoute(request, segments.drop(2))
                 else -> fail("E_NOT_FOUND", "/" + group, 404)
             }
         } catch (e: Throwable) {
@@ -270,6 +275,119 @@ class Api(private val daemon: Daemon) {
         val lines = file.readLines(Charsets.UTF_8)
         val tail = if (lines.size > limit) lines.subList(lines.size - limit, lines.size) else lines
         return ok(jobj("lines" to jarr(tail.map { jstr(it) })))
+    }
+
+    // ------------------------------------------------------------------ 链接分享
+
+    /**
+     * 链接分享（W1）。四条路由共用这一段：
+     *
+     *   POST   /api/shares                  {fileId, expireDays? | ttlSec?} → 201 {share}
+     *   GET    /api/shares                  → {shares:[…], available, reason, baseUrl, webRtc}
+     *   GET    /api/shares/{token}          → {share}
+     *   GET    /api/shares/{token}/status   → {status, phase, active, visitor, share}
+     *   DELETE /api/shares/{token}          → {share, remoteRevoked, alreadyRevoked, reason}
+     *
+     * 失败口径只在这里翻译一次：链接层不可用是 503 E_LINK_UNAVAILABLE，文件本机没有副本
+     * 是 409 E_NO_LOCAL_FILE，Worker 拒绝登记是 429/409（详见 docs/daemon-api.md §3.6）。
+     */
+    private fun sharesRoute(request: HttpRequest, rest: List<String>): HttpResponse {
+        val link = daemon.link
+            ?: return fail("E_LINK_UNAVAILABLE", "链接分享还没起来（daemon 正在启动或链接层初始化失败）", 503)
+        if (rest.isEmpty()) {
+            return when (request.method) {
+                "GET" -> ok(link.listJson())
+                "POST" -> createShare(request, link)
+                else -> methodNotAllowed(request)
+            }
+        }
+        val token = rest[0]
+        if (rest.size == 2 && rest[1] == "status") {
+            if (request.method != "GET") return methodNotAllowed(request)
+            val record = link.find(token) ?: return fail("E_NO_LINK_SHARE", "没有这个分享：" + token, 404)
+            return ok(shareStatusJson(link, record))
+        }
+        if (rest.size > 1) return fail("E_NOT_FOUND", request.path, 404)
+        val record = link.find(token) ?: return fail("E_NO_LINK_SHARE", "没有这个分享：" + token, 404)
+        return when (request.method) {
+            "GET" -> ok(jobj("share" to link.shareJson(record)))
+            "DELETE" -> revokeShare(link, record)
+            else -> methodNotAllowed(request)
+        }
+    }
+
+    private fun createShare(request: HttpRequest, link: LinkService): HttpResponse {
+        val body = request.json() as? J.Obj
+            ?: return fail("E_BAD_JSON", "body 必须是 JSON 对象", 400)
+        val fileId = (body.str("fileId") ?: "").trim()
+        if (fileId.isEmpty()) return fail("E_BAD_FILE", "fileId 必填：要分享群里的哪个文件", 400)
+        val expireDays = body.num("expireDays")
+        val ttlSec = body.num("ttlSec")
+        if (expireDays != null && ttlSec != null) {
+            return fail("E_BAD_EXPIRE", "expireDays 与 ttlSec 只能给一个", 400)
+        }
+        val ttl = when {
+            ttlSec != null -> {
+                if (ttlSec < 1L) return fail("E_BAD_EXPIRE", "ttlSec 至少 1 秒", 400)
+                ttlSec.coerceAtMost(LinkDefaults.TTL_MAX_SEC)
+            }
+            expireDays != null -> {
+                if (expireDays < 1L || expireDays > 7L) {
+                    return fail("E_BAD_EXPIRE", "expireDays 只能是 1–7（默认 7 天）", 400)
+                }
+                expireDays * 86_400L
+            }
+            else -> LinkDefaults.TTL_DEFAULT_SEC
+        }
+        val created = link.create(fileId, ttl)
+        if (created is LinkCreateResult.Failure) {
+            return fail(created.code, created.message, created.status)
+        }
+        val success = created as LinkCreateResult.Success
+        val share = link.shareJson(success.record)
+        daemon.log.event(
+            "api_link_create",
+            mapOf(
+                "token" to success.record.token,
+                "file_id" to fileId,
+                "ttl_sec" to ttl.toString(),
+                "expires_at" to success.record.expiresAt.toString(),
+            ),
+        )
+        return ok(jobj("share" to share), 201)
+    }
+
+    private fun revokeShare(link: LinkService, record: LinkStore.Record): HttpResponse {
+        val outcome = link.revoke(record.token)
+            ?: return fail("E_NO_LINK_SHARE", "没有这个分享：" + record.token, 404)
+        val fields = LinkedHashMap<String, J>()
+        fields["share"] = link.shareJson(outcome.record)
+        // remoteRevoked = 服务端也记成撤销了（已经撤销过也算，DELETE 是幂等的）。
+        fields["remoteRevoked"] = jbool(outcome.alreadyRevoked || outcome.remote?.ok == true)
+        fields["alreadyRevoked"] = jbool(outcome.alreadyRevoked)
+        fields["reason"] = jstr(outcome.remote?.reason ?: "")
+        return ok(J.Obj(fields))
+    }
+
+    /**
+     * 状态口径（docs/daemon-api.md §3.6）：status 是细分状态，phase 只有
+     * active（等待 / 建链 / 传输中）与 finished（完成 / 失败 / 过期 / 撤销）。
+     */
+    private fun shareStatusJson(link: LinkService, record: LinkStore.Record): J.Obj {
+        val share = link.shareJson(record)
+        val status = link.statusOf(record)
+        val active = LinkService.activeStatus(status)
+        return jobj(
+            "token" to jstr(record.token),
+            "shareId" to jstr(record.shareId),
+            "status" to jstr(status),
+            "phase" to jstr(if (active) "active" else "finished"),
+            "active" to jbool(active),
+            "bytesSent" to (share["bytesSent"] ?: jnum(0L)),
+            "bytesTotal" to jnum(record.sizeBytes),
+            "visitor" to (share["visitor"] ?: J.Null),
+            "share" to share,
+        )
     }
 
     // ------------------------------------------------------------------ 群

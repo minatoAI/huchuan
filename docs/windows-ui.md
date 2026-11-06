@@ -203,6 +203,49 @@ P3 页面本身没有输入框：`Enter` 打开「添加文件」弹层；弹层
 「仅局域网」；如果设置与内核现状差一次重启，开关下面多一行「重启后生效」（daemon 的
 `trackerRestartRequired`），不把「已点的值」冒充成「已经生效」。
 
+### 3.4 链接分享（W1）：本轮只有接口，页面没有入口
+
+daemon 侧的链接分享已经全通（端点、日志、过期、撤销、WebRTC 发送端），但按本轮边界
+**`windows/resources/web/` 一个元素都没加**：页面上还看不到「分享链接」这个动作。
+这一段把「将来接页面时要读哪份数」先钉住，免得接的时候又去猜。
+
+接口与字段口径见 `docs/daemon-api.md` §3.6，页面要用的只有这些：
+
+| 界面上的 | 数据来源 | 判定 |
+| --- | --- | --- |
+| P9 列表的一行 | `GET /api/shares` 的 `shares[]` | 只显示 `active=true` 的（`waiting` / `connecting` / `transferring`）；撤销 / 过期按设计移出列表 |
+| 二维码 | `share.qrText` | 就是链接本身（`https://huchuan-a9f.pages.dev/#s=<token>`），编码它，不拼别的 |
+| 「7 天后失效」 | `share.expiresAt` | 服务端给的时间，页面不自己从创建时间推算 |
+| 文件名 / 大小 | `share.fileName` / `share.sizeBytes` | 创建时从本机文件取，列表不重新读盘 |
+| 「正在发送 42%」 | `share.progressPercent`（或状态接口的 `bytesSent` / `bytesTotal`） | 只有 `status=transferring` 时出现；完成即 `done` / `finished` |
+| 「被访问 n 次」 | `share.transfers` | daemon 记的取件完成次数（不是 Worker 的 visitCount） |
+| 「分享服务未配置」 | `GET /api/shares` 的 `available=false` + `reason` | 链接层不可用（缺原生库等）。`/api/shares` 本身仍然 200，页面显示一句原因并禁用入口 |
+| 撤销 | `DELETE /api/shares/{token}` | 不可逆破坏动作，允许一次确认；回包 `remoteRevoked=false` 不等于失败，是「服务端还没同步」 |
+
+为什么这一轮不接界面：设计里的入口是 P9「分享管理」与 P8 二维码页（`docs/design/link-share.md` §3），
+属于下一轮；本轮先把 daemon 的契约、发送端与验收跑通，界面接上去时只做展示与一次确认。
+
+不进界面也能手动验（daemon 在跑时）：
+
+    curl -s http://127.0.0.1:47200/api/shares
+    curl -s -X POST -H 'Content-Type: application/json' \
+         --data-binary '{"fileId":"<群里的 40 位 fileId>"}' \
+         http://127.0.0.1:47200/api/shares
+    # 浏览器打开返回的 link（或把 qrText 编码成二维码）
+
+端到端证据：`artifacts/link-share-win/e2e/`（`result.json`、`view-done.png`、浏览器日志、
+daemon 的 `link_*` 日志摘录）。它跑的是真 Worker + 真 WebRTC：daemon 发 8 MiB，
+Edge headless 打开 Pages 接收页收字节并自己算 SHA-256，两个 SHA 与字节数都对得上。
+复跑：`node daemon/e2e/link-share-e2e.mjs --port 47200 --file <8 MiB 文件>`，
+或直接跑 `bash scripts/m1-windows.sh`（§5 的第 9 组断言）。
+
+已知边界（都是设计口径，不是本轮缺陷）：
+
+- **同时 1 个访客**（Worker 房间的硬上限）。链接可以先后给多个人，列表中 `transfers` 累加。
+- 浏览器接收页单文件上限 **1 GiB**（OPFS / 内存降级），更大的走 App。
+- **没有 TURN**：对称 NAT / CGNAT 下打洞失败会如实显示「无法直连」。
+- 分享期间 daemon 要在线；进程退出链接变 offline（Worker 的 `/api/share/{token}` 四态之一）。
+
 ## 4. 内嵌：资源表怎么来的（现在只是兜底）
 
 daemon 起不来时壳回退到 exe 内嵌的那份页面，所以内嵌这条路仍然保留。
@@ -434,7 +477,7 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
 3. **别人的做种数与平台是 0 / 「未知」**，只有本机是真数。缺口 G3。
 4. **群只能建、不能退**。core 没有退出群的 API。缺口 G1。
 5. **评论发出去不能删**。缺口 G6。
-6. **绿色版自带 JRE**：`dist/Huchuan/` 里带着 jlink 裁出来的 `runtime/`（26.88 MiB），目标机
+6. **绿色版自带 JRE**：`dist/Huchuan/` 里带着 jlink 裁出来的 `runtime/`（27.43 MiB），目标机
    不用装 Java。只有在既没有 `runtime/` 又没装 Java 的机器上（比如直接跑 `windows/build/Huchuan.exe`），
    壳才退回内嵌页面并显示「网络不可用」。打包见 `docs/daemon-api.md` §8。
 7. **跨网发现已接，但没有打洞与端口映射**：默认开、地址是已部署的 Pages 入口
@@ -443,6 +486,10 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
    DHT / PEX（协议 §8），tracker 只收 groupHash20。开关与地址只在 daemon 启动时装配，P7 改了
    要重启进程才生效（页面显示「重启后生效」）；pages.dev 不可达时注册会失败，局域网不受影响。
 8. **无鉴权**：daemon 只监听 127.0.0.1，本机任何进程都能调它的 API。M1 接受这个前提。
+
+9. **链接分享没有页面入口**：daemon 的四条 `/api/shares` 端点、WebRTC 发送端与验收都已就位（§3.4），
+   但 `windows/resources/web/` 本轮没加元素。要分享只能用 API / 脚本；界面接线留给 P9 / P8 那一轮。
+   页面接上之前，绿色版里 `GET /api/shares` 的 `available` 已经验过（精简 runtime 能加载 WebRTC 原生库）。
 
 ## 10. 体积
 
@@ -455,6 +502,9 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
 | `js/app.js` | 55,522 |
 | **页面资源合计** | **99,086**（预算 200 KB） |
 | `Huchuan.exe` | 402,432（WebView2 运行时是系统组件，不在 exe 内） |
-| `daemon.jar` | 8,239,214（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
-| `runtime/`（jlink） | 28,186,664（26.88 MiB，模块 `java.base,java.logging,jdk.crypto.ec`） |
-| **`dist/Huchuan` 合计** | **36,828,310**（35.12 MiB，拷走就能跑，目标机不用装 Java） |
+| `daemon.jar` | 18,041,527（含 core、libtorrent4j 的 x86_64 dll、WebRTC 原生包、jmdns、上面这份页面） |
+| `runtime/`（jlink） | 28,766,257（27.43 MiB，模块 `java.base,java.logging,java.net.http,jdk.crypto.ec`） |
+| **`dist/Huchuan` 合计** | **47,210,216**（45.02 MiB，拷走就能跑，目标机不用装 Java） |
+
+2026-11-07 读数：链接分享把 webrtc-java 1.0.0 的原生包（DLL 22.8 MB）打进 jar，daemon.jar 从 8.1 MiB
+涨到 17.21 MiB；runtime 因为 `java.net.http` 多 0.55 MiB。页面资源本身没变（96.7 KiB）。

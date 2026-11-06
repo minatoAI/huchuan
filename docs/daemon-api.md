@@ -95,6 +95,13 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
 | `E_BAD_TRACKER` | 跨网发现取值非法：`enabled` 不是布尔、`baseUrl` 不是 http(s)、或一项都没给 |
 | `E_NOT_PUBLIC` | 想移除一个私有条目：私有条目只能休眠（`active=false`），「移除」只对公开条目开放 |
 | `invalid_link` / `duplicate` / `session_error` | 磁力导入的请求级失败（400 / 409 / 503）：链接非法 / 同群已有这个种子 / 公开会话没起来。回包另带内核同名的 `message` 与 `fileId`，见 3.3 |
+| `E_BAD_FILE` / `E_BAD_EXPIRE` | 创建分享的入参不对：`fileId` 缺失；`expireDays` 不在 1–7；`expireDays` 与 `ttlSec` 同时给 |
+| `E_NO_LOCAL_FILE` / `E_FILE_CHANGED` | 这个文件本机还没有副本（没下载完）/ 磁盘上的内容和群里的条目对不上（409） |
+| `E_LINK_UNAVAILABLE` | 链接分享不可用：缺 webrtc-java、原生库加载失败、或 daemon 正在启动（503，`error` 带原因） |
+| `E_LINK_TOO_MANY` | Worker 侧这台设备的有效分享已达 20 条（429） |
+| `E_LINK_REGISTRY` | 连不上分享服务（503），本机记录不受影响 |
+| `E_LINK_CREATE` | 分享服务拒绝登记（409），原因在 `error` |
+| `E_NO_LINK_SHARE` | token 在本机没有记录（404） |
 
 ---
 
@@ -473,6 +480,127 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 `GET /`、`GET /index.html`、`GET /js/*`、`GET /css/*`、`GET /*.ico` 由 daemon 返回
 `windows/resources/web`（或 jar 内 `web/`）。其余路径 404。
 
+### 3.6 链接分享（W1）
+
+给一个本机文件生成取件链接，浏览器打开就能经 WebRTC 直取，字节不经过任何服务器。
+服务端只做两件事：登记分享（Worker 的 `/api/share`）与转发信令（`/signal`）；
+daemon 是唯一的字节源。接口全部在 127.0.0.1 上，**token 只出现在返回体与链接的 fragment 里**，
+不进任何查询串（worker 的 `/signal` 只收 shareId）。
+
+分享对象：
+
+    {
+      "token": "G6NWVZWD2DZ9KPJCFEN3Y7HEY4",
+      "shareId": "130b15b89d9bb5e5f60df9cf9b4e2968",
+      "link": "https://huchuan-a9f.pages.dev/#s=G6NWVZWD2DZ9KPJCFEN3Y7HEY4",
+      "qrText": "https://huchuan-a9f.pages.dev/#s=G6NWVZWD2DZ9KPJCFEN3Y7HEY4",
+      "fileId": "ef3f3c680cd2c45cd108f3e9440f72680da981d4",
+      "fileName": "payload-8m.bin", "sizeBytes": 8388608,
+      "mime": "application/octet-stream",
+      "createdAt": 1793991451305, "expiresAt": 1794596251305,
+      "revokedAt": 0, "expiredAt": 0,
+      "status": "waiting", "phase": "active", "active": true,
+      "bytesSent": 0, "bytesTotal": 8388608, "progressPercent": 0,
+      "transfers": 0, "sha256": "", "lastTransferAt": 0,
+      "visitor": null
+    }
+
+- `link` 与 `qrText` 是同一个字符串：二维码就编码它。fragment（`#s=<token>`）不发往服务器，
+  链接里没有文件名，也没有 shareId。
+- `status` 是细分状态，`phase` 只有「进行中 / 已结束」两档：
+
+| status | 含义 | phase |
+| --- | --- | --- |
+| `waiting` | 已登记，等访客 | active |
+| `connecting` | 访客进了房间，正在交换 SDP / ICE | active |
+| `transferring` | DataChannel 已开，正在推字节 | active |
+| `done` | 最近一次取件完成（字节数与 SHA-256 都对过） | finished |
+| `failed` | 最近一次取件失败，原因在 `visitor.error` | finished |
+| `expired` | 过了 `expiresAt`（daemon 每秒扫一次，扫到才写 `expiredAt`） | finished |
+| `revoked` | 已撤销 | finished |
+| `file-missing` | 原文件不在 `path` 上了，链接近期发不出去 | finished |
+
+- `visitor`：有人进来过才有，否则是 `null`。
+  `{id, status, joinedAt, finishedAt, bytesSent, sha256, error}`；`id` 是 Worker 生成的 8 字符访客 id
+  （协议里没有访客地址）。`sha256` 是**浏览器**算出来的那个。
+- `bytesSent` 是本次访客已经写进 DataChannel 的字节数；收件端的 `ack` 只用来续 90 s 空闲预算，
+  不参与计数（状态接口的读数比浏览器慢几十毫秒是正常的）。
+- `transfers`：这条链接一共被取过几次。同一条链接可以先后给多个访客，**同时最多 1 个**
+  （Worker 房间的硬约束 `SIGNAL_ROOM_MAX_GUESTS=1`）。
+- 本机记录落在 `<data-dir>/links.json`：daemon 重启后链接仍然有效，启动时会给「未撤销、未过期、
+  文件还在」的分享重连信令。撤销与过期的记录不删（证据在），列表里用 `status` 区分。
+
+#### `POST /api/shares`
+
+    { "fileId": "ef3f…", "expireDays": 7 }     // expireDays 1–7，可选，默认 7
+    { "fileId": "ef3f…", "ttlSec": 60 }        // 秒级口径（脚本 / 自定义时长），与 expireDays 二选一
+
+    → 201 { "share": 分享对象 }
+
+- `fileId` 必须是本机已经有副本的条目（自己共享的，或已经下载完的）。daemon 直接从磁盘读字节，
+  不经 BT。条目不存在回 404 `E_NO_FILE`；没有副本回 409 `E_NO_LOCAL_FILE`；磁盘上的
+  内容变了（长度对不上）回 409 `E_FILE_CHANGED`。
+- 有效期由 Worker 夹到 [60 s, 7 天]；回包的 `expiresAt` 是服务端给的值，daemon 不自己算 TTL。
+- 链接层不可用（缺 webrtc-java / 原生库加载失败 / daemon 还在启动）回 503 `E_LINK_UNAVAILABLE`，
+  `error` 里是具体原因；其余 API 不受影响（没有这个依赖的机器上 daemon 照常起）。
+- Worker 侧同一设备最多 20 条有效分享（`worker/src/limits.js`），超了回 429 `E_LINK_TOO_MANY`。
+- 创建成功就立刻连上 `/signal` 等访客；日志见 §5。
+
+#### `GET /api/shares`
+
+    { "shares": [分享对象...], "available": true, "reason": "",
+      "baseUrl": "https://huchuan-a9f.pages.dev", "webRtc": "present" }
+
+- 列表是 **daemon 的本机记录**（最近创建的在前），不是 Worker 的列表：Worker 只回 shareId / 文件 /
+  被访问次数，不回访客状态，过期或撤销后也查不到（link-share.md §8「本机记录是事实源」）。
+- `available` 会真加载一次原生库来判定（`WebRtc.create()`，22.8 MB 的 DLL，第一次约 0.2 s），
+  不是只看 jar 在不在；失败一次之后固定为 `false`，`reason` 是 `webrtc-java-missing` 或
+  `webrtc-native:…`。`webRtc` 只表示 jar 在不在（`present` / `missing`）。
+- 撤销 / 过期的记录仍然在列表里（`status` / `phase` 会变）。P9 的界面按 `active` 过滤，
+  「列表里只放仍然有效的分享」是界面规则，不是接口规则。
+
+#### `GET /api/shares/{token}`
+
+    { "share": 分享对象 }
+
+token 是 26 字符 Crockford B32；未知 token 404 `E_NO_LINK_SHARE`。
+
+#### `GET /api/shares/{token}/status`
+
+    { "token": "…", "shareId": "…", "status": "transferring",
+      "phase": "active", "active": true,
+      "bytesSent": 4194304, "bytesTotal": 8388608,
+      "visitor": { "id": "MT9CD603", "status": "transferring", "joinedAt": 1793991497148,
+                   "finishedAt": 0, "bytesSent": 4194304, "sha256": "", "error": "" },
+      "share": 分享对象 }
+
+「进行中 / 已结束」看 `phase`：`active` = 等待 / 建链 / 传输中，`finished` = 完成 / 失败 /
+过期 / 撤销；细分原因看 `status`。`share` 是同一份分享对象，省一次请求。
+
+#### `DELETE /api/shares/{token}`
+
+    → 200 { "share": 分享对象, "remoteRevoked": true, "alreadyRevoked": false, "reason": "" }
+
+- 顺序：本机先关通道（分享者是唯一字节源，关掉字节当场停）→ 让 Worker 标 revoked 并踢房间
+  （后来者打不开，已经连着的那条 WS 收到 `bye{gone}`）。
+- 幂等：撤销过再 DELETE 回 `alreadyRevoked=true`、`remoteRevoked=true`，不再请求 Worker。
+- Worker 不可达时本机照样标撤销（`remoteRevoked=false`，`reason` 是网络原因）：本机记录是事实源，
+  但服务端那条要等下一次成功撤销。界面应把 `remoteRevoked=false` 当成「服务端还没同步」，不要显示成成功。
+- 未知 token 404 `E_NO_LINK_SHARE`。撤销后 daemon 不再为它连信令，重启也不会复活。
+
+#### 这一层怎么跑（实现口径）
+
+- 一条分享一个 `SignalClient`（core 的信令状态机）；一个访客一条 PeerConnection
+  （`WebRtcSender`）：建链 → `meta` → 16 KiB 分块 → `done` → 等浏览器 `verify`，
+  然后关 PeerConnection。信令连接留着等下一位置，服务端同时只允许 1 个访客。
+- 90 s 传输空闲预算归 core；daemon 每收到一次访客 `ack` 就续一次，另有一条 30 s 心跳兜住
+  「传完但页面还开着」的那段时间。
+- 浏览器回 `verify` 里带它自己算的 SHA-256 与字节数；daemon 用本机算的 SHA-256 比一次，
+  两个都进 `link_transfer_done` 日志与分享对象的 `visitor.sha256`（§5）。
+- 可用性探测与降级：没有 webrtc-java 时那个类根本不会被加载，`/api/shares` 回 503 而不是让进程崩掉
+  （link-share.md §10.3 的同一条原则）。STUN 固定 `stun:stun.cloudflare.com:3478`，与接收页一致；
+  没有 TURN（设计上永久不做）。
+
 ---
 
 ## 4. WebSocket
@@ -533,6 +661,24 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 
 `session_*_kbps` 是内核读回值；`ok=false` 表示下发没生效（限速被拒或会话还没起来），脚本可以直接断言它不出现。
 
+链接分享（W1）的四行是验收脚本直接 grep 的：
+
+    ts=… event=link_share_created token=G6NW… link=https://huchuan-a9f.pages.dev/#s=G6NW…
+    ts=… event=link_visitor_join share=130b15b8 visitor=MT9CD603 token_masked=G6NW****
+    ts=… event=link_transfer_done bytes=8388608 sha256=5835… guest_sha256=5835… chunks=512 ms=714
+    ts=… event=link_share_revoked token=G6NW… share=130b15b8 remote=true reason=
+
+- `link_share_created` 里的 `token` 与 `link` 是**全量**：这是本机文件日志，和二维码、`links.json`
+  同属本机信任域（对外的信令与 Worker 日志只打 `token_masked`）。验收脚本就是靠这一行把
+  「创建的链接」与「浏览器收到的 SHA」对起来。
+- `link_transfer_done` 的 `sha256` 是本机算的，`guest_sha256` 是浏览器 `verify` 回执里的；
+  两个都对过才算 `done`（回执字段 `bytes` / `chunks` / `transferMs` 也记在这里）。
+- 周边事件：`link_ready`（启动，含 base / 本机记录数）、`link_webrtc_ready` /
+  `link_webrtc_unavailable`（可用性探测）、`link_transfer_start` / `link_transfer_failed`、
+  `link_share_expired`、`link_session_closed`（reason=revoke / expired / daemon-stop）。
+  core 的信令状态机另有 `link_connecting` / `link_open` / `link_connected` / `link_state` /
+  `link_bye` / `link_failed`，字段口径见 docs/core.md §3.11。
+
 ---
 
 ## 6. daemon 侧的实现约定
@@ -552,6 +698,12 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
    过滤（`Daemon.visibleFiles` / `visibleFile`）；公开条目的元数据回填、公开会话按需启停
    都归 core，daemon 只负责停掉任务、落隐藏标记、不再对外显示。
 
+6. **链接分享的记录在 daemon 侧**：core 的 `ShareRegistry` 只跟 Worker 说话（登记 / 撤销 / 查询），
+   Worker 不回访客状态，过期与撤销之后也查不到。daemon 把 token / shareId / 文件路径 / 有效期 /
+   被访问次数落在 `<data-dir>/links.json`，重启后按它恢复（未撤销、未过期、文件还在的分享重连信令）。
+   过期扫描每秒一次，只做时间比较；`status` 永远按 `expiresAt` 现算，不依赖扫描是否已经跑过。
+   WebRTC 的 PeerConnection 不持久化：每个访客新建一条，传完就关，runtime 全进程共享一个。
+
 ---
 
 ## 7. 缺口（需要 core 补的 API，daemon 侧不改 core）
@@ -569,6 +721,9 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 | G7 | `startDownload(fileId, savePath)` 指定落盘目录 | 下载固定落 `<data-dir>/downloads`；本机共享的文件走「重新做种」分流（§3.3 active、§6.1） | 只影响「下载目录不可选」，不再影响休眠→激活的正确性 |
 | ~~G8~~ | ~~tracker / 跨网状态查询~~ **已补**：core 提供 `trackerBaseUrl`（构造参数 / start 前的 `setTrackerBaseUrl`）与 `trackerEnabled`，daemon 接成 `/api/settings/tracker` + `settings.tracker*` | 读内核真值，不自己猜 | 已关闭（口径见 §3.1；运行期改配置要重启，core 不支持换基址） |
 | G9 | 单文件限速的内核读回（`torrent_handle::upload_limit()`） | 只记 daemon 侧的设置值 + `uploadLimitInForce`（会话里挂着且未完成） | P4 的「已生效」是按「已下发」判的，不是按内核读数判的 |
+| G10 | 二维码图像生成 | daemon 只给 `qrText`（就是链接本身）；渲染成图是界面的事 | 本轮不加 UI，P8 的二维码页接这个字段即可 |
+| G11 | 服务端撤销的对齐（`ShareRegistry.list()`） | daemon 只用自己的 `links.json`：同一身份只可能是本机撤销，所以没有去 Worker 拉列表对账 | 如果服务端记录被清空、或另一台机器用同一身份撤销，本机列表不会知道；`revoke` 仍能走通 |
+| G12 | 服务端上限的本地复刻 | 20 条有效分享 / 同时 1 个访客 / 7 天上限都直接透传 Worker 的错误与 `expiresAt` | daemon 不做本地插值；离线时创建会失败（503 `E_LINK_REGISTRY`），不会静默记一条假分享 |
 
 ---
 
@@ -589,7 +744,7 @@ daemon 要 JDK 17+ 的运行时，目标机不该为它装 Java。`scripts/packa
 
 ```bash
 jdeps --multi-release 17 --ignore-missing-deps --print-module-deps daemon.jar
-# → java.base,java.logging
+# → java.base,java.logging,java.net.http   （java.net.http 是链接分享的 HttpTransport 带进来的）
 ```
 
 再补一个 jdeps 看不见的：**`jdk.crypto.ec`**。core 生成邀请码要 EC `KeyPairGenerator`，它是
@@ -598,18 +753,25 @@ Security provider 里的东西，字节码里没有直接引用；少了这一�
 所以打包脚本在 jlink 之后**用产出的 runtime 起一次 daemon 并等 `/api/health` 回 ok**：模块少一个
 就当场失败，而不是等用户双击才发现。
 
+链接分享的原生库（`webrtc-java-windows-x86_64.dll`，22.8 MB）是从 `daemon.jar` 里解出来加载的，
+不靠额外文件；精简 runtime 够不够用它，打包脚本的冒烟看不到（它只等 `/api/health`）。
+所以 `scripts/m1-windows.sh` 对绿色版额外打一条 `GET /api/shares`：它会真 `WebRtc.create()` 一次，
+回 `available=true` 才算这套 runtime 带对了模块。
+
 jlink 参数：`--strip-debug --no-man-pages --no-header-files --compress=2`。
 `--compress` 的写法在 JDK 21 换过（17/18/19/20 只认 `0|1|2`，21+ 才认 `zip-0…zip-9`），
 脚本按 `java -version` 的主版本自动选。
 
 ### 实际体积（JDK 17 Temurin，2026-11-06）
 
-| 项 | 字节 | MiB |
-| --- | ---: | ---: |
-| `Huchuan.exe` | 385,024 | 0.37 |
-| `daemon.jar` | 8,107,170 | 7.73 |
-| `runtime/` | 28,186,664 | 26.88 |
-| **合计 `dist/Huchuan`** | **36,678,858** | **34.98** |
+| 项 | 字节 | MiB | 与上一版比 |
+| --- | ---: | ---: | --- |
+| `Huchuan.exe` | 402,432 | 0.38 | — |
+| `daemon.jar` | 18,041,527 | 17.21 | +9.48 MiB：WebRTC 原生包（DLL 22.8 MB） |
+| `runtime/` | 28,766,257 | 27.43 | +0.55 MiB：多了 `java.net.http` |
+| **合计 `dist/Huchuan`** | **47,210,216** | **45.02** | +10.04 MiB |
+
+2026-11-07 读数（JDK 17 Temurin；把链接分享的 webrtc-java 1.0.0 打进 jar 之后）。
 
 runtime 预算是 60 MiB，超了脚本直接失败（说明模块挑多了或压缩没开）。
 
@@ -634,9 +796,9 @@ bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 ```
 
 脚本自己起 A/B 两个 daemon（47200 / 47201，另有一个只验跨网关闭的 C 节点 47202），走完建群 →
-后 8 位加入 → 共享 32 MiB → 下载 → SHA-256 比对 → 评论回流 → WS 推送 → Web UI 数据通路，
-最后是公开种子的磁力导入 / 本地移除，最后打印 `PASS` / `FAIL`。
-共 82 条断言。
+后 8 位加入 → 共享 32 MiB → 下载 → SHA-256 比对 → 评论回流 → WS 推送 → Web UI 数据通路 →
+链接分享（含 8 MiB 端到端）→ 绿色版，最后是公开种子的磁力导入 / 本地移除，最后打印
+`PASS` / `FAIL`。**共 113 条断言**（2026-11-07 实测：通过 113 / 失败 0）。
 
 限速与组队这一组（5 条）：B 侧 `POST /api/settings/limits {"uploadKbps":512,"downloadKbps":512}`
 后 `sessionUploadLimitKbps` / `sessionDownloadLimitKbps` 必须读回 512，改成 0 必须读回 0，
@@ -660,7 +822,33 @@ bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 `sizeBytes` 整个不出现；`POST …/files/{fid}/remove` 之后 A 的 state 里没有这个 id、详情 404、
 `settings.json` 的 `hiddenFiles` 有记录，而同群 B 的 state 里仍然有 —— 证明移除没有广播。
 
+链接分享 31 条（排在 Web UI 之后、绿色版之前）：
+
+- **可用性**：`GET /api/shares` 回 `available=true`、`webRtc=present`、`baseUrl` 是 Pages 入口；
+  daemon 日志有 `link_ready`。
+- **创建**：缺 `fileId` / `expireDays=9` / 两个时长一起给都是 400（`E_BAD_FILE` /
+  `E_BAD_EXPIRE`）；正常创建回 201，`status=waiting`、`phase=active`，
+  `link == baseUrl + "/#s=" + token`、`qrText == link`、默认有效期正好 7 天；
+  日志有 `link_share_created token=… link=…`。
+- **列表 / 状态**：`GET /api/shares` 里有这条、`status=waiting`、`visitor=null`；
+  `GET /api/shares/{token}/status` 的 `status` / `phase` 与之一致。
+- **端到端（8 MiB）**：`daemon/e2e/link-share-e2e.mjs` 走真 Worker：先建临时群、共享文件、
+  `POST /api/shares` 拿链接，再起 Edge headless（CDP 驱动）打开 Pages 的接收页
+  （本地静态服务复刻 `/` 与 `/r/*` 的重写），页面经 `wss://…/signal` 建链、收 8 MiB、
+  自己算 SHA-256，并在 DataChannel 的 `verify` 回执里带回来。断言：浏览器 `phase=done`、
+  `bytes=8388608`、`sha256` 与源文件一致、`sha256Match=true`；daemon 侧 `status=done`、
+  `visitor.sha256` 一致、`bytesSent=8388608`；日志有
+  `link_transfer_done bytes=8388608 sha256=…`。证据（result.json / 截图 / 浏览器日志 /
+  daemon 的 link_* 日志摘录）落在 `artifacts/link-share-win/e2e/`。
+- **撤销**：`DELETE` 回 `remoteRevoked=true`、状态变 `revoked` / `finished`；日志
+  `link_share_revoked token=…`；再 DELETE 一次 `alreadyRevoked=true`；未知 token 404。
+- **过期**：另建一条 `ttlSec=60` 的分享（Worker 的有效期下限），到点后状态 `expired` /
+  `finished`，日志有 `link_share_expired` 与 `link_session_closed … reason=expired`。
+- **绿色版**：`dist/Huchuan` 里的 daemon 也要 `GET /api/shares` 回 `available=true`
+  （真加载一次 WebRTC 原生库，证明 jlink 出来的 runtime 带对了模块）。
+
 最后一条验绿色版：用 `cmd` 把 `JAVA_HOME` 清空、`PATH` 只留 `C:\Windows\System32`（复现
 「目标机没装 Java」），再启动 `dist/Huchuan/Huchuan.exe`，要求 47290 上的 `/api/health` 通，
 且壳日志里「拉起 daemon」用的 java 是 exe 同级的 `runtime\bin\javaw.exe`。
-`dist/Huchuan` 不存在时脚本会先跑一次 `scripts/package-windows.sh`。
+`dist/Huchuan` 不存在、或里面的 `daemon.jar` 比刚构建的旧时，脚本会先跑一次
+`scripts/package-windows.sh`（绿测必须验本轮产物，不能拿上一轮的 jar 冒充）。

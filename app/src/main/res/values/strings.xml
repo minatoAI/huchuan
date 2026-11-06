@@ -152,4 +152,55 @@
     <string name="p7_reading">读取中</string>
     <string name="p7_read_failed">读取失败，重试</string>
     <string name="p7_offline_editable">离线可改，联网后生效</string>
+
+    <!-- P4 链接分享入口（link-share §3 P8）：没配置分享服务时这一项不出现 -->
+    <string name="p4_share_link">分享链接</string>
+
+    <!-- P7 分享管理入口（link-share §8） -->
+    <string name="p7_share_manage">分享管理</string>
+
+    <!-- P8 链接分享（link-share §3 P8）：二维码 / 链接 / 复制 / 有效期 / 状态行 -->
+    <string name="p8_title">分享链接</string>
+    <string name="p8_creating">创建中</string>
+    <string name="p8_connecting">正在连接</string>
+    <string name="p8_waiting">等待访客</string>
+    <string name="p8_incoming">访客已加入</string>
+    <string name="p8_sending">正在发送 %1$d%%</string>
+    <string name="p8_sending_plain">正在发送</string>
+    <string name="p8_sent">已发送</string>
+    <string name="p8_revoked">链接已失效</string>
+    <string name="p8_expired">已失效</string>
+    <string name="p8_expires_days">%1$d 天后失效</string>
+    <string name="p8_expires_hours">%1$d 小时后失效</string>
+    <string name="p8_expires_minutes">%1$d 分钟后失效</string>
+    <string name="p8_copy">复制链接</string>
+    <string name="p8_not_found">没有这条分享</string>
+    <string name="p8_address_warning">对方可见你的网络地址</string>
+    <!-- 失败一律一句话，不弹窗（link-share §10.3 / 任务验收 5） -->
+    <string name="p8_file_missing">文件不在本机</string>
+    <string name="p8_file_not_ready">文件还没下载完</string>
+    <string name="p8_file_empty">文件是空的</string>
+    <string name="p8_file_read_failed">读不到这个文件</string>
+    <string name="p8_not_configured">分享服务未配置</string>
+    <string name="p8_not_started">分享服务未就绪</string>
+    <string name="p8_too_many">分享数量已达上限</string>
+    <string name="p8_server_unreachable">连不上分享服务</string>
+    <string name="p8_no_direct">无法直连</string>
+    <string name="p8_busy">对方正忙</string>
+    <string name="p8_peer_left">访客已离开</string>
+    <string name="p8_transfer_timeout">传输超时</string>
+    <string name="p8_verify_failed">校验不一致</string>
+    <string name="p8_send_failed">发送失败</string>
+    <string name="p8_connect_failed">连接失败</string>
+
+    <!-- P9 分享管理（link-share §3 P9 / §8）：文件名 / 剩余有效期 / 访客状态 / 撤销 -->
+    <string name="p9_title">分享管理</string>
+    <string name="p9_empty">还没有分享</string>
+    <string name="p9_revoke">撤销</string>
+    <string name="p9_revoke_title">撤销分享</string>
+    <string name="p9_revoke_confirm">撤销后这条链接立即失效</string>
+    <string name="p9_cancel">取消</string>
+    <string name="p9_visits">被访问 %1$d 次</string>
+    <string name="p9_visitor_joined">访客已加入</string>
+    <string name="p9_visitor_sending">正在取件 %1$d%%</string>
 </resources>

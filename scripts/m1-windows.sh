@@ -23,8 +23,13 @@
 #   7. tracker ：跨网发现默认开、地址是已部署的 Pages 入口（pages.dev），建群后确实发起注册尝试
 #                （成功 / 失败都算，断言的是「有尝试」）；另起一个启动前就关掉 tracker 的 C 节点，
 #                要求 kernel_started tracker=off、建群后一条 tracker 请求都没有
-#   8. magnet  ：公开种子 / 磁力导入（最后一组）：非法链接 400 invalid_link、同一链接第二次
+#   8. magnet  ：公开种子 / 磁力导入：非法链接 400 invalid_link、同一链接第二次
 #                duplicate、state 里 scope=public + magnet、本机移除后从 state 消失但同群 B 还在
+#   9. link    ：链接分享（W1）：可用性、创建（link/qrText/7 天默认）、列表、状态、撤销（幂等、
+#                未知 token 404）、过期（ttlSec=60 自然过期），以及一条真端到端：daemon 发 8 MiB，
+#                Edge headless 打开 Pages 接收页，经真 Worker 的 /signal 建链收字节，浏览器自己
+#                算 SHA-256 再从 DataChannel 回 verify；证据在 artifacts/link-share-win/。
+#                绿色版那台（jlink 精简 runtime）也要能 probe 出 available=true。
 #
 # 端口用文档里写死的固定值 47200 / 47201 / 47202。占用就 FAIL，不静默换端口 ——
 # 换端口等于没验「默认端口能起」。
@@ -43,6 +48,8 @@ DATA_B="$ART/b-data"
 DATA_C="$ART/c-data"
 SHARE_DIR="$ART/a-share"
 SHARE_FILE="$SHARE_DIR/payload-32m.bin"
+LINK_DIR="$ART/link"
+LINK_FILE="$LINK_DIR/payload-8m.bin"
 OUT_A="$ART/daemon-A.out"
 OUT_B="$ART/daemon-B.out"
 OUT_C="$ART/daemon-C.out"
@@ -70,6 +77,12 @@ BT_C=51520
 TRACKER_URL="https://huchuan-a9f.pages.dev"
 
 FILE_BYTES=33554432
+# 链接分享的端到端用 8 MiB（spike 的同一口径）：单独一个文件，不跟 32 MiB 的 BT 用例混。
+LINK_BYTES=8388608
+# 链接分享的服务地址：与 daemon 的 LinkDefaults.BASE_URL / SettingsStore 的默认值同一个入口。
+LINK_API="https://huchuan-a9f.pages.dev"
+# 端到端验收的留证目录（daemon/e2e/link-share-e2e.mjs 写这里；不进 artifacts/m1-windows，避免被清场删掉）。
+LINK_E2E="$ROOT/artifacts/link-share-win/e2e"
 # 给 A 的共享文件压 8 MiB/s：顺带验单文件限速，并让 WS 的 tick 采样有东西可采。
 A_UPLOAD_LIMIT_KBPS=8192
 WAIT_TRANSFER_S=240
@@ -191,6 +204,8 @@ SCRIPT_T0=$(date +%s)
 command -v java      >/dev/null 2>&1 || die "java 不在 PATH（要 JDK 17+）"
 command -v curl      >/dev/null 2>&1 || die "curl 不在 PATH"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum 不在 PATH（脚本要独立重算 SHA-256）"
+# 链接分享的端到端要驱动 Edge headless（CDP）：Node 18+ 自带的 fetch / WebSocket 就够了。
+command -v node      >/dev/null 2>&1 || die "node 不在 PATH（链接分享端到端要 node 18+）"
 
 for port in "$PORT_A" "$PORT_B" "$PORT_C"; do
   if port_busy "$port"; then
@@ -212,7 +227,7 @@ fi
 # ------------------------------------------------------------------ 2. 装置
 say "--- 清场"
 rm -rf "$ART" || die "删不掉 $ART"
-mkdir -p "$DATA_A" "$DATA_B" "$SHARE_DIR" || die "建不出 $ART 下的目录"
+mkdir -p "$DATA_A" "$DATA_B" "$SHARE_DIR" "$LINK_DIR" || die "建不出 $ART 下的目录"
 
 say "--- 造料：$FILE_BYTES 字节"
 head -c "$FILE_BYTES" /dev/urandom > "$SHARE_FILE" || die "生成测试文件失败"
@@ -220,6 +235,13 @@ MADE_BYTES=$(wc -c < "$SHARE_FILE" | tr -d ' ')
 [ "$MADE_BYTES" = "$FILE_BYTES" ] || die "测试文件大小不对：$MADE_BYTES"
 SRC_SHA=$(sha256sum < "$SHARE_FILE" | cut -d' ' -f1)
 say "      源文件 sha256=$SRC_SHA"
+
+say "--- 造料：链接分享 $LINK_BYTES 字节"
+head -c "$LINK_BYTES" /dev/urandom > "$LINK_FILE" || die "生成链接分享测试文件失败"
+LINK_MADE_BYTES=$(wc -c < "$LINK_FILE" | tr -d ' ')
+[ "$LINK_MADE_BYTES" = "$LINK_BYTES" ] || die "链接分享测试文件大小不对：$LINK_MADE_BYTES"
+LINK_SRC_SHA=$(sha256sum < "$LINK_FILE" | cut -d' ' -f1)
+say "      链接源文件 sha256=$LINK_SRC_SHA"
 
 # 起一个 daemon；pid 落在 LAST_PID 里。disown 是为了让 bash 不要在收尾时
 # 打印「Killed」把 PASS 顶到上面去。
@@ -559,7 +581,125 @@ done
 chk "tracker.off_node_stopped" "$(port_busy $PORT_C && echo 0 || echo 1)"
 PID_C=""
 
-# ------------------------------------------------------------------ 11. 绿色版：没有 Java 的机器
+# ------------------------------------------------------------------ 11. 链接分享（W1）
+# 这一段只走 daemon 的 REST（不碰 core 内部）；8 MiB 的端到端在 11b，用 Edge headless 打开
+# Pages 的接收页、经真 Worker 的 /signal 建链，浏览器自己算 SHA-256 再从 DataChannel 回执。
+say ""
+say "--- 链接分享：可用性 / 创建 / 列表 / 状态"
+LINK_AVAIL=$(get "http://127.0.0.1:$PORT_A/api/shares")
+LINK_AVAILABLE=$(bval "$LINK_AVAIL" available)
+LINK_WEBRTC=$(sval "$LINK_AVAIL" webRtc)
+LINK_BASE=$(sval "$LINK_AVAIL" baseUrl)
+chk "link.available (available=$LINK_AVAILABLE webRtc=$LINK_WEBRTC)" \
+  "$([ "$LINK_AVAILABLE" = "true" ] && echo 1 || echo 0)"
+chk "link.base_is_pages ($LINK_BASE)" "$([ "$LINK_BASE" = "$LINK_API" ] && echo 1 || echo 0)"
+chk "link.ready_logged" \
+  "$(grep -q "event=link_ready .*base=$LINK_API" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+
+say "--- A 共享链接分享用的 8 MiB"
+LINK_ADDED=$(post "http://127.0.0.1:$PORT_A/api/groups/$GID/files" "{\"path\":\"$(w "$LINK_FILE")\"}")
+LINK_FID=$(sval "$LINK_ADDED" id)
+chk "link.file_shared (id=$LINK_FID)" "$([ -n "$LINK_FID" ] && echo 1 || echo 0)"
+
+# 请求体校验：缺 fileId / expireDays 越界 / 两个时长一起给，都必须是 400。
+BAD_SHARE_STATUS=$(curl -s -m 20 -o "$ART/link-no-file.json" -w '%{http_code}' \
+  -X POST -H 'Content-Type: application/json' --data-binary '{}' "http://127.0.0.1:$PORT_A/api/shares")
+chk "link.create_requires_fileId (status=$BAD_SHARE_STATUS)" \
+  "$([ "$BAD_SHARE_STATUS" = "400" ] && grep -q '"code":"E_BAD_FILE"' "$ART/link-no-file.json" && echo 1 || echo 0)"
+BAD_EXPIRE_STATUS=$(curl -s -m 20 -o "$ART/link-bad-expire.json" -w '%{http_code}' \
+  -X POST -H 'Content-Type: application/json' --data-binary "{\"fileId\":\"$LINK_FID\",\"expireDays\":9}" \
+  "http://127.0.0.1:$PORT_A/api/shares")
+chk "link.create_rejects_expireDays (status=$BAD_EXPIRE_STATUS)" \
+  "$([ "$BAD_EXPIRE_STATUS" = "400" ] && grep -q '"code":"E_BAD_EXPIRE"' "$ART/link-bad-expire.json" && echo 1 || echo 0)"
+BAD_BOTH_STATUS=$(curl -s -m 20 -o "$ART/link-both-expire.json" -w '%{http_code}' \
+  -X POST -H 'Content-Type: application/json' --data-binary "{\"fileId\":\"$LINK_FID\",\"expireDays\":1,\"ttlSec\":60}" \
+  "http://127.0.0.1:$PORT_A/api/shares")
+chk "link.create_rejects_both_ttl (status=$BAD_BOTH_STATUS)" \
+  "$([ "$BAD_BOTH_STATUS" = "400" ] && grep -q '"code":"E_BAD_EXPIRE"' "$ART/link-both-expire.json" && echo 1 || echo 0)"
+
+LINK_CREATED=$(post "http://127.0.0.1:$PORT_A/api/shares" "{\"fileId\":\"$LINK_FID\"}")
+LINK_TOKEN=$(sval "$LINK_CREATED" token)
+LINK_TOKEN_TAG=$(printf '%s' "$LINK_TOKEN" | cut -c1-4)
+LINK_SHARE_ID=$(sval "$LINK_CREATED" shareId)
+LINK_SHARE_TAG=$(printf '%s' "$LINK_SHARE_ID" | cut -c1-8)
+LINK_LINK=$(sval "$LINK_CREATED" link)
+LINK_QR=$(sval "$LINK_CREATED" qrText)
+LINK_CREATED_AT=$(ival "$LINK_CREATED" createdAt)
+LINK_EXPIRES_AT=$(ival "$LINK_CREATED" expiresAt)
+LINK_TTL_DAYS=$(( (LINK_EXPIRES_AT - LINK_CREATED_AT) / 86400000 ))
+LINK_STATUS=$(sval "$LINK_CREATED" status)
+LINK_PHASE=$(sval "$LINK_CREATED" phase)
+chk "link.create_ok (share=$LINK_SHARE_TAG status=$LINK_STATUS phase=$LINK_PHASE)" \
+  "$([ -n "$LINK_TOKEN" ] && [ "$LINK_STATUS" = "waiting" ] && [ "$LINK_PHASE" = "active" ] && echo 1 || echo 0)"
+chk "link.link_shape ($LINK_LINK)" "$([ "$LINK_LINK" = "$LINK_API/#s=$LINK_TOKEN" ] && echo 1 || echo 0)"
+chk "link.qr_is_link" "$([ "$LINK_QR" = "$LINK_LINK" ] && echo 1 || echo 0)"
+chk "link.expiry_default_7d (days=$LINK_TTL_DAYS)" "$([ "$LINK_TTL_DAYS" = "7" ] && echo 1 || echo 0)"
+chk "link.log_created" \
+  "$(grep -qF "event=link_share_created token=$LINK_TOKEN link=$LINK_LINK" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+
+LINK_LIST=$(get "http://127.0.0.1:$PORT_A/api/shares")
+LINK_LIST_ENTRY=$(printf '%s' "$LINK_LIST" | grep -o "\"token\":\"$LINK_TOKEN\"[^}]*" | head -1)
+chk "link.list_has_share" "$([ -n "$LINK_LIST_ENTRY" ] && echo 1 || echo 0)"
+chk "link.list_status_waiting" \
+  "$(printf '%s' "$LINK_LIST_ENTRY" | grep -q '"status":"waiting"' && echo 1 || echo 0)"
+chk "link.list_visitor_null" \
+  "$(printf '%s' "$LINK_LIST_ENTRY" | grep -q '"visitor":null' && echo 1 || echo 0)"
+
+LINK_STATUS_JSON=$(get "http://127.0.0.1:$PORT_A/api/shares/$LINK_TOKEN/status")
+chk "link.status_waiting (status=$(sval "$LINK_STATUS_JSON" status) phase=$(sval "$LINK_STATUS_JSON" phase))" \
+  "$([ "$(sval "$LINK_STATUS_JSON" status)" = "waiting" ] && [ "$(sval "$LINK_STATUS_JSON" phase)" = "active" ] && echo 1 || echo 0)"
+
+# 过期用的分享：Worker 的有效期下限是 60 s，正好可以在这一轮跑完之前自然过期。
+EXP_CREATED=$(post "http://127.0.0.1:$PORT_A/api/shares" "{\"fileId\":\"$LINK_FID\",\"ttlSec\":60}")
+EXP_TOKEN=$(sval "$EXP_CREATED" token)
+EXP_TOKEN_TAG=$(printf '%s' "$EXP_TOKEN" | cut -c1-4)
+EXP_AT=$(ival "$EXP_CREATED" expiresAt)
+chk "link.expire_share_created (ttl=60s token=$EXP_TOKEN_TAG)" \
+  "$([ -n "$EXP_TOKEN" ] && [ -n "$EXP_AT" ] && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 11b. 链接分享端到端（8 MiB）
+say ""
+say "--- 链接分享端到端：daemon 发 8 MiB，Edge headless 接收页收并自己算 SHA-256"
+LINK_E2E_TAG="m1-$(date +%Y%m%d-%H%M%S)"
+LINK_E2E_RC=1
+node "$ROOT/daemon/e2e/link-share-e2e.mjs" \
+  --port "$PORT_A" --file "$(w "$LINK_FILE")" --out "$(w "$LINK_E2E")" \
+  --tag "$LINK_E2E_TAG" --api "$LINK_API" --log "$(w "$LOG_A")" > "$ART/link-e2e.out" 2>&1
+LINK_E2E_RC=$?
+chk "link.e2e_pass (rc=$LINK_E2E_RC)" "$([ "$LINK_E2E_RC" = "0" ] && echo 1 || echo 0)"
+if [ -f "$LINK_E2E/result.json" ]; then
+  chk "link.e2e_browser_sha_matches" \
+    "$(grep -q '\"shaOk\": true' "$LINK_E2E/result.json" && echo 1 || echo 0)"
+  chk "link.e2e_daemon_status_done" \
+    "$(grep -q '\"daemonStatus\": \"done\"' "$LINK_E2E/result.json" && echo 1 || echo 0)"
+else
+  note "端到端没有 result.json（见 $ART/link-e2e.out）"
+  chk "link.e2e_browser_sha_matches" "0"
+  chk "link.e2e_daemon_status_done" "0"
+fi
+chk "link.e2e_transfer_log" \
+  "$(grep -q "event=link_transfer_done bytes=$LINK_BYTES sha256=$LINK_SRC_SHA" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+chk "link.e2e_screenshot" "$([ -f "$LINK_E2E/view-done.png" ] && echo 1 || echo 0)"
+
+# 撤销：本机先断流，再让 Worker 标 revoked；DELETE 幂等，未知 token 404。
+say "--- 撤销分享 / 幂等 / 未知 token"
+LINK_REVOKED=$(curl -s -m 30 -X DELETE "http://127.0.0.1:$PORT_A/api/shares/$LINK_TOKEN")
+chk "link.revoke (remoteRevoked=$(bval "$LINK_REVOKED" remoteRevoked) status=$(sval "$LINK_REVOKED" status))" \
+  "$([ "$(bval "$LINK_REVOKED" remoteRevoked)" = "true" ] && [ "$(sval "$LINK_REVOKED" status)" = "revoked" ] && echo 1 || echo 0)"
+chk "link.log_revoked" \
+  "$(grep -q "event=link_share_revoked token=$LINK_TOKEN " "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+LINK_REVOKED_STATUS=$(get "http://127.0.0.1:$PORT_A/api/shares/$LINK_TOKEN/status")
+chk "link.revoked_status (status=$(sval "$LINK_REVOKED_STATUS" status) phase=$(sval "$LINK_REVOKED_STATUS" phase))" \
+  "$([ "$(sval "$LINK_REVOKED_STATUS" status)" = "revoked" ] && [ "$(sval "$LINK_REVOKED_STATUS" phase)" = "finished" ] && echo 1 || echo 0)"
+LINK_REVOKED_AGAIN=$(curl -s -m 30 -X DELETE "http://127.0.0.1:$PORT_A/api/shares/$LINK_TOKEN")
+chk "link.revoke_idempotent (alreadyRevoked=$(bval "$LINK_REVOKED_AGAIN" alreadyRevoked))" \
+  "$([ "$(bval "$LINK_REVOKED_AGAIN" alreadyRevoked)" = "true" ] && echo 1 || echo 0)"
+LINK_UNKNOWN_STATUS=$(curl -s -m 20 -o /dev/null -w '%{http_code}' \
+  "http://127.0.0.1:$PORT_A/api/shares/00000000000000000000000000/status")
+chk "link.unknown_token_404 (status=$LINK_UNKNOWN_STATUS)" \
+  "$([ "$LINK_UNKNOWN_STATUS" = "404" ] && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 12. 绿色版：没有 Java 的机器
 # 复现「目标机没装 Java」：用 cmd 把 JAVA_HOME 清空、PATH 只留 System32，再双击同一个 exe。
 # 判定三条同时成立才算过：
 #   1) 这个端口本来没人监听（上面清场时查过），/api/health 能通 = daemon 是本轮拉起来的；
@@ -571,8 +711,12 @@ PKG_DIR="$ROOT/dist/Huchuan"
 PKG_DATA="$ART/package-data"
 PKG_SHELL_LOG="$(cygpath -u "${LOCALAPPDATA:-$HOME}")/Huchuan/logs/shell.log"
 
-if [ ! -f "$PKG_DIR/Huchuan.exe" ]; then
-  note "dist/Huchuan 不存在，先打包（scripts/package-windows.sh）"
+# 绿色版要验的是**这一轮**的产物：dist/Huchuan/daemon.jar 比刚构建的旧也重打，
+# 否则测试会拿上一轮的 jar 冒充本轮（链接分享这类新端点尤其容易假绿）。
+PKG_STALE=0
+if [ ! -f "$PKG_DIR/daemon.jar" ] || [ "$JAR" -nt "$PKG_DIR/daemon.jar" ]; then PKG_STALE=1; fi
+if [ ! -f "$PKG_DIR/Huchuan.exe" ] || [ "$PKG_STALE" = "1" ]; then
+  note "dist/Huchuan 不存在或 daemon.jar 过期，先打包（scripts/package-windows.sh）"
   bash "$SCRIPT_DIR/package-windows.sh" > "$ART/package.log" 2>&1 \
     || { tail -n 15 "$ART/package.log" >&2; note "打包失败，完整日志：artifacts/m1-windows/package.log"; }
 fi
@@ -601,6 +745,19 @@ if [ -f "$PKG_DIR/Huchuan.exe" ] && [ -x "$PKG_DIR/runtime/bin/javaw.exe" ]; the
   [ -n "$PKG_JAVA_LINE" ] && note "壳用的 java：$PKG_JAVA_LINE"
 fi
 
+# 绿色版的 runtime 是 jlink 裁出来的：链接分享要的是原生 WebRTC 库，光把 jar 装进去不够。
+# GET /api/shares 会做一次真探测（WebRtc.create 加载 22.8 MB 的 DLL），能回 available=true
+# 才算这个精简 JRE 把模块带对了；模块少了这里会变成 false，而不是等用户点分享才炸。
+PKG_LINK=""
+if [ -n "$PKG_HEALTH" ]; then
+  PKG_LINK=$(get "http://127.0.0.1:$PORT_PKG/api/shares")
+fi
+PKG_LINK_OK=$(bval "$PKG_LINK" available)
+[ -n "$PKG_LINK_OK" ] || PKG_LINK_OK="none"
+PKG_LINK_WEBRTC=$(sval "$PKG_LINK" webRtc)
+[ -n "$PKG_LINK_WEBRTC" ] || PKG_LINK_WEBRTC="none"
+note "绿色版的链接分享：available=$PKG_LINK_OK webRtc=$PKG_LINK_WEBRTC reason=$(sval "$PKG_LINK" reason)"
+
 # 收尾：先请 daemon 自己停，再关壳窗口（壳退出时会再试一次，不会留孤儿）
 if [ -n "$PKG_HEALTH" ]; then
   post "http://127.0.0.1:$PORT_PKG/api/shutdown" '{}' > /dev/null 2>&1 || true
@@ -619,7 +776,34 @@ esac
 chk "package.shell_runs_without_java (api=$PORT_PKG, PATH=C:\\Windows\\System32, JAVA_HOME 空)" \
   "$([ "$PKG_HEALTH_OK" = "1" ] && [ "$PKG_RUNTIME_OK" = "1" ] && echo 1 || echo 0)"
 
-# ------------------------------------------------------------------ 11b. 公开种子（磁力）
+chk "package.link_available_in_green_runtime (available=$PKG_LINK_OK webRtc=$PKG_LINK_WEBRTC)" \
+  "$([ "$PKG_LINK_OK" = "true" ] && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 12c. 链接分享：过期
+# 11 段创建的 ttlSec=60 分享到这里一定过期了；若这一轮跑得比 60 s 还快，就等到 expiresAt。
+say ""
+say "--- 链接分享：过期（ttlSec=60）"
+EXP_STATUS=""
+EXP_DONE=0
+EXP_LIMIT=$(( (EXP_AT + 2000) / 1000 ))
+while [ "$EXP_DONE" = "0" ]; do
+  EXP_STATUS=$(get "http://127.0.0.1:$PORT_A/api/shares/$EXP_TOKEN/status")
+  case "$EXP_STATUS" in
+    *'"status":"expired"'*) EXP_DONE=1 ;;
+  esac
+  [ "$EXP_DONE" = "1" ] && break
+  NOW_S=$(date +%s)
+  if [ "$NOW_S" -gt "$((EXP_LIMIT + 30))" ]; then break; fi
+  sleep 2
+done
+chk "link.expired_status (status=$(sval "$EXP_STATUS" status) phase=$(sval "$EXP_STATUS" phase))" \
+  "$([ "$(sval "$EXP_STATUS" status)" = "expired" ] && [ "$(sval "$EXP_STATUS" phase)" = "finished" ] && echo 1 || echo 0)"
+chk "link.expired_log" \
+  "$(grep -q "event=link_share_expired token=$EXP_TOKEN " "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+chk "link.expired_session_closed" \
+  "$(grep -q "event=link_session_closed .*reason=expired" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 12b. 公开种子（磁力）
 # 放在最后一组：磁力导入会拉起公开会话（DHT），与前面的私有传输无关；把潜在的公开会话异常
 # 隔离在收尾之前，前面的断言已经全部跑完。断言只走 daemon 的 REST 与 /api/state，不碰 core 内部。
 say ""
@@ -716,7 +900,7 @@ STATE_B_AFTER=$(get "http://127.0.0.1:$PORT_B/api/state")
 chk "magnet.remove_not_broadcast (B still has it)" \
   "$(printf '%s' "$STATE_B_AFTER" | grep -qF "\"id\":\"$PUB_HASH\"" && echo 1 || echo 0)"
 
-# ------------------------------------------------------------------ 12. 停
+# ------------------------------------------------------------------ 13. 停
 say ""
 say "--- 停 daemon"
 post "http://127.0.0.1:$PORT_A/api/shutdown" '{}' > /dev/null
@@ -730,7 +914,7 @@ done
 chk "shutdown.A_stopped" "$(port_busy $PORT_A && echo 0 || echo 1)"
 chk "shutdown.B_stopped" "$(port_busy $PORT_B && echo 0 || echo 1)"
 
-# ------------------------------------------------------------------ 13. 汇总
+# ------------------------------------------------------------------ 14. 汇总
 # 先彻底收尾再打分：PASS / FAIL 必须是脚本的最后一行。
 cleanup
 trap - EXIT

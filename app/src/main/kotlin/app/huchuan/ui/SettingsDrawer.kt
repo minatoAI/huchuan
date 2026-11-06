@@ -1,5 +1,6 @@
 package app.huchuan.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -48,6 +49,7 @@ import app.huchuan.ui.theme.brandSwitchColors
 @Composable
 fun SettingsDrawer(
     state: HuchuanState,
+    onOpenShareManage: () -> Unit = {},
 ) {
     val device = state.deviceState
     val networkReport = remember { state.probe.check() }
@@ -183,6 +185,28 @@ fun SettingsDrawer(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            }
+
+            // P9 唯一入口（link-share.md §8）：只有配置了分享服务才出现。
+            if (state.linkAvailable) {
+                val linkCount = state.link?.shares?.value?.size ?: 0
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = Spacing.rowMinHeight)
+                        .clickable(onClick = onOpenShareManage),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(stringResource(R.string.p7_share_manage))
+                    Spacer(Modifier.weight(1f))
+                    if (linkCount > 0) {
+                        Text(
+                            text = linkCount.toString(),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
 

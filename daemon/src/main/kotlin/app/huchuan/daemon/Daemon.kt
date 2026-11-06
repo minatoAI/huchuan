@@ -14,6 +14,7 @@ import app.huchuan.core.m1.jstr
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -31,6 +32,8 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
     val startedAt = System.currentTimeMillis()
 
     private val rev = AtomicLong(1)
+    /** stop 是幂等的：Main 的正常退出路径与 JVM 的 shutdown hook 会各调一次。 */
+    private val stoppedOnce = AtomicBoolean(false)
     private val highWater = java.util.Collections.synchronizedMap(HashMap<String, Int>())
     private val stopLatch = CountDownLatch(1)
     private var ticker: Thread? = null
@@ -76,6 +79,11 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         override fun opReceived(group: GroupRuntime, op: OpRecord) = bump("comment_added")
     }
 
+    /** 链接分享（W1）：服务端登记 + 信令 + WebRTC 发送端，全部在 daemon 进程内。 */
+    @Volatile
+    var link: app.huchuan.daemon.link.LinkService? = null
+        private set
+
     // ------------------------------------------------------------------ 生命周期
 
     fun start() {
@@ -106,6 +114,7 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         kernel = created
         // 限速不落内核（libtorrent 的 settings_pack 不持久化），重启后按落盘值重新下发一次。
         applySessionLimits()
+        startLink()
         startTicker()
         if (options.restoreSeeds) restoreSeedsAsync()
         log.event(
@@ -119,6 +128,20 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         )
     }
 
+    /**
+     * 链接分享的装配。失败只降级（link=null），不影响内核与其它 API：
+     * 没有 webrtc-java 原生库的机器上 daemon 照常起，/api/shares 回 503 并说明原因。
+     */
+    private fun startLink() {
+        val service = try {
+            app.huchuan.daemon.link.LinkService(this, log).also { it.start() }
+        } catch (e: Throwable) {
+            log.event("daemon_link_start_failed", mapOf("error" to e.toString()))
+            null
+        }
+        link = service
+    }
+
     fun awaitStop(timeoutMs: Long): Boolean = stopLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
 
     fun requestShutdown(reason: String) {
@@ -129,7 +152,12 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
     }
 
     fun stop() {
+        if (!stoppedOnce.compareAndSet(false, true)) return
         try { ticker?.interrupt() } catch (_: Throwable) {}
+        try { link?.stop() } catch (e: Throwable) {
+            log.event("daemon_link_stop_error", mapOf("error" to e.toString()))
+        }
+        link = null
         hub.closeAll()
         try { kernel?.stop() } catch (e: Throwable) {
             log.event("daemon_kernel_stop_error", mapOf("error" to e.toString()))

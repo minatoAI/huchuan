@@ -39,6 +39,7 @@ import app.huchuan.core.NetworkStatus
 import app.huchuan.kernel.M1Runtime
 import app.huchuan.kernel.MagnetImport
 import app.huchuan.kernel.PublicPublish
+import app.huchuan.link.LinkShareController
 import app.huchuan.notify.NotifyPermission
 import app.huchuan.notify.NotifyRoute
 import app.huchuan.share.ShareInRoute
@@ -49,6 +50,8 @@ import app.huchuan.ui.MembersScreen
 import app.huchuan.ui.NetworkScreen
 import app.huchuan.ui.NewGroupScreen
 import app.huchuan.ui.SettingsDrawer
+import app.huchuan.ui.ShareLinkScreen
+import app.huchuan.ui.ShareManageScreen
 import app.huchuan.ui.UserNameScreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -104,6 +107,15 @@ sealed interface Destination {
     data class NewGroup(val firstLaunch: Boolean) : Destination
 
     data class Members(val groupId: String) : Destination
+
+    /** P8：已有的分享（创建成功后 NewLink 换成它）。 */
+    data class LinkShare(val shareId: String) : Destination
+
+    /** P8：从 P4「分享链接」进来，先创建。 */
+    data class NewLink(val groupId: String, val fileId: String) : Destination
+
+    /** P9：分享管理（P7 入口）。 */
+    data object ShareManage : Destination
 }
 
 /**
@@ -153,6 +165,13 @@ class HuchuanState(
 
     fun pop() {
         if (stack.size > 1) stack.removeAt(stack.lastIndex)
+        syncActiveView()
+    }
+
+    /** 把栈顶换成另一个目的地（P8 创建成功：NewLink → LinkShare，不再重复创建）。 */
+    fun replaceTop(destination: Destination) {
+        if (stack.isEmpty()) return
+        stack[stack.size - 1] = destination
         syncActiveView()
     }
 
@@ -386,6 +405,11 @@ class HuchuanState(
     }
 
     // ------------------------------------------------------------------ P7 跨网发现（tracker）
+
+    /** 链接分享：构建期配置了 http(s) 基址才可用（link-share §10.3）。 */
+    val link: LinkShareController? get() = runtime?.link
+
+    val linkAvailable: Boolean get() = link?.enabled == true
 
     /** 只有接了内核的壳才有这一项：静态壳里没有任何「跨网」行为可以开关。 */
     val trackerAvailable: Boolean get() = runtime != null
@@ -625,7 +649,15 @@ fun HuchuanApp(
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
-            SettingsDrawer(state = state)
+            SettingsDrawer(
+                state = state,
+                onOpenShareManage = {
+                    scope.launch {
+                        drawerState.close()
+                        state.push(Destination.ShareManage)
+                    }
+                },
+            )
         },
     ) {
         when (val destination = state.current) {
@@ -679,6 +711,20 @@ fun HuchuanApp(
                 state = state,
                 groupId = destination.groupId,
             )
+
+            is Destination.LinkShare -> ShareLinkScreen(
+                state = state,
+                shareId = destination.shareId,
+            )
+
+            is Destination.NewLink -> ShareLinkScreen(
+                state = state,
+                shareId = "",
+                pendingGroupId = destination.groupId,
+                pendingFileId = destination.fileId,
+            )
+
+            Destination.ShareManage -> ShareManageScreen(state = state)
         }
     }
 }
