@@ -197,10 +197,14 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
         const val DEFAULT_NOTIFICATION = "bubble"
 
         /**
-         * 已部署的自建 tracker（Cloudflare Worker，见 docs/deploy-cloudflare.md）。
+         * 已部署的自建 tracker 的**对外入口**（Cloudflare Pages，见 docs/deploy-cloudflare.md §5）。
+         *
+         * 这里写的是 Pages 域名，不是 Worker 的 workers.dev：中国大陆网络下 workers.dev 被 DNS
+         * 污染 / SNI 阻断，pages.dev 通；Pages Functions 把 /api/tracker/register 与 /announce
+         * 原样转给后面的 Worker。core 只把 base 拼上自己的路径，不认识入口是谁。
          * 换部署地址只改这一处：core 里没有任何写死的线上地址，daemon 是唯一的来源。
          */
-        const val DEFAULT_TRACKER_BASE_URL = "https://huchuan-relay.autoai233.workers.dev"
+        const val DEFAULT_TRACKER_BASE_URL = "https://huchuan-a9f.pages.dev"
 
         /** 跨网发现默认开：地址内置，用户不需要先配。 */
         const val DEFAULT_TRACKER_ENABLED = true

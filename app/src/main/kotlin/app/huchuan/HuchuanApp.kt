@@ -324,7 +324,7 @@ class HuchuanState(
             return runtime?.prefs?.trackerDiscoveryEnabled ?: false
         }
 
-    /** 设置与运行中的内核不一致时提示「下次启动生效」。 */
+    /** 设置与运行中的内核不一致时提示「重启后生效」。 */
     val trackerRestartNeeded: Boolean
         get() {
             @Suppress("UNUSED_EXPRESSION")

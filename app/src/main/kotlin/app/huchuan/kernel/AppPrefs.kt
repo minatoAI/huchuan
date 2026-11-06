@@ -141,7 +141,12 @@ class AppPrefs(context: Context) : LocalDeviceStore {
         private const val KEY_TRACKER_BASE = "tracker_base_url"
         private const val KEY_TRACKER_DISCOVERY = "tracker_discovery"
 
-        /** 已部署的 relay（Worker）地址；只在宿主里出现这一次，内核不许写死。 */
-        const val DEFAULT_TRACKER_BASE = "https://huchuan-relay.autoai233.workers.dev"
+        /**
+         * 已部署的 relay 地址；只在宿主里出现这一次，内核不许写死。
+         *
+         * 入口走 **pages.dev**（Pages Functions 转发到 Worker）：国内网络下 workers.dev 被
+         * DNS 污染 / SNI 阻断，pages.dev 可达（AGENTS §9 客户端默认地址一条）。
+         */
+        const val DEFAULT_TRACKER_BASE = "https://huchuan-a9f.pages.dev"
     }
 }

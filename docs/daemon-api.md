@@ -126,7 +126,7 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
                 "downloadLimitKbps": 0, "unlimited": true,
                 "sessionUploadLimitKbps": 0, "sessionDownloadLimitKbps": 0,
                 "trackerEnabled": true,
-                "trackerBaseUrl": "https://huchuan-relay.autoai233.workers.dev",
+                "trackerBaseUrl": "https://huchuan-a9f.pages.dev",
                 "trackerActive": true, "trackerRestartRequired": false },
   "groups": [ /* 见 3.2 的群对象；每个文件额外带 comments */ ]
 }
@@ -189,7 +189,7 @@ POST { "unlimited": true }                         // 「不限」：两项都�
 
 ```json
 GET  → { "tracker": { "enabled": true,
-                      "baseUrl": "https://huchuan-relay.autoai233.workers.dev",
+                      "baseUrl": "https://huchuan-a9f.pages.dev",
                       "active": true, "restartRequired": false } }
 
 POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改几项
@@ -198,7 +198,9 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
 
 - `enabled`：布尔，默认 `true`。关掉 = 只走局域网 mDNS 与手动 IP:port；内核根本不装配
   tracker，一条请求都不会发。
-- `baseUrl`：tracker 基址，默认是已部署的 Worker（`https://huchuan-relay.autoai233.workers.dev`）。
+- `baseUrl`：tracker 基址，默认是已部署的 Pages 入口（`https://huchuan-a9f.pages.dev`）。
+  中国大陆网络打不开 `*.workers.dev`，Pages Functions 把 `/api/tracker/register` 与 `/announce`
+  原样转给后面的 Worker（见 `docs/deploy-cloudflare.md` §5），所以客户端只认 pages.dev。
   给了就必须是 `http://` / `https://` 开头的地址，否则 400 `E_BAD_TRACKER`。
 - `active`：**内核此刻**有没有 tracker 在工作（core 的 `kernel.trackerEnabled`），不是刚点的值。
 - `restartRequired`：落盘设置与内核现状不一致。core 只在 `start` 时装配 tracker
@@ -515,8 +517,8 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 
 跨网发现（tracker）这一组：
 
-    ts=… event=kernel_started … tracker=on tracker_base=https://huchuan-relay.autoai233.workers.dev
-    ts=… event=tracker_started gid=7N2P… base=https://huchuan-relay.autoai233.workers.dev …
+    ts=… event=kernel_started … tracker=on tracker_base=https://huchuan-a9f.pages.dev
+    ts=… event=tracker_started gid=7N2P… base=https://huchuan-a9f.pages.dev …
     ts=… event=tracker_register_failed gid=7N2P… reason=… passkey_masked=abcd****
     ts=… event=tracker_disabled reason=base_url_empty
 
@@ -643,9 +645,10 @@ bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 做种者，按 spec §306 做种者不计入队友。队友 ≥1 的画面取证在 `windows/scripts/capture-team-ui.sh`
 （三个 daemon，S 做种 + C1/C2 同时下载），见 `docs/windows-ui.md` §6.1。
 
-跨网发现 18 条：A 侧默认开、地址是已部署的 Worker、内核里 `active=true`、`kernel_started` 里
-`tracker=on`、建群后出现 `tracker_started` 且确实发起注册（本机 DNS 被拦时日志是
-`tracker_register_failed`，失败可接受 —— 断言的是「有尝试」，不是「注册成功」）。另起一个
+跨网发现 18 条：A 侧默认开、地址是已部署的 Pages 入口（`https://huchuan-a9f.pages.dev`）、
+内核里 `active=true`、`kernel_started` 里 `tracker=on`、建群后出现 `tracker_started` 且确实发起
+注册（pages.dev 可达时是 `tracker_register`，不可达时是 `tracker_register_failed` —— 断言的是
+「有尝试」，不是「注册成功」）。另起一个
 启动前就把 `trackerEnabled` 写成 `false` 的 C 节点（47202）：`kernel_started tracker=off` 且
 `tracker_disabled`，建群后没有任何 `tracker_service_started` / `tracker_register` /
 `tracker_announce`；运行期 POST `{"enabled":true}` 只落盘，回包 `restartRequired=true` 且

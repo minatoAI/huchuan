@@ -20,8 +20,8 @@
 #   6. limit   ：全局限速下发内核后**读回**会话里生效的值（512 ↔ 0），并采队友数，
 #                确认做种者不计入队友（spec §306）；≥1 的组队取证见
 #                windows/scripts/capture-team-ui.sh
-#   7. tracker ：跨网发现默认开、地址是已部署的 Worker，建群后确实发起注册尝试
-#                （本机 DNS 被拦，失败可接受）；另起一个启动前就关掉 tracker 的 C 节点，
+#   7. tracker ：跨网发现默认开、地址是已部署的 Pages 入口（pages.dev），建群后确实发起注册尝试
+#                （成功 / 失败都算，断言的是「有尝试」）；另起一个启动前就关掉 tracker 的 C 节点，
 #                要求 kernel_started tracker=off、建群后一条 tracker 请求都没有
 #   8. magnet  ：公开种子 / 磁力导入（最后一组）：非法链接 400 invalid_link、同一链接第二次
 #                duplicate、state 里 scope=public + magnet、本机移除后从 state 消失但同群 B 还在
@@ -63,9 +63,11 @@ BT_A=51500
 BT_B=51510
 BT_C=51520
 
-# 默认的跨网发现地址：与 daemon 的 SettingsStore.DEFAULT_TRACKER_BASE_URL 同一个值
-# （docs/deploy-cloudflare.md 里部署的那个 Worker）。换地址时两处一起改。
-TRACKER_URL="https://huchuan-relay.autoai233.workers.dev"
+# 默认的跨网发现地址：与 daemon 的 SettingsStore.DEFAULT_TRACKER_BASE_URL 同一个值。
+# 写 Pages 入口而不是 workers.dev：中国大陆下 workers.dev 被 DNS 污染 / SNI 阻断，pages.dev 通
+# （Pages Functions 把 /api/tracker/register 与 /announce 转给 Worker，见 docs/deploy-cloudflare.md §5）。
+# 换地址时两处一起改。
+TRACKER_URL="https://huchuan-a9f.pages.dev"
 
 FILE_BYTES=33554432
 # 给 A 的共享文件压 8 MiB/s：顺带验单文件限速，并让 WS 的 tick 采样有东西可采。
@@ -294,7 +296,8 @@ chk "group.invite_tail8 (tail8=$TAIL8)" \
 
 # ------------------------------------------------------------------ 3b. 跨网发现（开）
 # 默认开 + 内置地址：daemon 把地址交给内核，群一建好 tracker 线程就开始注册。
-# 这台机器的 DNS 被拦，注册失败是预期结果 —— 断言的是「确实发起了尝试」，不是注册成功。
+# pages.dev 入口可达时通常会 register 成功，不可达时是 register_failed；两种都算一次真实尝试
+# —— 断言的是「确实发起了尝试」，不是注册成功。
 say ""
 say "--- A 跨网发现：默认开、地址是已部署的 $TRACKER_URL"
 TRACKER_A=$(get "http://127.0.0.1:$PORT_A/api/settings/tracker")

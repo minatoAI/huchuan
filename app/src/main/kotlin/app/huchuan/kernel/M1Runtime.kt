@@ -310,7 +310,7 @@ class M1Runtime(context: Context) {
      *
      * 改的是**下一次冷启动**的行为：内核只接受启动前给基址，运行中的 tracker 不动
      * （中途换基址会打断 passkey 连续性，core 明确不支持）。界面用 [trackerRestartNeeded]
-     * 提示「下次启动生效」，不假装已生效。
+     * 提示「重启后生效」，不假装已生效。
      */
     fun setTrackerDiscoveryEnabled(enabled: Boolean) {
         prefs.trackerDiscoveryEnabled = enabled
@@ -321,7 +321,7 @@ class M1Runtime(context: Context) {
         )
     }
 
-    /** 设置与运行中的内核不一致（改了开关但还没冷启动）。P7 据此显示「下次启动生效」。 */
+    /** 设置与运行中的内核不一致（改了开关但还没冷启动）。P7 据此显示「重启后生效」。 */
     val trackerRestartNeeded: Boolean
         get() = started && kernel.trackerBaseUrl != prefs.trackerBaseUrlForKernel()
 

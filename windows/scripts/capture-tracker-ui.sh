@@ -27,7 +27,8 @@ BT_PORT=51810
 # 这个装置自己的设备名：同机可能还有别的 daemon，health 的 deviceName 用来认领
 # 「这个端口上应答的是不是我拉起的那个进程」（MSYS 的 $! 不等于 java.exe 的 Windows pid）。
 DEVICE_NAME=Tracker-Off
-TRACKER_URL="https://huchuan-relay.autoai233.workers.dev"
+# 与 daemon 的 SettingsStore.DEFAULT_TRACKER_BASE_URL 同一口径：Pages 入口（不是 workers.dev）。
+TRACKER_URL="https://huchuan-a9f.pages.dev"
 
 OK=0
 BAD=0

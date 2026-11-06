@@ -123,7 +123,7 @@
     <string name="p7_notification">通知</string>
     <!-- 跨网发现（自建 tracker）开关；改完要冷启动才生效时补一行状态 -->
     <string name="p7_tracker">跨网发现</string>
-    <string name="p7_tracker_restart">下次启动生效</string>
+    <string name="p7_tracker_restart">重启后生效</string>
     <string name="p7_network_diagnostics">网络诊断</string>
     <string name="p7_network_status">网络：%1$s</string>
     <string name="p7_notify_bubble">系统气泡</string>

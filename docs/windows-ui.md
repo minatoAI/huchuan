@@ -160,7 +160,7 @@ P3 已经没有输入框了，所以 `Enter` 就是这一页的主操作（见 �
 | P7 输入框 | `settings.uploadLimitKbps` / `downloadLimitKbps` | 用户设的值，写 `POST /api/settings/limits` |
 | P4 单文件限速读回 | `file.uploadLimitKbps` + `file.uploadLimitInForce` | 已生效 / 已设置；core 没有按 torrent 读回限速的口子（daemon-api 缺口 G9） |
 | P7「跨网发现」开关 | `settings.trackerEnabled` | 落盘的设置；关掉 = 只走局域网 mDNS 与手动地址 |
-| P7 只读地址 / 「重启后生效」 | `settings.trackerBaseUrl` / `trackerRestartRequired` | 地址由 daemon 配（默认已部署的 Worker）；内核只在启动时装配 tracker，改完要重启进程才生效 |
+| P7 只读地址 / 「重启后生效」 | `settings.trackerBaseUrl` / `trackerRestartRequired` | 地址由 daemon 配（默认 `https://huchuan-a9f.pages.dev`，Pages 入口）；内核只在启动时装配 tracker，改完要重启进程才生效 |
 
 「不限」开关与输入框是同一件事的两面：开关打开 → 两项都按 0 下发（输入框同时置灰，与 Android 一致）；
 输入框里给出非 0 值 → 开关自动关掉（daemon 侧就是这么解释的，见 `docs/daemon-api.md` §3.1）。
@@ -373,10 +373,11 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
 6. **绿色版自带 JRE**：`dist/Huchuan/` 里带着 jlink 裁出来的 `runtime/`（26.88 MiB），目标机
    不用装 Java。只有在既没有 `runtime/` 又没装 Java 的机器上（比如直接跑 `windows/build/Huchuan.exe`），
    壳才退回内嵌页面并显示「网络不可用」。打包见 `docs/daemon-api.md` §8。
-7. **跨网发现已接，但没有打洞与端口映射**：默认开、地址是已部署的 Worker（P7 只读展示）；
+7. **跨网发现已接，但没有打洞与端口映射**：默认开、地址是已部署的 Pages 入口
+   `https://huchuan-a9f.pages.dev`（P7 只读展示）；
    关掉只走局域网 mDNS + 手动地址，P7 的网络状态显示「仅局域网」。私有群的 infohash 不进
    DHT / PEX（协议 §8），tracker 只收 groupHash20。开关与地址只在 daemon 启动时装配，P7 改了
-   要重启进程才生效（页面显示「重启后生效」）；本机 DNS 被拦时注册会失败，局域网不受影响。
+   要重启进程才生效（页面显示「重启后生效」）；pages.dev 不可达时注册会失败，局域网不受影响。
 8. **无鉴权**：daemon 只监听 127.0.0.1，本机任何进程都能调它的 API。M1 接受这个前提。
 
 ## 10. 体积

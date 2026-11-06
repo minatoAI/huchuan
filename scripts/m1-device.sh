@@ -746,9 +746,15 @@ open_local_picker() {
     fi
   fi
   sleep 1
-  screenshot "p3-add-sheet"
+  # 截图只留第一次：每多拍一张就多一次 uiautomator dump，真机上一个 dump 要 2-3 s，
+  # 第 12 步连共享三份素材时这点开销会累起来（而且窗口没有变化，不需要每份都留证）。
+  if [ "$ADD_SHEET_SHOT" = "0" ]; then
+    screenshot "p3-add-sheet"
+    ADD_SHEET_SHOT=1
+  fi
   tap "本机文件" exact
 }
+ADD_SHEET_SHOT=0
 
 # SAF 抽屉有动画：点完「显示根目录」要等抽屉真的展开再点「下载」，
 # 中途点到遮罩只会把抽屉关掉。整段最多重来 3 次。
@@ -762,7 +768,10 @@ saf_pick() {
       sleep 1
       continue
     fi
-    if ! see_text "显示根目录" 25000; then
+    if ! see_text "显示根目录" 35000; then
+      # SAF 没起来（弹层被遮罩吃掉、或 DocumentsUI 停在别的状态）：留下现场再退，别猜。
+      warn "SAF 第 $attempt 次没起来（点完「本机文件」等不到「显示根目录」）"
+      uidump "saf-not-opened$attempt"
       sh_ input keyevent KEYCODE_BACK >/dev/null 2>&1
       sleep 1
       continue
