@@ -21,3 +21,6 @@ tools/build-libtorrent-android/build/
 tools/build-libtorrent-android/build2/
 tools/build-libtorrent-android/build3/
 tools/build-libtorrent-android/host/
+
+# 临时探针（Java 源码与 class 都不进库）
+.probe/
