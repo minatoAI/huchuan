@@ -25,3 +25,7 @@ tools/build-libtorrent-android/host/
 
 # 临时探针（Java 源码与 class 都不进库）
 .probe/
+
+# 构建与部署临时产物
+.wrangler/
+node_modules/
