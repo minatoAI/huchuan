@@ -5,6 +5,7 @@ import org.libtorrent4j.AlertListener
 import org.libtorrent4j.SessionManager
 import org.libtorrent4j.SessionParams
 import org.libtorrent4j.SettingsPack
+import org.libtorrent4j.TcpEndpoint
 import org.libtorrent4j.TorrentFlags
 import org.libtorrent4j.TorrentHandle
 import org.libtorrent4j.TorrentInfo
@@ -434,6 +435,25 @@ class PublicBtSession(
     }
 
     override fun peers(fileId: String): Int = status(fileId, false)?.numPeers() ?: 0
+
+    /**
+     * 公开条目对群成员的拨号（public-swarm §4.1）：目标是成员的**公开会话** BT 端口，
+     * 不是私有会话的 btPort —— 两个 SessionManager 各开一套 swarm，拨错会话等于连错群。
+     */
+    override fun connectPeer(fileId: String, host: String, port: Int): Boolean {
+        val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return false
+        return try {
+            handle.swig().connect_peer(TcpEndpoint(host, port).swig())
+            true
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    override fun peerSnapshot(fileId: String): List<BtSession.PeerSnapshot> {
+        val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return emptyList()
+        return BtSession.snapshotOf(handle)
+    }
 
     override fun seedState(fileId: String): String {
         val st = status(fileId, false) ?: return "missing"

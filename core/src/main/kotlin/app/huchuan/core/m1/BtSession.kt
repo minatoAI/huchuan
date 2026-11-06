@@ -52,6 +52,22 @@ class BtSession(
     private val lock = Any()
 
     /**
+     * 动态白名单：消息层确认的**群成员公网 IP 字面量**（AGENTS §9）。
+     *
+     * 私有会话的 ip_filter 基础规则是「全禁 + 只放行私网」，跨网 peer 会被 libtorrent 自己拒掉；
+     * 这里收 GroupRuntime 从 `peer.announce.btHost` / tracker 候选 / 手动 IP:port 学到的地址，
+     * 重建整份 ip_filter 交给运行中的会话（`session::set_ip_filter`）。会话没起来时先记着，
+     * [start] 建会话时一起带进 session_params。
+     */
+    private val allowLock = Any()
+    private val publicAllow = LinkedHashSet<String>()
+
+    /** 动态 ip_filter 写不进会话时的原因（"" = 正常）。诊断用。 */
+    @Volatile
+    var ipFilterError: String = ""
+        private set
+
+    /**
      * 会话级（P7 全局限速）的目标值，单位 **KB/s**，0 = 不限。
      *
      * 会话没起来时先记在这里，[start] 建会话时带进 settings_pack；
@@ -286,7 +302,7 @@ class BtSession(
         }
     }
 
-    fun connectPeer(fileId: String, host: String, port: Int): Boolean {
+    override fun connectPeer(fileId: String, host: String, port: Int): Boolean {
         val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return false
         return try {
             handle.swig().connect_peer(TcpEndpoint(host, port).swig())
@@ -294,19 +310,6 @@ class BtSession(
         } catch (e: Throwable) {
             false
         }
-    }
-
-    /**
-     * `tcp://127.0.0.1:53513` → `127.0.0.1:53513`。
-     *
-     * peer_info.ip() 是带 scheme 的端点串（tcp / utp / ssl 前缀），群成员表里记的是裸 host:port。
-     * 不归一化就永远对不上，队友数会恒为 0（这是 harness 实测踩到的坑，见 docs/core.md §3.4）。
-     */
-    private fun normalizeEndpoint(raw: String): String {
-        var s = raw
-        val at = s.indexOf("://")
-        if (at >= 0) s = s.substring(at + 3)
-        return s.trim()
     }
 
     /** 把 torrent 从会话里摘掉（休眠 / 取消）。文件留在盘上。 */
@@ -426,32 +429,9 @@ class BtSession(
      * 这是「队友数」与「成员是否已互连」的唯一数据来源（产品规格 §306 的观测口径）：
      * 不看成员表、不看协议帧。torrent 不在会话里、或 handle 已失效时返回空表，不抛异常。
      */
-    fun peerSnapshot(fileId: String): List<PeerSnapshot> {
+    override fun peerSnapshot(fileId: String): List<PeerSnapshot> {
         val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return emptyList()
-        val raw = try {
-            handle.peerInfo()
-        } catch (e: Throwable) {
-            return emptyList()
-        }
-        if (raw.isEmpty()) return emptyList()
-        val seedBit = SEED_BIT
-        val busyBits = UNCONNECTED_BITS
-        val out = ArrayList<PeerSnapshot>(raw.size)
-        for (p in raw) {
-            val ip = normalizeEndpoint(try { p.ip() } catch (e: Throwable) { "" })
-            if (ip.isEmpty()) continue
-            val flags = try { p.flags() } catch (e: Throwable) { 0 }
-            val ppm = try { p.progressPpm() } catch (e: Throwable) { 0 }
-            out.add(
-                PeerSnapshot(
-                    ip = ip,
-                    progressPpm = ppm,
-                    connected = (flags and busyBits) == 0,
-                    seed = (flags and seedBit) != 0 || ppm >= 1_000_000,
-                ),
-            )
-        }
-        return out
+        return snapshotOf(handle)
     }
 
     /**
@@ -558,13 +538,13 @@ class BtSession(
             val ec = org.libtorrent4j.swig.error_code()
             fun addr(text: String) = org.libtorrent4j.swig.address.from_string(text, ec)
             val filter = org.libtorrent4j.swig.ip_filter()
-            // 顺序有意义：libtorrent 从后往前匹配，先全量给 global，再把私网段并成 global|local。
+            // 规则是「地址区间 → flags」的覆盖：先全量给 global，再把私网段并成 global|local。
             filter.add_rule(addr("0.0.0.0"), addr("255.255.255.255"), globalBits)
-            for (range in LOCAL_V4_RANGES) {
+            for (range in IpAllowlist.BASE_V4) {
                 filter.add_rule(addr(range.first), addr(range.second), globalBits or localBits)
             }
             filter.add_rule(addr("::"), addr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), globalBits)
-            for (range in LOCAL_V6_RANGES) {
+            for (range in IpAllowlist.BASE_V6) {
                 filter.add_rule(addr(range.first), addr(range.second), globalBits or localBits)
             }
             mgr.swig().set_peer_class_filter(filter)
@@ -608,26 +588,102 @@ class BtSession(
         return s
     }
 
+    // ------------------------------------------------------------------ 动态 ip_filter（AGENTS §9）
+
+    /**
+     * 更新动态白名单：消息层确认的群成员公网 IP 字面量（来源与移除策略见 docs/core.md §3.7）。
+     *
+     * 整份重建而不是增量合并：libtorrent 的 `ip_filter` 内部是地址区间表，重建一次几微秒，
+     * 比维护「哪条规则对应哪个成员」的账本简单，也不会留下已经失效的地址。返回是否变化。
+     *
+     * 会话没起来时只记在内存里，[start] 建会话时带进 session_params；起来了就
+     * `session::set_ip_filter` 立即生效（libtorrent 只对**新**连接应用，已在传的连接不受影响）。
+     */
+    fun updatePublicAllowlist(hosts: Collection<String>): Boolean {
+        val next = IpAllowlist.collect(hosts)
+        val changed = synchronized(allowLock) {
+            if (publicAllow == next) {
+                false
+            } else {
+                publicAllow.clear()
+                publicAllow.addAll(next)
+                true
+            }
+        }
+        if (changed) applyIpFilterToSession()
+        return changed
+    }
+
+    /** 当前动态白名单快照（诊断 / 验收读口）。 */
+    fun publicAllowlist(): Set<String> = synchronized(allowLock) { LinkedHashSet(publicAllow) }
+
+    /**
+     * 这个地址现在会不会被 ip_filter 放行（诊断 / 验收读口）。
+     *
+     * 会话起来后读的是**会话里生效的那份 filter**（`session::get_ip_filter().access()`）——
+     * 断言的是 libtorrent 真正看到的东西，不是本类的缓存。会话没起来时按同一套规则算。
+     */
+    fun ipFilterAllows(host: String): Boolean {
+        val normalized = IpAllowlist.normalizeLiteral(host) ?: return false
+        val mgr = manager
+        if (mgr != null) {
+            return try {
+                val addr = parseAddress(normalized) ?: return false
+                mgr.swig().get_ip_filter().access(addr) == ALLOW
+            } catch (e: Throwable) {
+                false
+            }
+        }
+        return IpAllowlist.isPrivateLiteral(normalized) ||
+            synchronized(allowLock) { publicAllow.contains(normalized) }
+    }
+
+    /** 建会话前的 ip_filter：基础私网段 + 当前动态白名单。 */
     private fun applyIpFilter(params: SessionParams) {
         try {
-            val filter = org.libtorrent4j.swig.ip_filter()
-            val ec = org.libtorrent4j.swig.error_code()
-            fun addr(text: String) = org.libtorrent4j.swig.address.from_string(text, ec)
-            // 顺序有意义：libtorrent 从后往前匹配，先全禁再放行内网。
-            filter.add_rule(addr("0.0.0.0"), addr("255.255.255.255"), BLOCK)
-            filter.add_rule(addr("127.0.0.0"), addr("127.255.255.255"), ALLOW)
-            filter.add_rule(addr("10.0.0.0"), addr("10.255.255.255"), ALLOW)
-            filter.add_rule(addr("172.16.0.0"), addr("172.31.255.255"), ALLOW)
-            filter.add_rule(addr("192.168.0.0"), addr("192.168.255.255"), ALLOW)
-            filter.add_rule(addr("169.254.0.0"), addr("169.254.255.255"), ALLOW)
-            filter.add_rule(addr("::"), addr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), BLOCK)
-            filter.add_rule(addr("::1"), addr("::1"), ALLOW)
-            filter.add_rule(addr("fc00::"), addr("fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), ALLOW)
-            filter.add_rule(addr("fe80::"), addr("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), ALLOW)
-            params.swig().setIp_filter(filter)
+            params.swig().setIp_filter(buildIpFilter())
         } catch (e: Throwable) {
-            // ip_filter 只是纵深防御；拿不到就退回「私有种子 + DHT/PEX/LSD 全关」。
+            // ip_filter 是纵深防御；拿不到就退回「私有种子 + DHT/PEX/LSD 全关」。
+            ipFilterError = e.toString()
         }
+    }
+
+    /** 运行期重建整份 ip_filter 并交给会话（不重启会话、不影响已建立的连接）。 */
+    private fun applyIpFilterToSession() {
+        val mgr = manager ?: return
+        try {
+            mgr.swig().set_ip_filter(buildIpFilter())
+            ipFilterError = ""
+        } catch (e: Throwable) {
+            ipFilterError = e.toString()
+        }
+    }
+
+    private fun buildIpFilter(): org.libtorrent4j.swig.ip_filter {
+        val filter = org.libtorrent4j.swig.ip_filter()
+        val ec = org.libtorrent4j.swig.error_code()
+        fun addr(text: String) = org.libtorrent4j.swig.address.from_string(text, ec)
+        // 规则是「地址区间 → flags」的覆盖，后加的区间覆盖先加的，与 add 顺序无关；
+        // 先全禁，再放行基础私网段，最后逐个放行动态白名单里的公网字面量。
+        filter.add_rule(addr("0.0.0.0"), addr("255.255.255.255"), BLOCK)
+        for ((first, last) in IpAllowlist.BASE_V4) {
+            filter.add_rule(addr(first), addr(last), ALLOW)
+        }
+        val hosts = synchronized(allowLock) { publicAllow.toList() }
+        for (host in hosts) {
+            val single = addr(host)
+            if (single.is_v4) filter.add_rule(single, single, ALLOW)
+            if (single.is_v6) filter.add_rule(single, single, ALLOW)
+        }
+        filter.add_rule(addr("::"), addr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), BLOCK)
+        for ((first, last) in IpAllowlist.BASE_V6) {
+            filter.add_rule(addr(first), addr(last), ALLOW)
+        }
+        for (host in hosts) {
+            val single = addr(host)
+            if (single.is_v6) filter.add_rule(single, single, ALLOW)
+        }
+        return filter
     }
 
     companion object {
@@ -648,21 +704,6 @@ class BtSession(
         /** peer class filter 的两个探针地址：非私网（global 类）、回环（local 类）。 */
         private const val PROBE_NON_LOCAL = "8.8.8.8"
         private const val PROBE_LOCAL = "127.0.0.1"
-
-        /** 默认落 local peer class 的地址段：限速要把它们并进 global 类，否则限速对它们无效。 */
-        private val LOCAL_V4_RANGES = listOf(
-            "127.0.0.0" to "127.255.255.255",
-            "10.0.0.0" to "10.255.255.255",
-            "172.16.0.0" to "172.31.255.255",
-            "192.168.0.0" to "192.168.255.255",
-            "169.254.0.0" to "169.254.255.255",
-        )
-
-        private val LOCAL_V6_RANGES = listOf(
-            "::1" to "::1",
-            "fc00::" to "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-            "fe80::" to "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-        )
 
         /**
          * `torrent_flags::super_seeding`（第 8 位，0x100）。
@@ -685,6 +726,50 @@ class BtSession(
         private val UNCONNECTED_BITS: Int by lazy {
             org.libtorrent4j.swig.peer_info.connecting.to_int() or
                 org.libtorrent4j.swig.peer_info.handshake.to_int()
+        }
+
+        /**
+         * `tcp://127.0.0.1:53513` → `127.0.0.1:53513`。
+         *
+         * peer_info.ip() 是带 scheme 的端点串（tcp / utp / ssl 前缀），群成员表里记的是裸 host:port。
+         * 不归一化就永远对不上，队友数会恒为 0（这是 harness 实测踩到的坑，见 docs/core.md §3.4）。
+         */
+        internal fun normalizeEndpoint(raw: String): String {
+            var s = raw
+            val at = s.indexOf("://")
+            if (at >= 0) s = s.substring(at + 3)
+            return s.trim()
+        }
+
+        /**
+         * 从一个 torrent handle 取对端快照。私有 / 公开两个会话共用这一份字段口径：
+         * 队友数与「成员是否已互连」在两个会话里必须是同一个判定（public-swarm §2.3）。
+         */
+        internal fun snapshotOf(handle: TorrentHandle): List<PeerSnapshot> {
+            val raw = try {
+                handle.peerInfo()
+            } catch (e: Throwable) {
+                return emptyList()
+            }
+            if (raw.isEmpty()) return emptyList()
+            val seedBit = SEED_BIT
+            val busyBits = UNCONNECTED_BITS
+            val out = ArrayList<PeerSnapshot>(raw.size)
+            for (p in raw) {
+                val ip = normalizeEndpoint(try { p.ip() } catch (e: Throwable) { "" })
+                if (ip.isEmpty()) continue
+                val flags = try { p.flags() } catch (e: Throwable) { 0 }
+                val ppm = try { p.progressPpm() } catch (e: Throwable) { 0 }
+                out.add(
+                    PeerSnapshot(
+                        ip = ip,
+                        progressPpm = ppm,
+                        connected = (flags and busyBits) == 0,
+                        seed = (flags and seedBit) != 0 || ppm >= 1_000_000,
+                    ),
+                )
+            }
+            return out
         }
 
         /** 协议 §4 的 pieceSize 规则 + 「>8192 片则翻倍」。 */

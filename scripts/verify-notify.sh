@@ -7,9 +7,8 @@
 # 装置：
 #   S  桌面 JVM 对端：建群 + 做种 256 KiB 素材（hold 住整场）
 #   手机  加入该群 → 打开文件 P4 → 激活（开始下载，即"我参与了这个文件"）→ 退回 P2
-#   D1/D2/D3  各自是一个新的桌面 JVM 对端：加入同群 → 下载素材 → 发一条评论
-#             （D1 另外共享一个小文件，用来验"群内出现新文件"这条触发条件）
-#   D4 在"权限被撤销"状态下发评论，验拒绝通知权限不影响应用内未读
+#   D1 桌面 JVM 对端（一条长连接跑完全场）：加入同群 → 下载素材 → 共享一个小文件
+#      （验"群内出现新文件"触发条件）→ 之后按控制文件一条条发评论（三档各一条 + 撤权一条）
 #
 # 断言（缺一条不算 PASS）：
 #   bubble.*  系统气泡：dumpsys 有该群的通知记录、渠道重要性 HIGH(4)、渠道带声音、日志 headsup=true，
@@ -40,12 +39,6 @@ S_MSG_PORT="${NOTIFY_S_MSG:-47300}"
 S_BT_PORT="${NOTIFY_S_BT:-51570}"
 D1_MSG="${NOTIFY_D1_MSG:-47310}"
 D1_BT="${NOTIFY_D1_BT:-51571}"
-D2_MSG="${NOTIFY_D2_MSG:-47320}"
-D2_BT="${NOTIFY_D2_BT:-51572}"
-D3_MSG="${NOTIFY_D3_MSG:-47330}"
-D3_BT="${NOTIFY_D3_BT:-51573}"
-D4_MSG="${NOTIFY_D4_MSG:-47340}"
-D4_BT="${NOTIFY_D4_BT:-51574}"
 GROUP_NAME="${NOTIFY_GROUP_NAME:-通知验收群}"
 PAYLOAD_KIB="${NOTIFY_PAYLOAD_KIB:-256}"
 NEWFILE_KIB="${NOTIFY_NEWFILE_KIB:-64}"
@@ -131,6 +124,19 @@ see_text() { dks wait-text "$1" --timeout "${2:-30000}" >/dev/null 2>&1; }
 
 back_key() { sh_ input keyevent KEYCODE_BACK >/dev/null 2>&1; sleep 1; }
 
+# 一路退到 P2。通知栏展开着的时候第一次 BACK 只是收起通知栏，所以要按"P2 出现"来判断，
+# 而不是数按了几下。
+back_home() {
+  local i
+  for i in 1 2 3 4 5; do
+    if see_text "设置" 4000; then return 0; fi
+    sh_ cmd statusbar collapse >/dev/null 2>&1
+    sh_ input keyevent KEYCODE_BACK >/dev/null 2>&1
+    sleep 1
+  done
+  return 1
+}
+
 # 手机内核事件日志（tag = huchuan/m1）：「event=xxx k=v ...」。
 applog() {
   "$ADB" -s "$SERIAL" logcat -d -v brief 2>/dev/null \
@@ -189,6 +195,11 @@ NOTIF_CACHE="$ART/dumpsys/.current.txt"
 notif_refresh() { mkdir -p "$ART/dumpsys"; notif_dump > "$NOTIF_CACHE" 2>&1; }
 notif_cached() { cat "$NOTIF_CACHE" 2>/dev/null; }
 
+# 该群当前那条通知的 NotificationRecord 行（不存在时为空）。
+notif_record_line() {
+  notif_cached | grep -E "^ *NotificationRecord\(.*pkg=app\.huchuan .*tag=$GID( |$)" | head -1
+}
+
 # 该群有没有**正在显示**的通知：NotificationRecord 行里同时出现 pkg=app.huchuan 与 tag=groupId。
 notif_record_count() {
   notif_cached | grep -E "^ *NotificationRecord\(.*pkg=app\.huchuan .*tag=$GID( |$)" | wc -l | tr -d ' '
@@ -231,12 +242,9 @@ echo $$ > "$LOCK"
 
 S_PID=""
 D1_PID=""
-D2_PID=""
-D3_PID=""
-D4_PID=""
 cleanup() {
   local pid
-  for pid in "$D4_PID" "$D3_PID" "$D2_PID" "$D1_PID" "$S_PID"; do
+  for pid in "$D1_PID" "$S_PID"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null
       sleep 0.3
@@ -292,13 +300,19 @@ for jar in "$ROOT"/core/build/m1-libs/*.jar; do
   [ -f "$jar" ] && PEER_CP="$PEER_CP;$(w "$jar")"
 done
 PEER_CLASSES="$ART/peer-classes"
-mkdir -p "$PEER_CLASSES"
-javac -encoding UTF-8 -cp "$PEER_CP" -d "$(w "$PEER_CLASSES")" "$(w "$ROOT/app/tools/peer/DesktopPeer.java")" \
+PEER_SRC="$ART/peer-src"
+mkdir -p "$PEER_CLASSES" "$PEER_SRC"
+# 类名改成 NotifyPeer 再编译：别的 agent 的脚本会按命令行里的 *DesktopPeer* 清 java 进程
+# （scripts/m1-device.sh:569、scripts/verify-targetsdk37.sh:284 是所有 DesktopPeer 一律 Stop-Process），
+# 那会把本脚本正在跑的对端中途杀掉（实测：S 在 19:29 被清掉，手机重连全超时）。
+# 源码仍然只有 app/tools/peer/DesktopPeer.java 一份，这里只是生成一个改名的副本再编译。
+sed 's/DesktopPeer/NotifyPeer/g' "$ROOT/app/tools/peer/DesktopPeer.java" > "$PEER_SRC/NotifyPeer.java"
+javac -encoding UTF-8 -cp "$PEER_CP" -d "$(w "$PEER_CLASSES")" "$(w "$PEER_SRC/NotifyPeer.java")" \
   || die "javac 桌面对端失败"
 PEER_CP="$PEER_CP;$(w "$PEER_CLASSES")"
 
 # 端口必须空着：本机同时可能跑着别的 agent 的对端，抢端口会互相搅坏验证。
-for port in "$S_MSG_PORT" "$S_BT_PORT" "$D1_MSG" "$D1_BT" "$D2_MSG" "$D2_BT" "$D3_MSG" "$D3_BT" "$D4_MSG" "$D4_BT"; do
+for port in "$S_MSG_PORT" "$S_BT_PORT" "$D1_MSG" "$D1_BT"; do
   if netstat -ano 2>/dev/null | grep LISTENING | grep -qE "[:.]$port[[:space:]]"; then
     die "端口 $port 已被占用（另一个对端在跑？），换 NOTIFY_* 端口或先结束它"
   fi
@@ -349,7 +363,7 @@ mkdir -p "$ART/desktop/S-data"
 
 S_LOG="$ART/logs/desktop-S.log"
 : > "$S_LOG"
-java -Dlibtorrent4j.jni.path="$(w "$PEER_NATIVE")" -Dfile.encoding=UTF-8 -cp "$PEER_CP" DesktopPeer host \
+java -Dlibtorrent4j.jni.path="$(w "$PEER_NATIVE")" -Dfile.encoding=UTF-8 -cp "$PEER_CP" NotifyPeer host \
   data="$(w "$ART/desktop/S-data")" work="$(w "$ART/desktop")" \
   name="验收S" group_name="$GROUP_NAME" \
   msg_port="$S_MSG_PORT" bt_port="$S_BT_PORT" \
@@ -370,6 +384,11 @@ done
 say "S         : tail8=$TAIL8 msg_port=$S_MSG pid=$S_PID"
 [ "$S_MSG" = "$S_MSG_PORT" ] || die "S 的消息端口不是 $S_MSG_PORT（$S_MSG）"
 chk "desktop.s_ready" 1 "tail8=$TAIL8"
+# 对端存活看门狗：S 若被别的 agent 的对端清理脚本清掉，要能一眼看出是什么时候没的。
+(
+  while kill -0 "$S_PID" 2>/dev/null; do sleep 2; done
+  say "$(date '+%H:%M:%S') S(pid=$S_PID) exited" >> "$ART/logs/peer-watch.log"
+) >/dev/null 2>&1 &
 
 # ------------------------------------------------------------------ 4. 手机加入
 
@@ -439,52 +458,69 @@ chk "perm.post_notifications_granted" "$PERMISSION_GRANTED" \
 [ "$PERMISSION_GRANTED" = "1" ] || die "拿不到通知权限，后面的系统通知无从谈起"
 see_text "设置" 25000 || die "授权框之后没回到 P2"
 
-# ------------------------------------------------------------------ 6. 桌面 D 的公共启动器
+# ------------------------------------------------------------------ 6. 桌面对端（一条连接跑完三档）
 
-PEER_READY_TIMEOUT=90
-start_peer() {
-  local tag="$1" msg="$2" bt="$3"
-  shift 3
-  local data="$ART/desktop/$tag-data"
-  local log="$ART/logs/desktop-$tag.log"
+# 只用**一个**长连接对端 D1：它加入群、下载素材（= 手机之外的另一个人），然后按控制文件
+# 一条条发评论。三档验收是「切档 → 发一条 → 断言 → 再切档」，每发一条就重起一个对端既慢
+# （每次 join + 下载 20-40 s），又更容易被同机其它 agent 的对端清理脚本打断。
+# 控制文件语义见 app/tools/peer/DesktopPeer.java §6：download=<文件名> / comment=<正文>。
+CONTROL="$ART/desktop/control.txt"
+D1_LOG="$ART/logs/desktop-D1.log"
+: > "$CONTROL"
+
+start_peer_d1() {
+  local data="$ART/desktop/D1-data"
   rm -rf "$data"
   mkdir -p "$data"
-  : > "$log"
-  java -Dlibtorrent4j.jni.path="$(w "$PEER_NATIVE")" -Dfile.encoding=UTF-8 -cp "$PEER_CP" DesktopPeer join \
+  : > "$D1_LOG"
+  java -Dlibtorrent4j.jni.path="$(w "$PEER_NATIVE")" -Dfile.encoding=UTF-8 -cp "$PEER_CP" NotifyPeer join \
     data="$(w "$data")" work="$(w "$ART/desktop")" \
-    name="$tag" tail8="$TAIL8" manual="$PC_IP:$S_MSG" \
-    msg_port="$msg" bt_port="$bt" download=1 hold=240 \
-    "$@" > "$log" 2>&1 &
-  echo $!
+    name="验收D1" tail8="$TAIL8" manual="$PC_IP:$S_MSG" \
+    msg_port="$D1_MSG" bt_port="$D1_BT" download=1 hold=2400 \
+    comment="$BODY_BUBBLE" share="$(w "$NEWFILE")" control="$(w "$CONTROL")" \
+    > "$D1_LOG" 2>&1 &
+  D1_PID=$!
 }
 
-wait_peer_comment() {
-  local log="$1" timeout="${2:-180}" start
+# 等 D1 把控制文件里的某条评论真的发出去。
+wait_control_comment() {
+  local body="$1" timeout="${2:-120}" start
   start=$(date +%s)
   while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
-    if grep -qF "PEER comment_sent" "$log" 2>/dev/null; then return 0; fi
-    if grep -qF "RESULT=FAIL" "$log" 2>/dev/null; then return 1; fi
+    if grep -F "PEER control_comment_sent" "$D1_LOG" 2>/dev/null | grep -qF "body=$body"; then return 0; fi
+    if grep -qF "RESULT=FAIL" "$D1_LOG" 2>/dev/null; then return 1; fi
     sleep 1
   done
   return 1
 }
 
+control_comment() { printf 'comment=%s\n' "$1" >> "$CONTROL"; }
+
 wait_phone_op() {
-  local body="$1" timeout="${2:-90}"
-  wait_log "event=ui_op_received" "$timeout" &&
-    applog | grep -F "event=ui_op_received" | grep -qF "body=$body"
+  local body="$1" timeout="${2:-90}" start
+  start=$(date +%s)
+  while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
+    if applog | grep -F "event=ui_op_received" | grep -qF "body=$body"; then return 0; fi
+    sleep 1
+  done
+  return 1
 }
 
 # ------------------------------------------------------------------ 7. 三档验收
 
 # ---------------- 档位一：系统气泡
-step "5/9 档位一「系统气泡」（默认档）：D1 共享新文件 + 评论"
+step "5/9 档位一「系统气泡」（默认档）：对端共享新文件 + 评论"
 NOTIFY_ALERTS_BEFORE="$(count_log "event=notify_alert")"
-D1_PID="$(start_peer D1 "$D1_MSG" "$D1_BT" comment="$BODY_BUBBLE" share="$(w "$NEWFILE")")"
-info "D1 pid=$D1_PID（等它下载完并发评论）"
-wait_peer_comment "$ART/logs/desktop-D1.log" 180 \
-  || { tail -20 "$ART/logs/desktop-D1.log"; die "D1 没发出评论"; }
-say "D1        : $(grep -o 'PEER comment_sent.*' "$ART/logs/desktop-D1.log" | tail -1)"
+start_peer_d1
+info "D1 pid=$D1_PID（等它下载完素材并发第一条评论）"
+START_OK=0
+for _ in $(seq 1 180); do
+  if grep -qF "PEER comment_sent" "$D1_LOG" 2>/dev/null; then START_OK=1; break; fi
+  if grep -qF "RESULT=FAIL" "$D1_LOG" 2>/dev/null; then break; fi
+  sleep 1
+done
+[ "$START_OK" = "1" ] || { tail -20 "$D1_LOG"; die "D1 没发出评论"; }
+say "D1        : $(grep -o 'PEER comment_sent.*' "$D1_LOG" | tail -1)"
 wait_phone_op "$BODY_BUBBLE" 90 || { applog | tail -15; die "手机没收到 D1 的评论"; }
 sleep 3
 
@@ -532,18 +568,15 @@ see_text "设置" 20000 || die "抽屉关掉后没回到 P2"
 # 进一次 P3 再回来：清未读 + 撤掉上一步留在通知栏里的该群通知
 tap "$GROUP_NAME"
 see_text "添加文件" 30000 || die "点群行没进 P3"
-back_key
-see_text "设置" 20000 || die "回不到 P2"
+back_home || die "回不到 P2"
 notif_refresh
 NOTIF_BEFORE_INAPP="$(notif_record_count)"
 ui_snapshot "p2-before-inapp" >/dev/null
 
 NOTIFY_ALERTS_BEFORE="$(count_log "event=notify_alert")"
-D2_PID="$(start_peer D2 "$D2_MSG" "$D2_BT" comment="$BODY_INAPP")"
-info "D2 pid=$D2_PID"
-wait_peer_comment "$ART/logs/desktop-D2.log" 180 \
-  || { tail -20 "$ART/logs/desktop-D2.log"; die "D2 没发出评论"; }
-wait_phone_op "$BODY_INAPP" 90 || { applog | tail -15; die "手机没收到 D2 的评论"; }
+control_comment "$BODY_INAPP"
+wait_control_comment "$BODY_INAPP" 120 || { tail -20 "$D1_LOG"; die "对端没发出第 2 条评论"; }
+wait_phone_op "$BODY_INAPP" 90 || { applog | tail -15; die "手机没收到第 2 条评论"; }
 sleep 3
 
 INAPP_ALERTS="$(( $(count_log "event=notify_alert") - NOTIFY_ALERTS_BEFORE ))"
@@ -577,11 +610,9 @@ text_gone "全局限速" 15000 || warn "抽屉可能没关掉（继续）"
 see_text "设置" 20000 || die "抽屉关掉后没回到 P2"
 
 NOTIFY_ALERTS_BEFORE="$(count_log "event=notify_alert")"
-D3_PID="$(start_peer D3 "$D3_MSG" "$D3_BT" comment="$BODY_MUTED")"
-info "D3 pid=$D3_PID"
-wait_peer_comment "$ART/logs/desktop-D3.log" 180 \
-  || { tail -20 "$ART/logs/desktop-D3.log"; die "D3 没发出评论"; }
-wait_phone_op "$BODY_MUTED" 90 || { applog | tail -15; die "手机没收到 D3 的评论"; }
+control_comment "$BODY_MUTED"
+wait_control_comment "$BODY_MUTED" 120 || { tail -20 "$D1_LOG"; die "对端没发出第 3 条评论"; }
+wait_phone_op "$BODY_MUTED" 90 || { applog | tail -15; die "手机没收到第 3 条评论"; }
 sleep 3
 
 MUTED_ALERTS="$(( $(count_log "event=notify_alert") - NOTIFY_ALERTS_BEFORE ))"
@@ -601,8 +632,20 @@ chk "muted.notification_posted" "$([ "$MUTED_RECORDS" -ge 1 ] && echo 1 || echo 
 MUTED_FIRST="$(printf '%s' "$MUTED_IMPORTANCE" | tr -d ' ' | head -c 1)"
 if [ -n "$MUTED_FIRST" ] && [ "$MUTED_FIRST" -le 2 ] 2>/dev/null; then MUTED_IMP_OK=1; else MUTED_IMP_OK=0; fi
 chk "muted.channel_low" "$MUTED_IMP_OK" "channel importance=[$MUTED_IMPORTANCE]（LOW=2，断言 ≤ 2）"
-if printf '%s' "$MUTED_SOUND" | grep -q '^null$'; then MUTED_SOUND_OK=1; else MUTED_SOUND_OK=0; fi
-chk "muted.no_sound" "$MUTED_SOUND_OK" "mSound=[$MUTED_SOUND]"
+# "无声音"的可证伪口径：
+#   1) 渠道重要性 ≤ LOW —— LOW/IMPORTANCE_LOW 在系统里就是"不响不横幅"；
+#   2) 那条通知本身被 setSilent(true) 过 —— dumpsys 的记录行里是 groupKey=silent。
+# 注意渠道的 mSound 字段：系统对"已存在的渠道"只更新部分字段，应用把声音改成 null 时
+# 记录里的 mSound 可能还是建渠道那次的默认铃声；它不影响行为（LOW 不发声），
+# 所以断言放在"通知记录的 silent 标记 + 重要性"上，而不是渠道的残余字段（见 docs/notify.md）。
+MUTED_LINE="$(notif_record_line)"
+if printf '%s' "$MUTED_LINE" | grep -q 'groupKey=silent' && printf '%s' "$MUTED_LINE" | grep -q 'importance=2'; then
+  MUTED_SILENT_OK=1
+else
+  MUTED_SILENT_OK=0
+fi
+chk "muted.silent_notification" "$MUTED_SILENT_OK" \
+  "$(printf '%s' "$MUTED_LINE" | grep -o 'importance=[0-9]*' | head -1) groupKey=$(printf '%s' "$MUTED_LINE" | grep -o 'groupKey=[a-z]*' | head -1 | cut -d= -f2)（渠道 mSound=[$MUTED_SOUND] 是系统保留值，LOW 不发声）"
 if printf '%s' "$MUTED_ALERT_LINE" | grep -q 'silent=true'; then MUTED_SILENT_OK=1; else MUTED_SILENT_OK=0; fi
 chk "muted.silent_log" "$MUTED_SILENT_OK" \
   "notify_alert ×$MUTED_ALERTS $(printf '%s' "$MUTED_ALERT_LINE" | grep -o 'silent=[a-z]* headsup=[a-z]*')"
@@ -632,10 +675,8 @@ ui_snapshot "p4-from-notification" >/dev/null
 chk "tap.opens_file_page" "$TAP_OK" "$(applog | grep -F 'event=notify_open' | tail -1 | cut -c1-140)"
 
 # ---------------- 权限被撤销：不发通知但未读照常
-step "9/9 撤销 POST_NOTIFICATIONS：D4 评论 → 无系统通知，应用内未读 +1"
-back_key
-back_key
-see_text "设置" 20000 || die "回不到 P2"
+step "9/9 撤销 POST_NOTIFICATIONS：对端再评论 → 无系统通知，应用内未读 +1"
+back_home || die "回不到 P2"
 KERNEL_READY_BEFORE="$(count_log "app_kernel_ready")"
 sh_ pm revoke "$PKG" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1
 sleep 2
@@ -649,26 +690,36 @@ info "revoked   : $(sh_ dumpsys package "$PKG" | grep -o 'POST_NOTIFICATIONS: gr
 
 tap "$GROUP_NAME"
 see_text "添加文件" 30000 || die "点群行没进 P3"
-back_key
-see_text "设置" 20000 || die "回不到 P2"
+back_home || die "回不到 P2"
+
+# 重启后消息层要重新绑定：等手机重新连回对端，否则评论发过来也收不到。
+PEER_EV_BASE="$(count_log "event=ui_peers_changed")"
+PEER_ONLINE=0
+for _ in $(seq 1 45); do
+  if [ "$(count_log "event=ui_peers_changed")" -gt "$PEER_EV_BASE" ] &&
+     applog | grep -F "event=ui_peers_changed" | tail -1 | grep -q "online=true"; then
+    PEER_ONLINE=1
+    break
+  fi
+  sleep 1
+done
+info "peer      : 撤权重启后重连 online=$PEER_ONLINE"
 
 NOTIFY_ALERTS_BEFORE="$(count_log "event=notify_alert")"
-D4_PID="$(start_peer D4 "$D4_MSG" "$D4_BT" comment="$BODY_DENIED")"
-info "D4 pid=$D4_PID"
-wait_peer_comment "$ART/logs/desktop-D4.log" 180 \
-  || { tail -20 "$ART/logs/desktop-D4.log"; die "D4 没发出评论"; }
-wait_phone_op "$BODY_DENIED" 90 || { applog | tail -15; die "手机没收到 D4 的评论"; }
+control_comment "$BODY_DENIED"
+wait_control_comment "$BODY_DENIED" 120 || { tail -20 "$D1_LOG"; die "对端没发出第 4 条评论"; }
+wait_phone_op "$BODY_DENIED" 90 || { applog | tail -15; die "手机没收到第 4 条评论（重连 online=$PEER_ONLINE）"; }
 sleep 3
 
 DENIED_ALERTS="$(( $(count_log "event=notify_alert") - NOTIFY_ALERTS_BEFORE ))"
-DENIED_BLOCKED="$(applog | grep -F "event=notify_blocked" | grep -c "reason=permission_denied" || true)"
+DENIED_BLOCKED="$(applog | grep -F "event=notify_blocked" | grep -cE "reason=(permission_denied|notifications_disabled)" || true)"
 notif_refresh
 DENIED_TEXTS="$(ui_snapshot "p2-permission-denied")"
 save_dumpsys "4-permission-denied"
 dks screenshot --name "p2-permission-denied" >/dev/null 2>&1 || warn "截图失败"
 
 chk "denied.blocked_logged" "$([ "${DENIED_BLOCKED:-0}" -ge 1 ] && echo 1 || echo 0)" \
-  "notify_blocked reason=permission_denied ×$DENIED_BLOCKED"
+  "notify_blocked ×$DENIED_BLOCKED $(applog | grep -F 'event=notify_blocked' | grep -o 'reason=[a-z_]*' | tail -1)"
 chk "denied.no_system_notification" "$([ "$DENIED_ALERTS" -eq 0 ] && echo 1 || echo 0)" \
   "新增 notify_alert=$DENIED_ALERTS"
 if printf '%s' "$DENIED_TEXTS" | grep -q '条新消息'; then DENIED_BADGE=1; else DENIED_BADGE=0; fi

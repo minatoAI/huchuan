@@ -295,24 +295,53 @@ public final class DesktopPeer {
             System.out.flush();
         }
 
-        // ---------------------------------------------------------- 6. 一直做种（+ 按需下载）
-        // control=<文件>：脚本往里写一行 "download=<文件名>"，这里就把对端的同名文件拉一份。
-        // 何时开始传由脚本决定，速率在这里量（startDownload → isComplete 的墙钟差），不靠日志猜。
-        // 真机验收用它验「P7 全局限速生效 / 清掉限制后恢复」。
+        // ---------------------------------------------------------- 6. 一直做种（+ 按需下载 / 按需评论）
+        // control=<文件>：脚本往里写一行命令，这里每 400 ms 读一次：
+        //   download=<文件名>   把对端的同名文件拉一份（何时开始传由脚本决定，速率在这里量，
+        //                       不靠日志猜；真机验收用它验「P7 全局限速 / 清掉限制后恢复」）。
+        //   comment=<正文>      对 remoteFileId 发一条评论。通知三档的验收要在**同一轮连接**里
+        //                       按脚本节奏一条条发评论（切档 → 发 → 断言 → 再切档），
+        //                       每发一条就重起一个对端既慢又容易被别的 agent 的对端清理打断。
+        // 每条命令行只执行一次（controlDone 按整行去重）。
         String controlPath = opts.getOrDefault("control", "");
         java.util.Set<String> controlDone = new java.util.HashSet<>();
         long holdDeadline = System.currentTimeMillis() + holdSeconds * 1000L;
         while (System.currentTimeMillis() < holdDeadline) {
             if (!controlPath.isEmpty()) {
                 for (String command : readControl(controlPath)) {
-                    if (!command.startsWith("download=")) {
+                    String line = command.trim();
+                    if (line.isEmpty() || !controlDone.add(line)) {
                         continue;
                     }
-                    String wanted = command.substring("download=".length()).trim();
-                    if (wanted.isEmpty() || !controlDone.add(wanted)) {
+                    if (line.startsWith("download=")) {
+                        String wanted = line.substring("download=".length()).trim();
+                        if (wanted.isEmpty()) {
+                            continue;
+                        }
+                        autoDownload(kernel, group, wanted);
                         continue;
                     }
-                    autoDownload(kernel, group, wanted);
+                    if (line.startsWith("comment=")) {
+                        String body = line.substring("comment=".length()).trim();
+                        if (body.isEmpty() || remoteFileId == null) {
+                            System.out.println("PEER control_comment_skipped body=" + clean(body)
+                                    + " reason=" + (remoteFileId == null ? "no_remote_file" : "empty_body"));
+                            System.out.flush();
+                            continue;
+                        }
+                        try {
+                            OpRecord op = group.comment(remoteFileId, body, null);
+                            System.out.println("PEER control_comment_sent op_id=" + op.getOpId()
+                                    + " body=" + clean(body) + " file_id=" + remoteFileId);
+                        } catch (Throwable t) {
+                            System.out.println("PEER control_comment_failed body=" + clean(body)
+                                    + " error=" + clean(t.toString()));
+                        }
+                        System.out.flush();
+                        continue;
+                    }
+                    System.out.println("PEER control_ignored line=" + clean(line));
+                    System.out.flush();
                 }
             }
             Thread.sleep(400);

@@ -661,11 +661,19 @@ class M1Runtime(context: Context) {
                     return@execute
                 }
                 if (!notifier.canPost()) {
+                    // 两种"发不出去"：运行时权限被拒，或用户在系统里关掉了本应用的通知
+                    // （appops POST_NOTIFICATION = ignore）。行为一样：不假装发出去，
+                    // 应用内未读照常（未读由内核算，与通知无关）。
+                    val reason = if (NotifyPermission.enforced && !NotifyPermission.isGranted(app)) {
+                        "permission_denied"
+                    } else {
+                        "notifications_disabled"
+                    }
                     Log.i(
                         TAG,
                         "event=notify_blocked group_id=" + groupId + " file_id=" + fileId +
                             " kind=" + kind + " level=" + level.name.lowercase() +
-                            " reason=permission_denied",
+                            " reason=" + reason,
                     )
                     requestNotifyPermission("notify")
                     return@execute

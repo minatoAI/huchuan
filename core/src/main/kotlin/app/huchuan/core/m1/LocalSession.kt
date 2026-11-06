@@ -26,6 +26,21 @@ interface LocalSession {
 
     fun peers(fileId: String): Int
 
+    /**
+     * 对端列表快照（队友数与「成员是否已互连」的唯一数据源）。
+     * 私有 / 公开两个会话字段口径相同（[BtSession.snapshotOf]）。
+     */
+    fun peerSnapshot(fileId: String): List<BtSession.PeerSnapshot>
+
+    /**
+     * 手动给某个 torrent 加一个 peer（swig `connect_peer`；libtorrent4j 高层 API 没有这个能力）。
+     *
+     * 私有条目拨成员的私有 BT 端口（peer.announce.btPort），公开条目拨公开会话端口
+     * （peer.announce.pubBtPort，public-swarm §4.1）：两条通道分属两个 SessionManager，
+     * 拨错会话就连错 swarm。
+     */
+    fun connectPeer(fileId: String, host: String, port: Int): Boolean
+
     /** 做种侧健康状态：finished / checking / pending / incomplete / missing。 */
     fun seedState(fileId: String): String
 

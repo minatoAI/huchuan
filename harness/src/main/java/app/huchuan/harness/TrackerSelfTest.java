@@ -227,7 +227,11 @@ final class TrackerSelfTest {
                         mock.baseUrl().equals(kernel.getTrackerBaseUrl()));
 
                 GroupRuntime group = kernel.createGroup("tracker-验收群");
-                boolean arrived = await(() -> mock.registerCount() >= 1 && mock.announceCount() >= 1, 20_000L);
+                // 等到**客户端日志**出现，而不是只等 mock 计数：mock 在写响应前就 +1，
+                // 只等计数会在 tracker_announce / interval=900 落日志之前开断，是一条真实的竞态
+                // （本轮实测偶发 tracker.announce_logged FAIL）。
+                boolean arrived = await(() -> mock.registerCount() >= 1 && mock.announceCount() >= 1
+                        && events.has("tracker_announce"), 20_000L);
                 check.accept("tracker.register_and_announce_arrived", arrived);
 
                 // ---- 注册

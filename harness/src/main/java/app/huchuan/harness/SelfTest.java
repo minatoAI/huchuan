@@ -69,6 +69,7 @@ public final class SelfTest {
             sessionRateLimits();
             publicSwarm();
             tracker();
+            crossNet();
             signBytes();
             json();
             framing();
@@ -105,6 +106,15 @@ public final class SelfTest {
      */
     private static void publicSwarm() {
         PublicSwarmSelfTest.run(SelfTest::check);
+    }
+
+    /**
+     * 跨网 BT 可达性：ip_filter 动态白名单（私网 + 消息层确认的成员公网地址）与
+     * peer.announce.pubBtPort（公开条目对成员各拨一次）。断言全在 [CrossNetSelfTest] 里，
+     * 它会真起 BtSession 与两个内核，并注入一条签名合法的 peer.announce 走生产入口。
+     */
+    private static void crossNet() {
+        CrossNetSelfTest.run(SelfTest::check);
     }
 
     private static void check(String name, boolean ok) {

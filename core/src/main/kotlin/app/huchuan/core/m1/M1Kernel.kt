@@ -146,6 +146,9 @@ class M1Kernel @JvmOverloads constructor(
         // 完成判定不再等 2 s 巡查（缺口二）：libtorrent 判完当场塞队列，由完成线程立刻推事件。
         bt.onTorrentFinished = { fileId -> onTorrentFinishedAlert(fileId) }
         bt.start()
+        // ip_filter 动态白名单（AGENTS §9）：state.json 恢复出来的手动地址 / 上次建链端点先带进去，
+        // 之后 peer.announce / tracker / 手动地址每次变化再重建（见 refreshBtAllowlist）。
+        refreshBtAllowlist()
 
         // 公开会话：先只建对象（数据目录 <data>/public，端口从 6881 起），真正起来按需（§7.1）。
         publicBt = PublicBtSession(File(dataDir, PUBLIC_DIR), PublicBtSession.DEFAULT_PORT, events)
@@ -232,6 +235,53 @@ class M1Kernel @JvmOverloads constructor(
     fun localMessagePort(): Int = messagePortValue
 
     fun localBtPort(): Int = if (this::bt.isInitialized) bt.listenPort else 0
+
+    /**
+     * 公开会话的 BT 监听端口；会话没起来（按需启停）时返回 0。
+     *
+     * 进 `peer.announce.pubBtPort`（协议 §10）：对端据此对公开条目拨号。私有 btPort 与它
+     * 是两个 SessionManager 的端口，不能互相顶替（public-swarm §4.1）。
+     */
+    internal fun localPublicBtPort(): Int =
+        if (this::publicBt.isInitialized && publicBt.isRunning) publicBt.listenPort else 0
+
+    // ------------------------------------------------------------------ ip_filter 动态白名单（AGENTS §9）
+
+    /**
+     * 重建私有会话的 ip_filter 动态白名单：所有群 `btAllowlistHosts()` 的并集。
+     *
+     * 调用点：peer.announce 落到群（新端点 / 端点替换）、tracker 名单整体替换、手动地址与
+     * 建链端点落盘、退群、内核启动（把 state.json 里恢复出来的手动地址先带进 filter）。
+     * 白名单变化时打一条 `bt_ip_allowlist` 事件，字段是实际放行的公网字面量（不含私网段）。
+     */
+    internal fun refreshBtAllowlist() {
+        if (!this::bt.isInitialized) return
+        val hosts = LinkedHashSet<String>()
+        for (group in allGroups()) hosts.addAll(group.btAllowlistHosts())
+        if (bt.updatePublicAllowlist(hosts)) {
+            val allowed = bt.publicAllowlist()
+            events.log(
+                "bt_ip_allowlist",
+                mapOf(
+                    "count" to allowed.size.toString(),
+                    "hosts" to allowed.joinToString(","),
+                ),
+            )
+        }
+    }
+
+    /** 当前动态白名单快照（诊断 / 验收读口；不含基础私网段）。 */
+    fun btAllowlistHosts(): Set<String> =
+        if (this::bt.isInitialized) bt.publicAllowlist() else emptySet()
+
+    /** 这个地址现在会不会被私有会话的 ip_filter 放行（诊断 / 验收读口）。 */
+    fun btIpFilterAllows(host: String): Boolean =
+        if (this::bt.isInitialized) bt.ipFilterAllows(host) else false
+
+    /** 把最新的 `peer.announce`（含 pubBtPort 变化）推给所有在线成员。 */
+    internal fun broadcastPeerAnnounceAll() {
+        for (group in allGroups()) group.broadcastPeerAnnounce(null)
+    }
 
     fun dhtNodes(): Long = if (this::bt.isInitialized) bt.dhtNodes() else 0L
 
@@ -444,6 +494,8 @@ class M1Kernel @JvmOverloads constructor(
             publicBt.setSessionUploadLimit(sessionUploadKbps)
             publicBt.setSessionDownloadLimit(sessionDownloadKbps)
             publicBt.start()
+            // 公开会话的端口可能变了：立刻重报 peer.announce，让成员知道新的 pubBtPort。
+            broadcastPeerAnnounceAll()
             events.log(
                 "public_session_started",
                 mapOf(
@@ -464,6 +516,8 @@ class M1Kernel @JvmOverloads constructor(
         if (!this::publicBt.isInitialized || !publicBt.isRunning) return
         if (allGroups().any { it.hasActivePublicTask() }) return
         publicBt.stop()
+        // 端口已经没了：重报一条 pubBtPort=0，对端下一轮就会跳过公开拨号。
+        broadcastPeerAnnounceAll()
         events.log("public_session_stopped", mapOf("reason" to "no_active_public_entry"))
     }
 

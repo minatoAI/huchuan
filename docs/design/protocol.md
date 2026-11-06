@@ -1,6 +1,6 @@
 # 互传 · 群组与消息协议 v0
 
-- 版本 hv1 / rev 2 · 2026-11-06 · 执行层设计 · 唯一事实源：本文件（rev 2 补四条裁决：hello 两阶段、join.ok 签名、file.list 条目签名、公钥分发；新增 §13 实现偏差登记）
+- 版本 hv1 / rev 3 · 2026-11-06 · 执行层设计 · 唯一事实源：本文件（rev 2 补四条裁决：hello 两阶段、join.ok 签名、file.list 条目签名、公钥分发；rev 3 补 peer.announce.pubBtPort 与 ip_filter 动态白名单口径，并同步 §13 实现偏差登记）
 - 前提：AGENTS.md §9（libtorrent4j 2.1.0-39、v1 私有种子、双 SessionManager、per-torrent 0x380000）；K1 spike 实测（v1 起传 500 ms 档、swig connect_peer 可用、dht_nodes 恒 0）
 - 适用：Android 8.0+（minSdk 26）与 JDK 17 Windows daemon，同一份 Kotlin/JVM 内核；局域网优先，跨网是 M2
 - 记号：B32 = Crockford Base32（大写、无填充、无连字符）；hex = 小写十六进制；整数一律无符号大端；JSON 禁浮点；字符串 UTF-8 + NFC；时间为 Unix 毫秒 u64。MUST 为硬约束，本文没写的不要自创。
@@ -261,8 +261,8 @@ file.list 的每条 entry MUST 原样携带该文件 file.add 的 `sig`，不重
 |---|---|
 | settings_pack | enable_dht=false、enable_lsd=false、enable_upnp=false、enable_natpmp=false、enable_ip_notifier=false、dht_bootstrap_nodes=""；私有会话独立 SessionManager |
 | 种子 / per-torrent | private=1、metainfo 无 trackers/nodes/url-list（libtorrent 自动禁 PEX/DHT，第二道保险）；0x380000 显式再设一次（PEX 无会话级开关） |
-| ip_filter | 只放行 127/8、10/8、172.16/12、192.168/16、169.254/16、::1/128、fc00::/7、fe80::/10；M2 跨网改为已入群设备白名单 |
-| 谁能连进来（BT） | 只有 infohash 在本地已知集合内的握手被接受；不做「按 infohash 自动连」 |
+| ip_filter | 基础私网段（127/8、10/8、172.16/12、192.168/16、169.254/16、::1/128、fc00::/7、fe80::/10）**＋ 消息层确认的群成员公网地址**：来源 `peer.announce.btHost`、tracker 候选、手动 IP:port、上次建链端点；只收 IP 字面量（不做 DNS 预解析），运行期随成员端点增删重建会话的 filter。成员离线不移除、端点被替换/退群才撤销，口径见 docs/core.md §3.7 |
+| 谁能连进来（BT） | 地址必须被上面的 ip_filter 放行，且 infohash 在本地已知集合内；不做「按 infohash 自动连」 |
 | 谁能连进来（消息层） | hello 通过后，非成员只允许 hello/join.req/ping/err，其余一律 E_NOT_MEMBER，不解析业务字段 |
 | 成员准入 | gid 在本地群列表内且 deviceId 在该群成员表内；新成员只能经 §2.3 七步 |
 | 重放与时钟 | hello nonce 16 B + chanId 绑定（跨通道重放签名必失败）；join.req 的 nonce + ts ±300 s + 应答方 LRU 256；ts 只用于防重放与展示，**排序一律用 Lamport**，偏移超 ±300 s 回 E_CLOCK（带本地 ts）并重试一次 |
@@ -282,7 +282,7 @@ file.list 的每条 entry MUST 原样携带该文件 file.add 的 `sig`，不重
 | 0x21 | log.ops | 应答 | M1 | 评论分页结果 |
 | 0x22 | log.op | 广播 | M1 | 新评论推送 |
 | 0x23 | member.name | 广播 | M1 | 用户名记录 |
-| 0x30 | peer.announce | 广播 | M1 | 交换 BT 端点 |
+| 0x30 | peer.announce | 广播 | M1 | 交换 BT 端点（私有会话端口 + 可选公开会话端口 pubBtPort） |
 | 0x40/0x41 | ping·pong | 双向 | M1 | 保活与应答 |
 | 0x42 | bye | 双向 | M1 | 主动断开（带原因） |
 | 0x7F | err | 双向 | M1 | 错误回报 |
@@ -292,7 +292,7 @@ file.list 的每条 entry MUST 原样携带该文件 file.add 的 `sig`，不重
 | 0x53 | team.part | 广播 | M2 | 组队片分配 |
 | 0x60 | tracker.hint | 应答 | M2 | 跨网候选下发（M1 直连 tracker，无此消息） |
 
-分层：M1 = 上表 15 个 M1 类型，覆盖建群、加入、发包、下载、评论全闭环。M2 = 5 个 M2 类型 + caps 扩展，覆盖轮换、删除、组队、跨网 tracker。M3 = 公开社区，私有层零变更，只加公开 SessionManager 与公开种子视图。
+分层：M1 = 上表 15 个 M1 类型，覆盖建群、加入、发包、下载、评论全闭环。M2 = 5 个 M2 类型 + caps 扩展，覆盖轮换、删除、组队、跨网 tracker。M3 = 公开社区，私有层只加**向后兼容的可选字段**（0x30 的 pubBtPort）与公开 SessionManager / 公开种子视图，无破坏性变更。
 
 ## 10. 字段与示例
 
@@ -328,12 +328,19 @@ members 每条带 `pub`（64 B 裸值，128 hex，与 §1.2 公钥编码、本�
 **0x21 log.ops**：ops(≤200) ‖ more ‖ nonce。例：{"t":"log.ops","ops":[{…op…}],"more":false,"nonce":"aa01"}
 **0x22 log.op**：{"t":"log.op","op":{…}}，op 字段见 §6。
 **0x23 member.name**：{"t":"member.name","dev":…,"pub":…(128 hex)、"name":…,"nameSeq":3,"ts":…,"sig":…}，见 §1.3。
-**0x30 peer.announce**：gid ‖ dev ‖ btPort(u16) ‖ btHost(可选，缺省用 TLS 对端地址) ‖ plat(可选) ‖ seeds(可选) ‖ ts ‖ sig。例：{"t":"peer.announce","gid":"7Q2F9C4M1XZ8KD3V","dev":"7Q2F9C4M1XZ8KD3V","btPort":51413,"plat":"windows","seeds":2,"ts":1762381200500,"sig":"1c2d…"}
+**0x30 peer.announce**：gid ‖ dev ‖ btPort(u16) ‖ btHost(可选，缺省用 TLS 对端地址) ‖ plat(可选) ‖ seeds(可选) ‖ pubBtPort(可选 u16) ‖ ts ‖ sig。例：{"t":"peer.announce","gid":"7Q2F9C4M1XZ8KD3V","dev":"7Q2F9C4M1XZ8KD3V","btPort":51413,"pubBtPort":6882,"plat":"windows","seeds":2,"ts":1762381200500,"sig":"1c2d…"}
 
-    两个新增的可选字段（口径与 btHost 相同：不进 peer1 签名域，缺省或认不出都不拒绝整帧）：
+    三个可选字段的口径与 btHost 相同：**都不进 peer1 签名域**，缺省或认不出都不拒绝整帧（协议 §5「未知字段忽略」）。
+    peer1 的签名域固定为 `[dev, gid, btPort, ts]`（§1.2），新增字段不改变它，所以旧实现发出的 sig 仍然验得过，
+    不需要升 hello.rev / 帧版本位。
+    - **pubBtPort**（M3，公开种子）：发送方**公开会话**的 BT 监听端口，0 或缺失 = 本机当前没有公开会话（公开会话按需启停）。
+      它与 btPort 属于两个 SessionManager（§8、public-swarm §4.1），收端 MUST NOT 拿它当私有会话端口用：
+      公开条目对成员拨号只拨 pubBtPort，私有条目只拨 btPort。收端把它当「建议端点」，真正的准入仍由 BT 握手与 infohash 决定。
+      公开会话启停时发送方重新广播一次（端口出现 / 消失），成员换端口时新值覆盖旧值。
     - plat：发送方平台，取值只有 android / windows / unknown；缺省或认不出的值一律按 unknown 处理。
     - seeds：发送方自报的「本群当前做种文件数」（u32，≥0，缺省 0）。收端只用于显示成员做种数，不据此改任何准入或传输判定。
-    两者都在本机做种集合变化时重新广播一次（共享新文件、下载完成转做种、休眠摘掉做种、建连后的首帧），不需要额外的心跳周期。
+    plat / seeds / pubBtPort 都在本机状态变化时重新广播一次（共享新文件、下载完成转做种、休眠摘掉做种、
+    公开会话启停、建连后的首帧），不需要额外的心跳周期。
 **0x40/41 ping·pong**：{"t":"ping","ts":1762381200000}；**0x42 bye**：{"t":"bye","code":"idle"}；**0x7F err**：{"t":"err","code":"E_RATE","msg":"join too frequent","ref":"aa01"}
 
 | err code | 触发 | | err code | 触发 |
@@ -388,7 +395,7 @@ members 每条带 `pub`（64 B 裸值，128 hex，与 §1.2 公钥编码、本�
 | 4 | 公钥分发只有 hello 一条路径 | 已收敛：三条路径都在，且每条都先算 deviceId(pub)==dev —— hello（PeerLink.kt:224-243）、join.ok.members 带 pub（发端 PeerLink.kt:422-430，收端先校验再 `registerPub` M1Kernel.kt:215-231）、member.name 带 pub（GroupRuntime.kt:356-377，转发时也带 pub）。未登记作者的 op 仍丢并记 `op_unknown_author`（GroupRuntime.kt:489），这是通道外的公钥缺失，不是分发缺口 | §10 三条记录都带 pub，代码即目标 | 已收敛（M1.1），本次仅落文档 |
 | 5 | hello 只带一个 gid | `singleGroupOrNull()`，多群设备只声明其中一个群（PeerLink.kt:146、M1Kernel.kt:155） | 按 gid 分别建连，或 hello 带 gid 列表 | M2，多群同网段时才暴露 |
 | 6 | keySeed 明文落盘 | 默认 `PlaintextSecretBox`，state.json 明文写（M1Kernel.kt:30-34、395-414） | Android Keystore ／ Windows PKCS12 | 上真机前（M1.1 Android 适配） |
-| 7 | ip_filter 走 swig best-effort | `session_params.setIp_filter` 启动前塞入，失败退回「私有种子 + DHT/PEX/LSD 全关」（BtSession.kt:234-250） | §8 的跨网白名单 | M2 跨网前必须复核；M1 不改 |
+| 7 | ip_filter 跨网白名单 | 原实现只放行私网（公网 peer 被自己拒掉）。**已收敛**：`BtSession` 启动前塞入基础私网段（`buildIpFilter`），运行期按动态白名单整份重建（`updatePublicAllowlist` → `session::set_ip_filter`）；`GroupRuntime` 从 `peer.announce.btHost`、tracker 候选、手动 IP:port、上次建链端点收集公网**字面量**，成员离线不移除、端点被新 announce 替换 / 退群时撤销。口径与理由见 `docs/core.md` §3.7，harness 断言 `selftest.crossnet checks=58` | §8「私网段 + 消息层确认的群成员公网地址」，代码即目标 | 已收敛（本轮） |
 | 8 | kind 按 8 字节整数签名 | `SignBytes.u8` 直接走 u64（Crypto.kt:176-177），op 用 u8 编码 kind（Protocol.kt:183） | 与 §1.2「整数固定 8 字节」一致，现状即目标 | 无需修；若要收紧成真 u8，需 domain 升版 |
 | 9 | magnet 加种未实现 | `startDownload` 要求 entry.torrent 非空，否则记 `download_no_torrent` 返回 false（GroupRuntime.kt:131-136）；BtSession 只有 `addDownload(torrentBytes)`（BtSession.kt:120-140），没有 add_magnet | §11 第 13-14 步两条路径都支持 | M2，需 ut_metadata 先取到元数据才能 connect_peer |
 

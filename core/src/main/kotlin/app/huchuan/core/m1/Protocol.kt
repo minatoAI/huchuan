@@ -398,13 +398,15 @@ data class JoinOkMsg(
 }
 
 /**
- * 协议 §10 的 0x30 peer.announce：本机的 BT 端点，顺带自报平台与做种数。
+ * 协议 §10 的 0x30 peer.announce：本机的 BT 端点，顺带自报平台、做种数与公开会话端口。
  *
- * [platform]（JSON 的 plat）与 [seeds]（JSON 的 seeds）不参与签名，口径与 [btHost] 相同：
- * 它们是可选的辅助字段，缺省/认不出时按 unknown / 0 处理，不影响端点交换本身。
- * seeds = 该设备在本群当前做种的文件数；M1 只自报，收端不验也不据此改任何判定。
+ * [platform]（JSON 的 plat）、[seeds]（JSON 的 seeds）与 [pubBtPort]（JSON 的 pubBtPort）
+ * 不参与签名，口径与 [btHost] 相同：它们是可选的辅助字段，缺省/认不出时按 unknown / 0 处理，
+ * 不影响端点交换本身。seeds = 该设备在本群当前做种的文件数；M1 只自报，收端不验也不据此改
+ * 任何判定。pubBtPort = 本机**公开会话**的 BT 监听端口，0/缺省 = 本机当前没有公开会话
+ * （public-swarm §4.1）；它与私有 btPort 是两个 SessionManager 的端口，混用会拨错会话。
  */
-data class PeerAnnounceMsg(
+data class PeerAnnounceMsg @JvmOverloads constructor(
     val gid: String,
     val dev: String,
     val btPort: Int,
@@ -413,6 +415,7 @@ data class PeerAnnounceMsg(
     val sig: String,
     val platform: String = Proto.PLATFORM_UNKNOWN,
     val seeds: Int = 0,
+    val pubBtPort: Int = 0,
 ) {
     fun signFields(): List<ByteArray> = listOf(
         SignBytes.str(dev),
@@ -431,6 +434,8 @@ data class PeerAnnounceMsg(
             sig = o.str("sig") ?: "",
             platform = Proto.normalizePlatform(o.str("plat") ?: ""),
             seeds = (o.num("seeds") ?: 0L).toInt().coerceAtLeast(0),
+            // 0 / 缺省 = 没有公开会话；负数与 >65535 的非法值同样归 0（不拒绝整帧）。
+            pubBtPort = ((o.num("pubBtPort") ?: 0L).toInt()).let { if (it in 1..65535) it else 0 },
         )
     }
 }

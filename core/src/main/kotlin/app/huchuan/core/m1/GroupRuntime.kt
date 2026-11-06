@@ -39,8 +39,17 @@ class GroupRuntime internal constructor(
     internal val members = LinkedHashMap<String, MemberRecord>()
     internal val links = LinkedHashMap<String, PeerLink>()
 
-    /** dev → (host, btPort)，来自 peer.announce 与 TLS 对端地址。 */
+    /** dev → (host, btPort)，来自 peer.announce 与 TLS 对端地址（**私有会话**端口）。 */
     internal val btEndpoints = HashMap<String, Pair<String, Int>>()
+
+    /**
+     * dev → (host, pubBtPort)，来自同一条 peer.announce 的 `pubBtPort`（**公开会话**端口）。
+     *
+     * 只在成员真的报了 1..65535 的值时存在；成员明确报 0（公开会话已停）或字段缺省时从这里移除。
+     * 公开条目对成员拨号只认这一张表（[connectSeeders]），绝不回落到私有 [btEndpoints]：
+     * 两个端口属于两个 SessionManager，拨错会话就是连错 swarm（public-swarm §4.1）。
+     */
+    internal val pubBtEndpoints = HashMap<String, Pair<String, Int>>()
 
     /**
      * dev → 该成员最近一条 peer.announce 自报的平台与做种数（协议 §10 的 plat / seeds）。
@@ -334,7 +343,12 @@ class GroupRuntime internal constructor(
     fun startDownload(fileId: String): Boolean {
         val entry = synchronized(lock) { files[fileId] } ?: return false
         // 公开条目走公开会话（public-swarm §1.2）：它没有内联 .torrent，只能按磁力 / 元数据缓存加种。
-        if (entry.scope == FileScope.PUBLIC) return kernel.startPublicDownload(this, entry)
+        // 激活成功立刻按 pubBtPort 拨一轮；等巡查那一拍也能拨到，但宿主点完「激活」不该先猜两秒。
+        if (entry.scope == FileScope.PUBLIC) {
+            val ok = kernel.startPublicDownload(this, entry)
+            if (ok) connectSeeders(fileId)
+            return ok
+        }
         if (entry.torrent.isEmpty()) {
             kernel.events.log("download_no_torrent", mapOf("file_id" to fileId))
             return false
@@ -364,8 +378,13 @@ class GroupRuntime internal constructor(
      *
      * **缺陷修复点**：原来的实现先算一个 `hasPeers = bt.peers(fileId) > 0`，只要有 1 条 peer 连接
      * 就整轮不拨 —— 单做种者先被一个下载者连上之后，其余下载者永远不互连，队友之间拿不到互补的片。
-     * 现在按「每成员一次拨号」：候选就是成员表里自报过 BT 端点的每个成员，
+     * 现在按「每成员一次拨号」：候选就是成员自报过端点（私有 btPort / 公开 pubBtPort）的每个成员，
      * 已互连的跳过（幂等），还在退避里的跳过，其余按 [ReconnectPolicy.MAX_PARALLEL_DIALS] 截断。
+     *
+     * **公开条目不再整轮跳过**（public-swarm §4.1 / §9-5）：它拨的是成员的 `pubBtPort`，
+     * 走 [M1Kernel.sessionOf] 路由到公开会话；成员的私有 `btPort` 对公开条目一律不拨 ——
+     * 两个端口属于两个 SessionManager，拨错会话就是连错 swarm。没有 `pubBtPort` 的成员
+     * 这一轮就是「跳过点」：等它下一次 peer.announce 带上公开端口，或干脆只靠 DHT。
      *
      * 退避与预算复用冷启动重连的那一套（[ReconnectPolicy]，1/2/4/8/16/30 s 封顶），不另立参数。
      * connect_peer 是「每个 torrent 一份」的连接，所以状态键必须带 fileId：只按 dev 去重会让
@@ -374,18 +393,15 @@ class GroupRuntime internal constructor(
     fun connectSeeders(fileId: String) {
         // 没挂进会话就没有可 connect_peer 的 torrent
         if (!isLocalTask(fileId)) return
-        // 公开条目不在这个通道上拨号：peer.announce 里还没有公开会话端口（pubBtPort，public-swarm §4.1
-        // 由协议侧跟进），拿私有 btPort 去拨只会连到对方的私有会话上。M3 之前公开条目只靠 DHT / tracker。
-        if (synchronized(lock) { files[fileId] }?.scope == FileScope.PUBLIC) return
-        val targets = synchronized(lock) {
-            btEndpoints.entries
-                .filter { it.key != kernel.deviceId }
-                .map { MemberDialPolicy.Target(it.key, it.value.first, it.value.second) }
+        val entry = synchronized(lock) { files[fileId] } ?: return
+        val publicEntry = entry.scope == FileScope.PUBLIC
+        val targets = memberEndpoints(publicEntry).map { (dev, host, port) ->
+            MemberDialPolicy.Target(dev, host, port)
         }
         if (targets.isEmpty()) return
 
-        // 已经互连的成员（数据来自 libtorrent 的 peer 列表）+ 顺手把它们的拨号状态清掉
-        val live = liveMembers(fileId)
+        // 已经互连的成员（数据来自对应会话的 libtorrent peer 列表）+ 顺手把它们的拨号状态清掉
+        val live = liveMembers(fileId, publicEntry, targets)
         val now = System.currentTimeMillis()
         val throttled = ArrayList<String>()
         synchronized(lock) {
@@ -402,9 +418,12 @@ class GroupRuntime internal constructor(
             throttled,
             ReconnectPolicy.MAX_PARALLEL_DIALS,
         )
+        if (plan.isEmpty()) return
+        // 同一个群里的这个 fileId 只会在一个会话里（加种时按 private 位路由），每次现取即可。
+        val session = kernel.sessionOf(fileId)
         for (t in plan) {
             val addr = t.host + ":" + t.port
-            val ok = kernel.bt.connectPeer(fileId, t.host, t.port)
+            val ok = session.connectPeer(fileId, t.host, t.port)
             val attempt = synchronized(lock) {
                 val st = dials.getOrPut(fileId + "@" + t.dev) { MemberDial() }
                 st.note(now, addr)
@@ -416,6 +435,9 @@ class GroupRuntime internal constructor(
                         "file_id" to fileId,
                         "peer" to t.dev,
                         "addr" to addr,
+                        // 公开条目走公开会话（pubBtPort），私有条目走私有会话（btPort）：
+                        // 断言 / 排障时要能一眼看出拨的是哪一套 swarm。
+                        "sess" to if (publicEntry) "pub" else "priv",
                         "attempt" to attempt.toString(),
                         "backoff_ms" to ReconnectPolicy.backoffMs(attempt - 1).toString(),
                     ),
@@ -424,32 +446,41 @@ class GroupRuntime internal constructor(
         }
     }
 
+    /** 一个文件该拨哪些成员端点：私有条目读 `btEndpoints`，公开条目读 `pubBtEndpoints`。 */
+    private fun memberEndpoints(publicEntry: Boolean): List<Triple<String, String, Int>> = synchronized(lock) {
+        val source = if (publicEntry) pubBtEndpoints else btEndpoints
+        source.entries
+            .filter { it.key != kernel.deviceId }
+            .map { Triple(it.key, it.value.first, it.value.second) }
+            .sortedBy { it.first }
+    }
+
     /**
      * 当前与这个文件的 torrent **真实互连**的成员（dev → 对端快照）。
      *
-     * 唯一数据来源是 libtorrent 的 peer 列表（[BtSession.peerSnapshot]）：
-     * 不看成员表、不看协议帧、不新造字段。peer_info 只有 IP 没有端口，所以「连接 → 成员」按 host 匹配；
-     * 同一个 host 上有多条连接（同机多进程 / 同一 NAT 后）时按 dev 字典序逐条分配，每个成员最多一条。
-     * 匹配不上的对端（非成员的直连）不计数。
+     * 唯一数据来源是 libtorrent 的 peer 列表（[LocalSession.peerSnapshot]，按条目 scope 路由到
+     * 私有 / 公开会话）：不看成员表、不看协议帧、不新造字段。peer_info 只有 IP 没有端口，
+     * 所以「连接 → 成员」按 host 匹配；同一个 host 上有多条连接（同机多进程 / 同一 NAT 后）时
+     * 按 dev 字典序逐条分配，每个成员最多一条。匹配不上的对端（非成员的直连）不计数。
      */
-    private fun liveMembers(fileId: String): Map<String, BtSession.PeerSnapshot> {
-        val peers = kernel.bt.peerSnapshot(fileId).filter { it.connected }
+    private fun liveMembers(
+        fileId: String,
+        publicEntry: Boolean,
+        targets: List<MemberDialPolicy.Target> = memberEndpoints(publicEntry).map { (dev, host, port) ->
+            MemberDialPolicy.Target(dev, host, port)
+        },
+    ): Map<String, BtSession.PeerSnapshot> {
+        val peers = kernel.sessionOf(fileId).peerSnapshot(fileId).filter { it.connected }
         if (peers.isEmpty()) return emptyMap()
-        val targets = synchronized(lock) {
-            btEndpoints.entries
-                .filter { it.key != kernel.deviceId }
-                .map { Triple(it.key, it.value.first, it.value.second) }
-                .sortedBy { it.first }
-        }
         val out = LinkedHashMap<String, BtSession.PeerSnapshot>()
         val taken = HashSet<Int>()
         // ① 先按 host:port 精确配对：本机拨出去的连接看到的就是对方的监听端口，一定对得上
-        for ((dev, host, port) in targets) {
-            val want = host + ":" + port
+        for (t in targets) {
+            val want = t.host + ":" + t.port
             for (i in peers.indices) {
                 if (i in taken) continue
                 if (peers[i].ip != want) continue
-                out[dev] = peers[i]
+                out[t.dev] = peers[i]
                 taken.add(i)
                 break
             }
@@ -462,12 +493,12 @@ class GroupRuntime internal constructor(
             byHost.getOrPut(hostOf(peers[i].ip)) { ArrayList() }
                 .add(i)
         }
-        for ((dev, host, _) in targets) {
-            if (out.containsKey(dev)) continue
-            val list = byHost[host] ?: continue
+        for (t in targets) {
+            if (out.containsKey(t.dev)) continue
+            val list = byHost[t.host] ?: continue
             while (list.isNotEmpty()) {
                 val i = list.removeAt(0)
-                out[dev] = peers[i]
+                out[t.dev] = peers[i]
                 break
             }
         }
@@ -490,9 +521,11 @@ class GroupRuntime internal constructor(
      */
     fun teammates(fileId: String): Int {
         if (!isLocalTask(fileId)) return 0
-        // 「部分」= 数据还没齐；做种中的文件不再算组队（100% 即退出）
-        if (kernel.bt.isFinished(fileId)) return 0
-        return liveMembers(fileId).values.count { !it.seed }
+        // 「部分」= 数据还没齐；做种中的文件不再算组队（100% 即退出）。
+        // 会话按 scope 路由：公开条目在公开会话里，用私有会话的读数会永远是 0。
+        if (kernel.sessionOf(fileId).isFinished(fileId)) return 0
+        val entry = synchronized(lock) { files[fileId] } ?: return 0
+        return liveMembers(fileId, entry.scope == FileScope.PUBLIC).values.count { !it.seed }
     }
 
     fun progress(fileId: String): Double = kernel.sessionOf(fileId).progress(fileId)
@@ -1004,7 +1037,11 @@ class GroupRuntime internal constructor(
         if (dev.isEmpty() || host.isEmpty() || port <= 0) return
         val addr = host + ":" + port
         val changed = synchronized(lock) { peerAddrs.put(dev, addr) != addr }
-        if (changed) kernel.saveStateIfStarted()
+        if (changed) {
+            // 建链端点也是「消息层确认过的成员地址」：公网 peer 的话要进 ip_filter 白名单。
+            kernel.refreshBtAllowlist()
+            kernel.saveStateIfStarted()
+        }
     }
 
     /** 记下手动 IP:port（P5 输入过的）。已经在集合里就不写盘。 */
@@ -1016,7 +1053,10 @@ class GroupRuntime internal constructor(
                 if (manualAddrs.add(c.key)) changed = true
             }
         }
-        if (changed) kernel.saveStateIfStarted()
+        if (changed) {
+            kernel.refreshBtAllowlist()
+            kernel.saveStateIfStarted()
+        }
     }
 
     /** 载入 state.json 时用。 */
@@ -1065,6 +1105,40 @@ class GroupRuntime internal constructor(
             trackerCandidates.clear()
             trackerCandidates.addAll(list)
         }
+        // tracker 的 peers 也是成员地址来源之一（kGrp 派生 passkey 换来的名单）：
+        // 公网源地址要进 ip_filter 白名单，下一轮名单里消失时随整体替换移除。
+        kernel.refreshBtAllowlist()
+    }
+
+    /**
+     * 私有会话 ip_filter 的动态白名单来源（AGENTS §9）。
+     *
+     * 只收「消息层已经确认过」的成员端点，四类：
+     *   ① peer.announce 的 btHost（签名验过、有已登记公钥的成员；btHost 缺省时用 TLS 对端地址）；
+     *   ② peer.announce 的 pubBtPort 同一 host（同一台设备的公开会话在同一个地址上）；
+     *   ③ tracker 候选（passkey 由 kGrp 派生，只有本群成员能登记）；
+     *   ④ 手动 IP:port 与上次建链端点（用户明确指定 / 本机真的拨通过）。
+     *
+     * 主机名不进来（ip_filter 按地址匹配，协议 §3.3 又不做 DNS 预解析）；私网字面量也不进来
+     * （基础规则已放行）。移除策略见 docs/core.md §3.7：成员离线**不**移除，端点被新 announce
+     * 替换、tracker 名单整体替换、手动地址被清、退群时才移除。
+     */
+    internal fun btAllowlistHosts(): Set<String> {
+        val raw = ArrayList<String?>()
+        synchronized(lock) {
+            for ((dev, endpoint) in btEndpoints) {
+                if (dev != kernel.deviceId) raw.add(endpoint.first)
+            }
+            for ((dev, endpoint) in pubBtEndpoints) {
+                if (dev != kernel.deviceId) raw.add(endpoint.first)
+            }
+            for (candidate in trackerCandidates) raw.add(candidate.host)
+            for (addr in manualAddrs) raw.add(ManualCandidate.parse(addr)?.host)
+            for ((dev, addr) in peerAddrs) {
+                if (dev != kernel.deviceId) raw.add(ManualCandidate.parse(addr)?.host)
+            }
+        }
+        return IpAllowlist.collect(raw)
     }
 
     /** 当前候选表快照（mDNS 的实时结果不在这里，由重连线程自己合）。P7 诊断与验收读它。 */
@@ -1129,14 +1203,24 @@ class GroupRuntime internal constructor(
         if (effectiveHost.isEmpty() || msg.btPort <= 0) return
         synchronized(lock) {
             btEndpoints[msg.dev] = effectiveHost to msg.btPort
+            // 协议 §10：pubBtPort 是公开会话的 BT 端口。报 0 / 缺省 = 本机没有公开会话：
+            // 把旧值撤掉，否则公开条目会一直拨一个已经关掉的端口。
+            if (msg.pubBtPort in 1..65535) {
+                pubBtEndpoints[msg.dev] = effectiveHost to msg.pubBtPort
+            } else {
+                pubBtEndpoints.remove(msg.dev)
+            }
             // 协议 §10：plat / seeds 是这条消息自报的两个运行期属性，只用于成员表展示。
             memberLive[msg.dev] = MemberLive(msg.platform, msg.seeds)
         }
+        // 端点是新的成员知识：私有会话的 ip_filter 动态白名单跟着重建（docs/core.md §3.7）。
+        kernel.refreshBtAllowlist()
         kernel.events.log(
             "peer_announce",
             mapOf(
                 "dev" to msg.dev,
                 "addr" to (effectiveHost + ":" + msg.btPort),
+                "pub_bt_port" to msg.pubBtPort.toString(),
                 "plat" to msg.platform,
                 "seeds" to msg.seeds.toString(),
             ),
@@ -1146,6 +1230,7 @@ class GroupRuntime internal constructor(
             "dev" to jstr(msg.dev),
             "btPort" to jnum(msg.btPort.toLong()),
             "btHost" to jstr(msg.btHost),
+            "pubBtPort" to jnum(msg.pubBtPort.toLong()),
             "plat" to jstr(msg.platform),
             "seeds" to jnum(msg.seeds.toLong()),
             "ts" to jnum(msg.ts),
@@ -1239,14 +1324,17 @@ class GroupRuntime internal constructor(
     internal fun peerAnnounceBody(): J.Obj? {
         val ts = System.currentTimeMillis()
         val port = kernel.localBtPortLong()
+        val pubPort = kernel.localPublicBtPort()
         val seeds = seedingFileCount()
         val unsigned = PeerAnnounceMsg(groupId, kernel.deviceId, port.toInt(), "", ts, "")
         val sig = kernel.identity.sign(Domains.PEER, unsigned.signFields())
-        // plat / seeds 不进 peer1 签名域（口径同 btHost）：只补字段，不改端点交换的语义。
+        // plat / seeds / pubBtPort 不进 peer1 签名域（口径同 btHost）：只补字段，不改端点交换的语义。
+        // pubBtPort = 0 表示本机当前没有公开会话（公开会话按需启停），对端据此跳过公开拨号。
         return jobj(
             "gid" to jstr(groupId),
             "dev" to jstr(kernel.deviceId),
             "btPort" to jnum(port),
+            "pubBtPort" to jnum(pubPort.toLong()),
             "plat" to jstr(kernel.platform),
             "seeds" to jnum(seeds.toLong()),
             "ts" to jnum(ts),
@@ -1340,6 +1428,7 @@ class GroupRuntime internal constructor(
             dials.clear()
             completed.clear()
             btEndpoints.clear()
+            pubBtEndpoints.clear()
             memberLive.clear()
             // 退群之后这些端点既不该再被拨，也不该留在 state.json 里
             peerAddrs.clear()
@@ -1347,6 +1436,8 @@ class GroupRuntime internal constructor(
             trackerCandidates.clear()
             ids
         }
+        // 成员集合消失 = 撤销动态白名单（docs/core.md §3.7 的移除策略）；私网基础规则不受影响。
+        kernel.refreshBtAllowlist()
         var stopped = 0
         for (fileId in taskIds) {
             if (kernel.bt.removeTorrent(fileId)) stopped++
