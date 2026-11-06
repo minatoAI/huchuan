@@ -1,12 +1,13 @@
 'use strict';
 
 /**
- * 互传 Windows 壳 · 八页 Web UI（纯静态，无框架、无 CDN、无网络请求）。
+ * 互传 Windows 壳 · 十页 Web UI（纯静态，无框架、无 CDN、无在线二维码服务）。
  *
  * 信息架构与 Android 壳同构：P0 自检 → P1 用户名 → P2 首页 → P3 群组 → P4 文件详情，
- * P5 新群组、P6 成员、P7 设置抽屉。数据来自 data.js 的内存 store。
+ * P5 新群组、P6 成员、P7 设置抽屉、P8 链接分享（二维码）、P9 分享管理。数据来自 data.js 的 store。
  *
- * 路由：#/p0 … #/p7。#/p7 是 P2 之上的设置抽屉（Android 里是 Drawer，没有独立目的地）。
+ * 路由：#/p0 … #/p9。#/p7 是 P2 之上的设置抽屉（Android 里是 Drawer，没有独立目的地）；
+ * 分享链接从 P4「…」→「分享链接」创建后进 #/p8/<token>，P7「分享管理」进 #/p9。
  * 开发/取证参数（正常启动不带）：?route=p3&theme=dark&network=fail&hold=result
  *
  * 桌面差异（相对 Android，见 docs/windows-ui.md）：没有系统返回键，所以页头给了 ←，
@@ -65,6 +66,8 @@ const COPY = {
   p4_activate: '激活',
   p4_sleep: '休眠',
   p4_remove: '移除',
+  p4_more: '更多',
+  p4_share_link: '分享链接',
   p4_teaming: function (n) { return '正在组队 · ' + n + ' 人'; },
   p4_seeders: function (n) { return '做种者 ' + n; },
   p4_waiting: '等待做种者',
@@ -115,6 +118,43 @@ const COPY = {
   p7_bubble: '系统气泡',
   p7_in_app: '仅应用内',
   p7_muted: '静音',
+  p7_share_manage: '分享管理',
+
+  // P8 链接分享（文案同 Android，链接终态是二维码）
+  p8_title: '分享链接',
+  p8_creating: '创建中',
+  p8_waiting: '等待访客',
+  p8_incoming: '访客已加入',
+  p8_sending: function (n) { return '传输中 ' + n + '%'; },
+  p8_finished: '已结束',
+  p8_finished_failed: '已结束 · 传输失败',
+  p8_finished_revoked: '已结束 · 链接已撤销',
+  p8_finished_expired: '已结束 · 链接已过期',
+  p8_finished_missing: '已结束 · 文件不在本机',
+  p8_expires_days: function (n) { return n + ' 天后失效'; },
+  p8_expires_hours: function (n) { return n + ' 小时后失效'; },
+  p8_expires_minutes: function (n) { return n + ' 分钟后失效'; },
+  p8_expired: '已失效',
+  p8_copy: '复制链接',
+  p8_not_found: '没有这条分享',
+  p8_not_configured: '分享服务未配置',
+  p8_server_unreachable: '连不上分享服务',
+  p8_too_many: '分享数量已达上限',
+  p8_no_local: '文件不在本机',
+  p8_file_changed: '文件已改变',
+  p8_no_file: '没有这个文件',
+  p8_create_failed: '创建失败',
+  p8_read_failed: '读取失败',
+
+  // P9 分享管理
+  p9_title: '分享管理',
+  p9_loading: '正在读取',
+  p9_empty: '还没有分享',
+  p9_visits: function (n) { return '被访问 ' + n + ' 次'; },
+  p9_revoke: '撤销',
+  p9_revoke_title: '撤销分享',
+  p9_revoke_confirm: '撤销后这条链接立即失效',
+  p9_cancel: '取消',
 
   // 通用
   unit_kbps: 'KB/s',
@@ -153,6 +193,19 @@ const State = {
   magnetNoteError: false, // 非法 / 重复这类「被拒」才染红；无源 / 超时只是还没成
   magnetCopied: false,
   magnetCopiedTimer: null,
+  // P4「…」溢出菜单（本轮只有「分享链接」一项；单文件限速在页内，不占菜单）。
+  p4Menu: false,
+  // P8：shareToken 为空时可能是「创建中」或创建失败；shareFileId 记着从哪个文件建的。
+  shareToken: '',
+  shareFileId: '',
+  shareCreating: false,
+  shareError: '',
+  shareCopied: false,
+  shareCopiedTimer: null,
+  sharePoll: null,        // P8 / P9 打开期间的 /api/shares 轮询定时器
+  // P9：待确认撤销的 token（不可逆动作给一次确认）
+  revokeToken: '',
+  revokeError: '',
 };
 
 /**
@@ -164,6 +217,10 @@ const State = {
 const RouteAlias = {
   'p3-magnet': { page: 'p3', add: 'magnet' },
   'p4-public': { page: 'p4', public: true },
+  // 取证用：落 P8/P9 前先确保 daemon 里有一条有效分享（没有就用本群第一个私有文件建一条）。
+  // 正常导航不带这两个别名 —— 真实入口是 P4「…」与 P7「分享管理」。
+  'p8-share': { page: 'p8', ensureShare: true },
+  'p9-list': { page: 'p9', ensureShare: true },
 };
 
 /* -------------------------------------------------------------- 小工具 */
@@ -289,14 +346,22 @@ const Nav = {
     this.sync();
   },
 
+  /** 留在当前栈深度上换一页 / 换 id：P8 创建成功后把 #/p8 补成 #/p8/<token>，不改返回目标。 */
+  replace: function (page, id) {
+    this.stack[this.stack.length - 1] = { page: page, id: id || null };
+    this.sync();
+  },
+
   sync: function () {
     const item = this.current();
     State.route = item.page;
-    // 栈里的 id 在 P3/P6 是群组、在 P4 是文件；其余页忽略。
+    // 栈里的 id 在 P3/P6 是群组、在 P4 是文件、在 P8 是分享 token；其余页忽略。
     if (item.page === 'p3' || item.page === 'p6') {
       if (item.id) State.groupId = item.id;
     } else if (item.page === 'p4') {
       if (item.id) State.fileId = item.id;
+    } else if (item.page === 'p8') {
+      if (item.id) State.shareToken = item.id;
     }
     const hash = '#/' + item.page + (item.id ? '/' + item.id : '');
     history.replaceState(null, '', location.pathname + location.search + hash);
@@ -315,6 +380,8 @@ function seedStack(route, id) {
     p5: ['p2'],
     p6: ['p2', 'p3'],
     p7: ['p2'],
+    p8: ['p2'],          // 深链进 P8 时没有文件上下文，返回落到 P2
+    p9: ['p2', 'p7'],    // P9 的上级是 P7 设置抽屉（spec：出口 → P7）
   }[route] || [];
   Nav.stack = parent.map(function (page) { return { page: page, id: null }; });
   Nav.stack.push({ page: route, id: id || null });
@@ -324,6 +391,10 @@ function seedStack(route, id) {
 /* -------------------------------------------------------------- 渲染 */
 function render() {
   clearSplash();
+
+  // 离开某页就清掉只属于它的瞬时状态（溢出菜单 / 撤销确认），免得下次进来还挂着。
+  if (State.route !== 'p4') State.p4Menu = false;
+  if (State.route !== 'p9') State.revokeToken = '';
 
   // 数据每秒都可能变，整页重绘会换掉 DOM：把焦点和光标位置记下来，画完再还回去。
   const active = document.activeElement;
@@ -340,11 +411,15 @@ function render() {
     case 'p5': html = viewNewGroup(); break;
     case 'p6': html = viewMembers(); break;
     case 'p7': html = viewHome() + viewSettings(); break;
+    case 'p8': html = viewShare(); break;
+    case 'p9': html = viewShareList(); break;
     default: html = viewHome();
   }
 
   app.innerHTML = html;
   document.body.dataset.page = State.route;
+
+  syncSharePolling();
 
   if (State.route === 'p0') startSplash();
 
@@ -361,6 +436,24 @@ function render() {
         // number 类输入框不支持光标定位，忽略
       }
     }
+  }
+}
+
+/**
+ * P8 / P9 打开期间每 2 s 拉一次 /api/shares：状态行（等待访客 → 传输中 xx% → 已结束）
+ * 与 P9 的撤销结果都靠它推进。离开两页立刻停 —— 轮询只服务这两页，不在后台空转。
+ * 其余页面仍然走 WS 推送（state / tick）；分享不在 /api/state 里，所以这两页单独轮询。
+ */
+function syncSharePolling() {
+  const active = State.route === 'p8' || State.route === 'p9';
+  if (active && !State.sharePoll) {
+    State.sharePoll = setInterval(function () {
+      if (State.route === 'p8' || State.route === 'p9') Store.loadShares(true);
+    }, 2000);
+    Store.loadShares(true);
+  } else if (!active && State.sharePoll) {
+    clearInterval(State.sharePoll);
+    State.sharePoll = null;
   }
 }
 
@@ -664,6 +757,25 @@ function commentRow(comment) {
     '</button>';
 }
 
+/**
+ * P4 右上「…」：本轮只有「分享链接」一项 —— 单文件限速在页内，不重复收进菜单。
+ * 分享服务不可用时整块不出现（与 Android 的 linkAvailable 同口径）；浏览器里点开就是普通菜单。
+ */
+function fileMenu(file) {
+  if (!Store.shares().available) return '';
+  const open = State.p4Menu;
+  return '<span class="menu-wrap">' +
+    '<button class="btn btn-text more-btn" data-act="more" aria-haspopup="menu" ' +
+      'aria-expanded="' + open + '" aria-label="' + COPY.p4_more + '">…</button>' +
+    (open
+      ? '<div class="menu" role="menu">' +
+          '<button class="menu-item" role="menuitem" data-act="share-link" data-id="' +
+            esc(file.id) + '">' + COPY.p4_share_link + '</button>' +
+        '</div>'
+      : '') +
+    '</span>';
+}
+
 function viewFile() {
   const group = Store.group(State.groupId);
   if (!group) return viewHome();
@@ -705,7 +817,7 @@ function viewFile() {
     : '';
 
   return '<div class="screen">' +
-    topbar(file.name, { back: true, actions: removeAction }) +
+    topbar(file.name, { back: true, actions: removeAction + fileMenu(file) }) +
     '<div class="content"><div class="page page-wide">' +
       '<div class="file-meta">' +
         publicChip +
@@ -1070,6 +1182,8 @@ function copyInviteCode() {
 function viewSettings() {
   const device = Store.device();
   const groups = Store.groups();
+  // P9 的入口只在分享服务可用时出现；计数只数仍然有效的链接（与 P9 列表同一个口径）。
+  const shareCount = Store.activeShares().length;
 
   const notifications = groups.length
     ? groups.map(function (group) {
@@ -1137,15 +1251,263 @@ function viewSettings() {
           ? '<p class="field-note" id="tracker-pending">' + COPY.p7_tracker_pending + '</p>'
           : '') +
 
+        /* P9 唯一入口（link-share.md §3 P9）：分享服务不可用时这一行不出现，
+           与 Android 的 linkAvailable 同口径。计数只数有效链接。 */
+        (Store.shares().available
+          ? '<button class="drawer-item" data-act="share-manage">' +
+              '<span>' + COPY.p7_share_manage + '</span>' +
+              '<span class="spacer"></span>' +
+              (shareCount > 0 ? '<span class="drawer-count">' + shareCount + '</span>' : '') +
+            '</button>'
+          : '') +
+
         '<div class="kv"><span class="field-label">' + COPY.p7_network_status + '</span>' +
           '<span>' + networkLabel() + '</span></div>' +
       '</div>' +
     '</aside>';
 }
 
+/* ------------------------------------------------------- P8 链接分享 */
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * 剩余有效期：与 Android 的 expiryLabel 同一口径（向上取整，刚建好显示「7 天后失效」）。
+ * 「现在」取 max(本机时间, 创建时间)：Worker 的时钟比本机快一两秒时，直接减会算出 7 天零几秒、
+ * 显示成「8 天后失效」。剩余时间不可能超过从创建时刻算起的整段有效期，所以用创建时间兜一下。
+ */
+function expiryLabel(expiresAt, createdAt) {
+  const now = Math.max(Date.now(), Number(createdAt) || 0);
+  const left = Number(expiresAt) - now;
+  if (!(left > 0)) return COPY.p8_expired;
+  if (left >= DAY_MS) return COPY.p8_expires_days(Math.ceil(left / DAY_MS));
+  if (left >= HOUR_MS) return COPY.p8_expires_hours(Math.ceil(left / HOUR_MS));
+  return COPY.p8_expires_minutes(Math.max(1, Math.ceil(left / MINUTE_MS)));
+}
+
+/**
+ * 状态行：一条链接的一辈子。daemon 的 status 是细分状态，phase 只回答「有没有人在取」；
+ * 这里把细分状态翻成一句话 —— 等待访客 / 访客已加入 / 传输中 xx% / 已结束（+ 原因）。
+ */
+function shareStatusLabel(share) {
+  if (share.status === ShareStatus.WAITING) return COPY.p8_waiting;
+  if (share.status === ShareStatus.CONNECTING) return COPY.p8_incoming;
+  if (share.status === ShareStatus.TRANSFERRING) return COPY.p8_sending(share.progressPercent);
+  if (share.status === ShareStatus.DONE) return COPY.p8_finished;
+  if (share.status === ShareStatus.FAILED) return COPY.p8_finished_failed;
+  if (share.status === ShareStatus.REVOKED) return COPY.p8_finished_revoked;
+  if (share.status === ShareStatus.EXPIRED) return COPY.p8_finished_expired;
+  if (share.status === ShareStatus.FILE_MISSING) return COPY.p8_finished_missing;
+  return COPY.p8_finished;
+}
+
+function shareTerminal(share) {
+  return share.status === ShareStatus.DONE || share.status === ShareStatus.FAILED ||
+    share.status === ShareStatus.REVOKED || share.status === ShareStatus.EXPIRED ||
+    share.status === ShareStatus.FILE_MISSING;
+}
+
+/** 创建 / 撤销失败的 code → 一句话；不认识的码也不把 daemon 的英文原因甩到界面上。 */
+function shareFailureLabel(code) {
+  if (code === 'E_LINK_UNAVAILABLE') return COPY.p8_not_configured;
+  if (code === 'E_LINK_REGISTRY') return COPY.p8_server_unreachable;
+  if (code === 'E_LINK_TOO_MANY') return COPY.p8_too_many;
+  if (code === 'E_NO_LOCAL_FILE') return COPY.p8_no_local;
+  if (code === 'E_FILE_CHANGED') return COPY.p8_file_changed;
+  if (code === 'E_NO_FILE') return COPY.p8_no_file;
+  return COPY.p8_create_failed;
+}
+
+/**
+ * P8：二维码 + 链接 + 复制 + 有效期 + 状态行。二维码用 qrText 本地画（js/qrcode.js），
+ * 不调用任何在线二维码服务；二维码 = 链接 = 凭据，撤销不在这页（撤销是 P9 的动作）。
+ */
+function viewShare() {
+  const share = State.shareToken ? Store.share(State.shareToken) : null;
+  let body = '';
+
+  if (share) {
+    const link = share.link || share.qrText;
+    const revoked = share.status === ShareStatus.REVOKED;
+    const transfer = share.status === ShareStatus.TRANSFERRING;
+    const qr = revoked ? '' : QRCode.svg(share.qrText || link);
+
+    body =
+      (qr ? '<div class="qr-box">' + qr + '</div>' : '') +
+      (revoked
+        ? ''
+        : '<p class="share-link" title="' + esc(link) + '">' + esc(link) + '</p>' +
+          '<div class="share-actions">' +
+            '<button class="btn btn-primary" data-act="copy-link">' + COPY.p8_copy + '</button>' +
+            (State.shareCopied ? '<span class="copied">' + COPY.p6_copied + '</span>' : '') +
+          '</div>') +
+      '<div class="share-state">' +
+        '<p class="share-status' + (shareTerminal(share) ? ' is-done' : '') + '">' +
+          shareStatusLabel(share) + '</p>' +
+        (transfer
+          ? '<div class="progress share-progress"><i style="width:' +
+            Math.max(0, Math.min(100, share.progressPercent)) + '%"></i></div>'
+          : '') +
+        '<p class="share-expiry">' + expiryLabel(share.expiresAt, share.createdAt) + '</p>' +
+      '</div>';
+  } else if (State.shareCreating) {
+    body = '<p class="share-status share-creating">' + COPY.p8_creating + '</p>';
+  } else if (State.shareError) {
+    body = '<p class="share-status is-error">' + esc(State.shareError) + '</p>' +
+      (State.shareFileId
+        ? '<button class="btn btn-primary" data-act="retry-share">' + COPY.p0_retry + '</button>'
+        : '');
+  } else {
+    body = '<p class="share-status is-error">' + COPY.p8_not_found + '</p>';
+  }
+
+  return '<div class="screen">' +
+    topbar(COPY.p8_title, { back: Nav.stack.length > 1 }) +
+    '<div class="content"><div class="page share-page">' + body + '</div></div>' +
+    '</div>';
+}
+
+/* -------------------------------------------------- P9 分享管理（列表） */
+/** 列表口径：仍有效的链接才出现；撤销 / 过期 / 文件不见了直接移出，不做「已撤销」chip。 */
+function shareRow(share) {
+  return '<div class="share-row">' +
+    '<button class="share-open" data-act="open-share" data-id="' + esc(share.token) + '">' +
+      '<span class="share-name">' + esc(share.fileName) + '</span>' +
+      '<span class="share-meta">' + expiryLabel(share.expiresAt, share.createdAt) + ' · ' +
+        COPY.p9_visits(share.transfers) + '</span>' +
+    '</button>' +
+    '<button class="btn btn-text is-danger share-revoke" data-act="revoke-share" data-id="' +
+      esc(share.token) + '">' + COPY.p9_revoke + '</button>' +
+    '</div>';
+}
+
+/** 撤销是不可逆动作，给一次确认；点空白处 / 取消 / Esc 都退回去。 */
+function revokeConfirm() {
+  if (!State.revokeToken) return '';
+  const share = Store.share(State.revokeToken);
+  return '<div class="scrim" data-act="close-revoke"></div>' +
+    '<div class="modal" role="dialog" aria-label="' + COPY.p9_revoke_title + '">' +
+      '<h2 class="modal-title">' + COPY.p9_revoke_title + '</h2>' +
+      '<p class="line">' + COPY.p9_revoke_confirm + '</p>' +
+      (share ? '<p class="field-note">' + esc(share.fileName) + '</p>' : '') +
+      '<div class="modal-actions">' +
+        '<button class="btn btn-text" data-act="close-revoke">' + COPY.p9_cancel + '</button>' +
+        '<button class="btn btn-primary" data-act="confirm-revoke">' + COPY.p9_revoke + '</button>' +
+      '</div>' +
+    '</div>';
+}
+
+function viewShareList() {
+  const data = Store.shares();
+  const items = Store.activeShares();
+  let body;
+
+  if (data.error) {
+    body = '<p class="empty">' + COPY.p8_read_failed + '</p>' +
+      '<button class="btn btn-text" data-act="retry-shares">' + COPY.p0_retry + '</button>';
+  } else if (!data.loaded && !items.length) {
+    body = '<p class="empty">' + COPY.p9_loading + '</p>';
+  } else if (!items.length) {
+    body = '<p class="empty">' + COPY.p9_empty + '</p>';
+  } else {
+    body = '<div class="list share-list">' + items.map(shareRow).join('') + '</div>';
+  }
+
+  return '<div class="screen">' +
+    topbar(COPY.p9_title, { back: Nav.stack.length > 1 }) +
+    '<div class="content"><div class="page">' +
+      body +
+      (State.revokeError
+        ? '<p class="field-note is-error">' + esc(State.revokeError) + '</p>'
+        : '') +
+    '</div></div>' +
+    revokeConfirm() +
+    '</div>';
+}
+
+/**
+ * 取证别名 p8-share / p9-list 的前置步骤：确保 daemon 里有一条有效分享。
+ * 已有就用最近一条；没有就用本群第一个私有文件建一条（7 天）。
+ * 只在 ?route=p8-share / ?route=p9-list 时走 —— 正常导航不会凭空建链接。
+ */
+function ensureShareForDemo() {
+  return Store.loadShares(true).then(function () {
+    const existing = Store.activeShares()[0];
+    if (existing) return existing.token;
+    const group = Store.groups()[0];
+    if (!group) throw new Error('no group');
+    const privates = group.files.filter(function (file) { return !isPublicFile(file); });
+    const file = privates[0] || group.files[0];
+    if (!file) throw new Error('no file');
+    return Store.createShare(file.id, 7).then(function (share) {
+      return share.token;
+    });
+  });
+}
+
+/** P4「分享链接」：先落 P8 显示「创建中」，POST /api/shares 回来后换成二维码。 */
+function startShareCreate(fileId) {
+  const id = fileId || State.fileId;
+  if (!id) return;
+  State.p4Menu = false;
+  State.shareFileId = id;
+  State.shareToken = '';
+  State.shareError = '';
+  State.shareCopied = false;
+  State.shareCreating = true;
+  Nav.go('p8');
+  Store.createShare(id, 7).then(function (share) {
+    State.shareCreating = false;
+    State.shareToken = share.token;
+    if (State.route === 'p8') Nav.replace('p8', share.token);
+  }, function (error) {
+    State.shareCreating = false;
+    State.shareError = shareFailureLabel(error && error.code);
+    render();
+  });
+}
+
+function copyShareLink() {
+  const share = State.shareToken ? Store.share(State.shareToken) : null;
+  if (!share || !share.link) return;
+  copyText(share.link, function () {
+    State.shareCopied = true;
+    render();
+    if (State.shareCopiedTimer) clearTimeout(State.shareCopiedTimer);
+    State.shareCopiedTimer = setTimeout(function () {
+      State.shareCopied = false;
+      render();
+    }, 1600);
+  });
+}
+
+function confirmRevokeShare() {
+  const token = State.revokeToken;
+  if (!token) return;
+  State.revokeToken = '';
+  Store.revokeShare(token).then(function () {
+    State.revokeError = '';
+    render();
+  }, function (error) {
+    State.revokeError = shareFailureLabel(error && error.code);
+    render();
+  });
+}
+
 /* -------------------------------------------------------------- 事件 */
 document.addEventListener('click', function (event) {
   const target = event.target.closest('[data-act]');
+
+  // P4「…」菜单：点菜单外面就收起。点的是别的动作时先收起再继续分派，不吞掉那次点击。
+  if (State.p4Menu && !(target && (target.dataset.act === 'more' || target.dataset.act === 'share-link'))) {
+    State.p4Menu = false;
+    if (!target) {
+      render();
+      return;
+    }
+  }
+
   if (!target) return;
   const act = target.dataset.act;
 
@@ -1177,6 +1539,51 @@ document.addEventListener('click', function (event) {
 
     case 'settings':
       Nav.go('p7');
+      break;
+
+    case 'more':
+      State.p4Menu = !State.p4Menu;
+      render();
+      break;
+
+    case 'share-link':
+      startShareCreate(target.dataset.id);
+      break;
+
+    case 'copy-link':
+      copyShareLink();
+      break;
+
+    case 'retry-share':
+      startShareCreate(State.shareFileId);
+      break;
+
+    case 'open-share':
+      State.revokeError = '';
+      Nav.go('p8', target.dataset.id);
+      break;
+
+    case 'revoke-share':
+      State.revokeToken = target.dataset.id;
+      State.revokeError = '';
+      render();
+      break;
+
+    case 'close-revoke':
+      State.revokeToken = '';
+      render();
+      break;
+
+    case 'confirm-revoke':
+      confirmRevokeShare();
+      break;
+
+    case 'share-manage':
+      Nav.go('p9');
+      break;
+
+    case 'retry-shares':
+      Store.loadShares(true);
       break;
 
     case 'close-settings':
@@ -1382,6 +1789,16 @@ document.addEventListener('input', function (event) {
 
 document.addEventListener('keydown', function (event) {
   if (event.key === 'Escape') {
+    if (State.p4Menu) {
+      State.p4Menu = false;
+      render();
+      return;
+    }
+    if (State.revokeToken) {
+      State.revokeToken = '';
+      render();
+      return;
+    }
     if (State.addOpen) {
       closeAddSheet();
       return;
@@ -1483,6 +1900,9 @@ function sendComment() {
     const first = Store.groups()[0];
     State.groupId = first ? first.id : '';
     Store.onChange(onDataChanged);
+    // 链接分享的入口（P4「…」/ P7「分享管理」）先探一次可用性：不可用时两处都不出现。
+    // 这条请求同时会让 daemon 加载 WebRTC 原生库，失败会固定降级（见 docs/daemon-api.md §3.6）。
+    Store.loadShares(true);
     // 取证别名 p4-public：直接把 P4 指向本群第一条公开条目（正常深链仍由 ?file= 指定）。
     let seedFile = Params.get('file') || null;
     if (!seedFile && alias.public && first) {
@@ -1492,6 +1912,16 @@ function sendComment() {
     if (alias.add === 'magnet') {
       State.addOpen = true;
       State.addMode = 'magnet';
+    }
+    // 取证别名 p8-share / p9-list：先确保有一条有效分享，再落页（见 docs/windows-ui.md §6.4）。
+    if (alias.ensureShare) {
+      ensureShareForDemo().then(function (token) {
+        if (token) State.shareToken = token;
+        seedStack(alias.page, token || null);
+      }, function () {
+        seedStack(alias.page, null);
+      });
+      return;
     }
     seedStack(alias.page, seedFile);
     if (Dev.pick === '1') {

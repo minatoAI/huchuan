@@ -799,6 +799,186 @@ button {
   color: var(--brand);
 }
 
+/* ------------------------------------------------------- P8 链接分享 */
+.share-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--gap);
+  max-width: 560px;
+}
+
+/* 二维码底色永远是白：深色主题下也照旧（黑码头必须在白底上才扫得出来）。 */
+.qr-box {
+  width: 232px;
+  height: 232px;
+  margin-top: var(--gap-lg);
+  padding: 12px;
+  border-radius: var(--radius-lg);
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(23, 29, 26, 0.12);
+}
+
+.qr-box .qr {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.share-link {
+  margin: 0;
+  max-width: 100%;
+  font-family: var(--font-num);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  text-align: center;
+  word-break: break-all;
+  user-select: all;
+}
+
+.share-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+}
+
+.share-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--gap-sm);
+  margin-top: var(--gap-sm);
+  text-align: center;
+}
+
+.share-status {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.share-status.is-done { color: var(--ink-2); }
+
+.share-status.is-error { color: var(--danger); }
+
+.share-creating { margin-top: var(--gap-xl); color: var(--ink-2); }
+
+.share-progress { width: 240px; }
+
+.share-expiry {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-3);
+}
+
+/* ------------------------------------------------------- P9 分享管理 */
+.share-list { overflow: hidden; }
+
+.share-row {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  padding-right: var(--gap-lg);
+  border-top: 1px solid var(--hairline);
+}
+
+.share-row:first-child { border-top: 0; }
+
+.share-row:hover { background: var(--hover); }
+
+.share-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--gap);
+  min-height: 62px;
+  padding: 0 var(--gap-lg);
+  text-align: left;
+}
+
+.share-name {
+  font-size: 15px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.share-meta {
+  font-size: 13px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.share-revoke { flex: none; }
+
+.btn-text.is-danger { color: var(--danger); }
+
+.btn-text.is-danger:hover { background: var(--hover); }
+
+/* ------------------------------------------------ P4 右上「…」溢出菜单 */
+.menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.more-btn {
+  min-width: 36px;
+  padding: 0 10px;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  padding: var(--gap-xs);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  animation: pop-in 0.12s ease;
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.menu-item:hover { background: var(--hover); }
+
+/* P7 抽屉里的「分享管理」入口：一行，右侧可选计数。 */
+.drawer-item {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  width: 100%;
+  min-height: 44px;
+  padding: 0 var(--gap-sm);
+  margin: 0 calc(-1 * var(--gap-sm));
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  text-align: left;
+}
+
+.drawer-item:hover { background: var(--hover); }
+
+.drawer-count { color: var(--ink-3); font-size: 13px; }
+
 /* -------------------------------------------------------------- 开屏 P0 */
 .splash {
   display: flex;

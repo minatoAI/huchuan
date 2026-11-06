@@ -11,6 +11,9 @@
  * 所以 daemon 是唯一事实源，本地镜像只是它的最近一次快照；任何写操作之后都重新拉一次
  * /api/state，WS 推送（state / tick）也会触发重新拉取 —— 镜像永远收敛到 daemon。
  *
+ * 链接分享（/api/shares）不在 /api/state 里，单独拉一份镜像；P8 / P9 打开时每 2 s 轮询一次
+ * （等待访客 → 传输中 xx% → 已结束 都靠它推进），离开这两页就停。
+ *
  * 页面来源有两种，两种都支持：
  *   1. 浏览器直接打开 http://127.0.0.1:47200/     —— 同源，最省事（推荐）
  *   2. 壳的内嵌资源 https://huchuan.invalid/      —— 跨源，靠 daemon 的 CORS + PNA 响应头
@@ -35,6 +38,22 @@ const NotificationLevel = {
   SYSTEM_BUBBLE: 'bubble',
   IN_APP_ONLY: 'in_app',
   MUTED: 'muted',
+};
+
+/**
+ * 分享状态：与 daemon 的 share.status 同名同义（docs/daemon-api.md §3.6）。
+ * revoked / expired / file-missing 才是「链接不可用」；done / failed 的链接仍可给下一位访客取，
+ * 所以 P9 只过滤前三者（页面规则见 docs/windows-ui.md §3.4）。
+ */
+const ShareStatus = {
+  WAITING: 'waiting',
+  CONNECTING: 'connecting',
+  TRANSFERRING: 'transferring',
+  DONE: 'done',
+  FAILED: 'failed',
+  EXPIRED: 'expired',
+  REVOKED: 'revoked',
+  FILE_MISSING: 'file-missing',
 };
 
 const DEFAULT_API_BASE = 'http://127.0.0.1:47200';
@@ -135,6 +154,15 @@ const Api = (function () {
     tracker: function () { return call('GET', '/api/settings/tracker'); },
     setTracker: function (patch) { return call('POST', '/api/settings/tracker', patch); },
     shutdown: function () { return call('POST', '/api/shutdown', {}); },
+    // 链接分享（W1）：列表 / 创建 / 单条 / 撤销。token 是 26 字符 Crockford B32。
+    shares: function () { return call('GET', '/api/shares'); },
+    createShare: function (fileId, expireDays) {
+      const body = { fileId: fileId };
+      if (expireDays !== undefined && expireDays !== null) body.expireDays = expireDays | 0;
+      return call('POST', '/api/shares', body);
+    },
+    share: function (token) { return call('GET', '/api/shares/' + encodeURIComponent(token)); },
+    revokeShare: function (token) { return call('DELETE', '/api/shares/' + encodeURIComponent(token)); },
     wsUrl: function () { return base.replace(/^http/, 'ws') + '/ws'; },
   };
 })();
@@ -199,6 +227,38 @@ function toFile(json) {
   };
 }
 
+/**
+ * daemon 的分享对象 → 页面用的形状。字段一个不改名：页面断言与 daemon-api 的读法保持一致，
+ * 也免得以后对着两个名字猜（docs/daemon-api.md §3.6 的「分享对象」）。
+ */
+function toShare(json) {
+  return {
+    token: json.token || '',
+    shareId: json.shareId || '',
+    // qrText 与 link 同值；二维码编的是 qrText（页面不自己拼链接）。
+    link: json.link || '',
+    qrText: json.qrText || json.link || '',
+    fileId: json.fileId || '',
+    fileName: json.fileName || '',
+    sizeBytes: json.sizeBytes || 0,
+    mime: json.mime || '',
+    createdAt: json.createdAt || 0,
+    expiresAt: json.expiresAt || 0,
+    revokedAt: json.revokedAt || 0,
+    expiredAt: json.expiredAt || 0,
+    status: json.status || ShareStatus.WAITING,
+    phase: json.phase === 'finished' ? 'finished' : 'active',
+    active: !!json.active,
+    bytesSent: json.bytesSent || 0,
+    bytesTotal: json.bytesTotal || 0,
+    progressPercent: json.progressPercent || 0,
+    transfers: json.transfers || 0,
+    sha256: json.sha256 || '',
+    lastTransferAt: json.lastTransferAt || 0,
+    visitor: json.visitor || null,
+  };
+}
+
 function toMember(json) {
   return {
     name: json.name || '',
@@ -253,6 +313,24 @@ const Store = (function () {
   let refreshPending = false;
 
   const pendingTimers = {};
+
+  /**
+   * 链接分享的镜像。/api/state 里没有它，所以是第二份快照：P8 / P9 打开时轮询 /api/shares。
+   * available=false 表示这一层的服务端能力不可用（缺 webrtc 原生库等），此时 P4「…」里的
+   * 分享项与 P7「分享管理」都不出现（docs/daemon-api.md §3.6）。
+   */
+  const shares = {
+    loaded: false,
+    loading: false,
+    available: false,
+    reason: '',
+    baseUrl: '',
+    webRtc: '',
+    items: [],
+    error: '',
+  };
+  let shareRequest = null;
+  let sharePending = false;
 
   function notify() {
     listeners.slice().forEach(function (fn) {
@@ -321,6 +399,49 @@ const Store = (function () {
       refreshTimer = null;
       refresh(true);
     }, 120);
+  }
+
+  function applyShares(data) {
+    shares.loaded = true;
+    shares.available = data.available === true;
+    shares.reason = data.reason || '';
+    shares.baseUrl = data.baseUrl || '';
+    shares.webRtc = data.webRtc || '';
+    shares.items = (data.shares || []).map(toShare);
+    shares.error = '';
+  }
+
+  /**
+   * 拉一次 /api/shares 覆盖镜像。同一时刻只允许一个请求在飞，多余的合并成一次补拉
+   * （P8 的轮询与「创建 / 撤销后立刻重拉」会撞在一起）。
+   * 失败时 loaded 也置 true：页面要能从「正在读取」出来并显示「读取失败」。
+   */
+  function loadShares(loud) {
+    if (shareRequest) {
+      sharePending = true;
+      return shareRequest;
+    }
+    shares.loading = true;
+    shareRequest = Api.shares()
+      .then(function (data) {
+        applyShares(data);
+        online = true;
+      }, function (error) {
+        shares.loaded = true;
+        shares.available = false;
+        shares.error = (error && error.message) || '读取失败';
+      })
+      .then(function () {
+        shares.loading = false;
+        shareRequest = null;
+        if (loud) notify();
+        if (sharePending) {
+          sharePending = false;
+          return loadShares(loud);
+        }
+        return undefined;
+      });
+    return shareRequest;
   }
 
   function connect() {
@@ -563,6 +684,55 @@ const Store = (function () {
         return refresh(true).then(function () {
           return data;
         });
+      });
+    },
+
+    /* ---- 链接分享（W1）：镜像 / 创建 / 撤销 ---- */
+
+    shares: function () {
+      return shares;
+    },
+
+    /** P9 的列表口径：只放仍然有效的链接（撤销 / 过期 / 文件不见了就移出）。 */
+    activeShares: function () {
+      return shares.items.filter(function (item) {
+        return item.status !== ShareStatus.REVOKED &&
+          item.status !== ShareStatus.EXPIRED &&
+          item.status !== ShareStatus.FILE_MISSING;
+      });
+    },
+
+    share: function (token) {
+      for (let i = 0; i < shares.items.length; i += 1) {
+        if (shares.items[i].token === token) return shares.items[i];
+      }
+      return null;
+    },
+
+    loadShares: function (loud) {
+      return loadShares(loud !== false);
+    },
+
+    /**
+     * P4「分享链接」：创建一条链接（默认 7 天，服务端口径见 docs/daemon-api.md §3.6）。
+     * 回包里的 share 先塞进镜像，页面立刻能画二维码；随后拉一次列表收敛。
+     * 失败 reject，err.code 是 E_LINK_* / E_NO_LOCAL_FILE / E_FILE_CHANGED 之类。
+     */
+    createShare: function (fileId, expireDays) {
+      return Api.createShare(fileId, expireDays === undefined ? 7 : expireDays).then(function (data) {
+        const created = toShare(data.share);
+        shares.items = [created].concat(shares.items.filter(function (item) {
+          return item.token !== created.token;
+        }));
+        shares.loaded = true;
+        return loadShares(true).then(function () { return created; });
+      });
+    },
+
+    /** P9「撤销」：不可逆；daemon 幂等。回包的 remoteRevoked=false 只表示服务端还没同步。 */
+    revokeShare: function (token) {
+      return Api.revokeShare(token).then(function (data) {
+        return loadShares(true).then(function () { return data; });
       });
     },
   };
