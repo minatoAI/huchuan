@@ -26,6 +26,14 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
     @Volatile var unlimited: Boolean = true
         private set
 
+    /** 跨网发现开关（默认开）。关掉 = 只剩局域网 mDNS 与手动地址，内核不发任何 tracker 请求。 */
+    @Volatile var trackerEnabled: Boolean = DEFAULT_TRACKER_ENABLED
+        private set
+
+    /** 自建 tracker 基址（默认已部署的 Worker）。空串 = 内核不装配 tracker。 */
+    @Volatile var trackerBaseUrl: String = DEFAULT_TRACKER_BASE_URL
+        private set
+
     private val notifications = ConcurrentHashMap<String, String>()
     private val uploadLimits = ConcurrentHashMap<String, Int>()
     private val seedPaths = ConcurrentHashMap<String, String>()
@@ -38,6 +46,8 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
             uploadLimitKbps = (root.num("uploadLimitKbps") ?: 0L).toInt()
             downloadLimitKbps = (root.num("downloadLimitKbps") ?: 0L).toInt()
             unlimited = root.bool("unlimited") ?: true
+            root.bool("trackerEnabled")?.let { trackerEnabled = it }
+            root.str("trackerBaseUrl")?.let { trackerBaseUrl = normalizeBaseUrl(it) }
             root.obj("notifications")?.fields?.forEach { (gid, value) ->
                 (value as? J.Str)?.let { notifications[gid] = it.value }
             }
@@ -59,6 +69,8 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
             "uploadLimitKbps" to jnum(uploadLimitKbps.toLong()),
             "downloadLimitKbps" to jnum(downloadLimitKbps.toLong()),
             "unlimited" to app.huchuan.core.m1.jbool(unlimited),
+            "trackerEnabled" to app.huchuan.core.m1.jbool(trackerEnabled),
+            "trackerBaseUrl" to jstr(trackerBaseUrl),
             "notifications" to J.Obj(notifications.entries.associate { it.key to jstr(it.value) }),
             "uploadLimits" to J.Obj(uploadLimits.entries.associate { it.key to jnum(it.value.toLong()) }),
             "seedPaths" to J.Obj(seedPaths.entries.associate { it.key to jstr(it.value) }),
@@ -109,6 +121,30 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
         return changed
     }
 
+    /**
+     * 写跨网发现的开关与地址。取值校验在 [Api] 做（要回 400 与具体 code），这里只管落盘。
+     *
+     * 内核只在启动时装配 tracker（core 的 setTrackerBaseUrl 在 start 之后会被忽略），所以改完
+     * 要重启进程才生效；daemon 在 `/api/settings/tracker` 的回包里用 restartRequired 明说。
+     * 返回是否真的改了。
+     */
+    fun applyTracker(enabled: Boolean?, baseUrl: String?): Boolean {
+        var changed = false
+        if (enabled != null && enabled != trackerEnabled) {
+            trackerEnabled = enabled
+            changed = true
+        }
+        if (baseUrl != null) {
+            val normalized = normalizeBaseUrl(baseUrl)
+            if (normalized != trackerBaseUrl) {
+                trackerBaseUrl = normalized
+                changed = true
+            }
+        }
+        if (changed) save()
+        return changed
+    }
+
     fun notificationOf(groupId: String): String = notifications[groupId] ?: DEFAULT_NOTIFICATION
 
     fun setNotification(groupId: String, level: String): Boolean {
@@ -134,8 +170,29 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
 
     companion object {
         const val DEFAULT_NOTIFICATION = "bubble"
+
+        /**
+         * 已部署的自建 tracker（Cloudflare Worker，见 docs/deploy-cloudflare.md）。
+         * 换部署地址只改这一处：core 里没有任何写死的线上地址，daemon 是唯一的来源。
+         */
+        const val DEFAULT_TRACKER_BASE_URL = "https://huchuan-relay.autoai233.workers.dev"
+
+        /** 跨网发现默认开：地址内置，用户不需要先配。 */
+        const val DEFAULT_TRACKER_ENABLED = true
+
+        /** 地址长度上限：只防手滑贴进来一整段文本，正常 Worker 地址不到 60 字符。 */
+        const val MAX_TRACKER_URL_LENGTH = 300
+
         private val LEVELS = setOf("bubble", "in_app", "muted")
 
         fun normalizeNotification(level: String): String? = if (LEVELS.contains(level)) level else null
+
+        /** 与 core 的 normalizeTrackerBaseUrl 同一口径：去首尾空白与尾部斜杠。 */
+        fun normalizeBaseUrl(raw: String): String = raw.trim().trimEnd('/')
+
+        /** 空串合法（= 不走 tracker）；非空必须是 http(s)。 */
+        fun isValidTrackerBaseUrl(url: String): Boolean =
+            url.isEmpty() ||
+                ((url.startsWith("http://") || url.startsWith("https://")) && url.length <= MAX_TRACKER_URL_LENGTH)
     }
 }

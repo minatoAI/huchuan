@@ -100,6 +100,9 @@ const COPY = {
   p7_readback: '内核读回',
   p7_readback_value: function (up, down) { return '上行 ' + up + ' · 下行 ' + down; },
   p7_notification: '通知',
+  p7_tracker: '跨网发现',
+  p7_lan_only: '仅局域网',
+  p7_tracker_pending: '重启后生效',
   p7_network_status: '网络状态',
   p7_bubble: '系统气泡',
   p7_in_app: '仅应用内',
@@ -169,8 +172,14 @@ function fileStateLabel(file) {
   return COPY.p3_sleeping;
 }
 
+/**
+ * P7 的网络状态。跨网发现关掉时，能到达的范围就是局域网：不管自检本身是 pass 还是
+ * degraded，都只说「仅局域网」。开关是落盘设置，重启后才真正改变内核，所以只有落盘为开时
+ * 才按自检结论说「可互传」。
+ */
 function networkLabel() {
   if (State.report.status === 'failed') return COPY.p0_failed;
+  if (!Store.device().trackerEnabled) return COPY.p7_lan_only;
   if (State.report.status === 'degraded') return COPY.p0_degraded;
   return COPY.p0_pass;
 }
@@ -900,6 +909,19 @@ function viewSettings() {
         '<h2 class="section-title">' + COPY.p7_notification + '</h2>' +
         notifications +
 
+        /* 跨网发现：开关是落盘的设置，地址只读。tracker 在内核启动时装配，
+           所以设置与内核现状不一致时补一行「重启后生效」（restartRequired 由 daemon 给）。 */
+        '<div class="setting-row">' +
+          '<span class="setting-label">' + COPY.p7_tracker + '</span>' +
+          '<span class="spacer"></span>' +
+          '<button class="switch" role="switch" data-act="toggle-tracker" ' +
+            'aria-checked="' + device.trackerEnabled + '" aria-label="' + COPY.p7_tracker + '"></button>' +
+        '</div>' +
+        '<p class="field-note tracker-base" id="tracker-base">' + esc(device.trackerBaseUrl) + '</p>' +
+        (device.trackerRestartRequired
+          ? '<p class="field-note" id="tracker-pending">' + COPY.p7_tracker_pending + '</p>'
+          : '') +
+
         '<div class="kv"><span class="field-label">' + COPY.p7_network_status + '</span>' +
           '<span>' + networkLabel() + '</span></div>' +
       '</div>' +
@@ -1020,6 +1042,13 @@ document.addEventListener('click', function (event) {
     case 'toggle-unlimited': {
       const device = Store.device();
       Store.setUnlimited(!device.unlimited);
+      render();
+      break;
+    }
+
+    case 'toggle-tracker': {
+      const device = Store.device();
+      Store.setTrackerEnabled(!device.trackerEnabled);
       render();
       break;
     }

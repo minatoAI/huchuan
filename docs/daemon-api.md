@@ -92,6 +92,7 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
 | `E_BAD_ACTIVE` | `active` 不是布尔 |
 | `E_ACTIVATE_FAILED` | 内核里没有这个文件的种子信息 |
 | `E_BAD_LIMIT` / `E_BAD_LEVEL` | 限速 / 通知档取值非法 |
+| `E_BAD_TRACKER` | 跨网发现取值非法：`enabled` 不是布尔、`baseUrl` 不是 http(s)、或一项都没给 |
 
 ---
 
@@ -121,7 +122,10 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
               "userName": "我的设备", "displayName": "我的设备" },
   "settings": { "userName": "我的设备", "uploadLimitKbps": 0,
                 "downloadLimitKbps": 0, "unlimited": true,
-                "sessionUploadLimitKbps": 0, "sessionDownloadLimitKbps": 0 },
+                "sessionUploadLimitKbps": 0, "sessionDownloadLimitKbps": 0,
+                "trackerEnabled": true,
+                "trackerBaseUrl": "https://huchuan-relay.autoai233.workers.dev",
+                "trackerActive": true, "trackerRestartRequired": false },
   "groups": [ /* 见 3.2 的群对象；每个文件额外带 comments */ ]
 }
 ```
@@ -129,6 +133,10 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
 `settings` 里有两组限速数：`uploadLimitKbps` / `downloadLimitKbps` 是**用户设的值**（落盘），
 `sessionUploadLimitKbps` / `sessionDownloadLimitKbps` 是**内核读回值**（会话里真正生效的那个）。
 两者平时相等；不等就说明下发没生效（daemon 日志有 `session_limit_applied … ok=false`）。
+
+跨网发现的四项也在 `settings` 里：`trackerEnabled` / `trackerBaseUrl` 是落盘设置，
+`trackerActive` 是内核此刻有没有在跑，`trackerRestartRequired` 表示两者差一次进程重启
+（内核只在启动时装配 tracker，详见本节的 `/api/settings/tracker`）。
 
 **为什么带评论**：Web UI 每次刷新只发一个请求。传输中页面每秒重绘，若再按文件拉评论，
 请求数会跟着文件数涨。`/api/state` 是 UI 的唯一读口，评论就一起给；其余接口（`/api/groups`
@@ -144,6 +152,9 @@ POST { "userName": "我的设备" }          // 字段都可选，给几个改�
 落盘在 `<data-dir>/settings.json`。`userName` 截断到 20 字，限速 0 = 不限。
 这里改到 `uploadLimitKbps` / `downloadLimitKbps` / `unlimited` 时同样会下发内核（见下一条），
 但脚本要断言限速请直接走 `/api/settings/limits`：那条回包里带内核读回值。
+
+跨网发现不在这条路由里改：它有独立的 `/api/settings/tracker`（见本节后面），
+因为回包必须同时给出「内核此刻在不在跑」和「要不要重启才生效」，这两件这里没有。
 
 #### `GET|POST /api/settings/limits`
 
@@ -169,6 +180,35 @@ POST { "unlimited": true }                         // 「不限」：两项都�
 - 校验：kbps 必须是 0–2097151 的整数（与 core 的 `saneKbps` 同界），否则 400 `E_BAD_LIMIT`；
   一项都没给也是 400。
 - 落盘在 `settings.json`，重启后 daemon 建会话时按落盘值重新下发一次（内核不持久化限速）。
+
+#### `GET|POST /api/settings/tracker`
+
+跨网发现（P7 的开关 + 只读地址）。
+
+```json
+GET  → { "tracker": { "enabled": true,
+                      "baseUrl": "https://huchuan-relay.autoai233.workers.dev",
+                      "active": true, "restartRequired": false } }
+
+POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改几项
+  → { "tracker": { …同上，active 仍是内核此刻的真值… } }
+```
+
+- `enabled`：布尔，默认 `true`。关掉 = 只走局域网 mDNS 与手动 IP:port；内核根本不装配
+  tracker，一条请求都不会发。
+- `baseUrl`：tracker 基址，默认是已部署的 Worker（`https://huchuan-relay.autoai233.workers.dev`）。
+  给了就必须是 `http://` / `https://` 开头的地址，否则 400 `E_BAD_TRACKER`。
+- `active`：**内核此刻**有没有 tracker 在工作（core 的 `kernel.trackerEnabled`），不是刚点的值。
+- `restartRequired`：落盘设置与内核现状不一致。core 只在 `start` 时装配 tracker
+  （`setTrackerBaseUrl` 在 start 之后会被忽略），所以 POST 只落盘：当前进程继续按启动时的
+  配置跑，重启 daemon 后按新设置生效。界面据此多显示一行「重启后生效」。
+- 落盘在 `settings.json` 的 `trackerEnabled` / `trackerBaseUrl`；daemon 启动时把它们交给内核
+  （`enabled=false` 时传空串，core 因此连 tracker 服务都不建）。
+- `/api/state` 的 `settings` 里也有这四个字段（`trackerEnabled` / `trackerBaseUrl` /
+  `trackerActive` / `trackerRestartRequired`），页面不额外发请求。
+- 日志：关掉时是 `event=tracker_disabled reason=base_url_empty`；开着时 `kernel_started` 里
+  `tracker=on tracker_base=<地址>`，每个群一条 `tracker_started`，注册结果见
+  `tracker_register` / `tracker_register_failed`。
 
 #### `POST /api/shutdown`
 
@@ -400,6 +440,17 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 排查时常用的 event：`daemon_ready`、`daemon_config`、`api_*`、`http_request`、`ws_open`/`ws_close`、
 `ws_push`、`join_*`、`file_*`、`seed_restore_*`、`api_error`、`http_conn_error`。
 
+跨网发现（tracker）这一组：
+
+    ts=… event=kernel_started … tracker=on tracker_base=https://huchuan-relay.autoai233.workers.dev
+    ts=… event=tracker_started gid=7N2P… base=https://huchuan-relay.autoai233.workers.dev …
+    ts=… event=tracker_register_failed gid=7N2P… reason=… passkey_masked=abcd****
+    ts=… event=tracker_disabled reason=base_url_empty
+
+`tracker=on` / `tracker=off` 是内核启动时的装配结果；`tracker_register`（成功）与
+`tracker_register_failed`（失败，含 DNS 不通）都代表一次真实的注册尝试；关闭时只有
+`tracker_disabled`，不会有 `tracker_service_started` / `tracker_started` / `tracker_announce`。
+
 限速相关的两行：
 
     ts=… event=session_limit_applied up_kbps=512 down_kbps=128 session_up_kbps=512 session_down_kbps=128 unlimited=false ok=true
@@ -437,7 +488,7 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 | ~~G5~~ | ~~组队（teammates）~~ **已补**：core 提供 `kernel.teammates(gid, fileId)`，daemon 接进 `file.teammates` / `group.teamSize` | 直接读内核观测值，不自己推算 | 已关闭（口径与边界见 §3.3） |
 | G6 | 评论删除 / 墓碑的对外 API | 只读不删 | 评论发出去就收不回 |
 | G7 | `startDownload(fileId, savePath)` 指定落盘目录 | 下载固定落 `<data-dir>/downloads`；本机共享的文件走「重新做种」分流（§3.3 active、§6.1） | 只影响「下载目录不可选」，不再影响休眠→激活的正确性 |
-| G8 | tracker / 跨网状态查询 | 没有 | 设置页只能显示「网络状态」的粗粒度结论 |
+| ~~G8~~ | ~~tracker / 跨网状态查询~~ **已补**：core 提供 `trackerBaseUrl`（构造参数 / start 前的 `setTrackerBaseUrl`）与 `trackerEnabled`，daemon 接成 `/api/settings/tracker` + `settings.tracker*` | 读内核真值，不自己猜 | 已关闭（口径见 §3.1；运行期改配置要重启，core 不支持换基址） |
 | G9 | 单文件限速的内核读回（`torrent_handle::upload_limit()`） | 只记 daemon 侧的设置值 + `uploadLimitInForce`（会话里挂着且未完成） | P4 的「已生效」是按「已下发」判的，不是按内核读数判的 |
 
 ---
@@ -503,9 +554,10 @@ runtime 预算是 60 MiB，超了脚本直接失败（说明模块挑多了或�
 bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 ```
 
-脚本自己起 A/B 两个 daemon（47200 / 47201），走完建群 → 后 8 位加入 → 共享 32 MiB →
-下载 → SHA-256 比对 → 评论回流 → WS 推送 → Web UI 数据通路，最后打印 `PASS` / `FAIL`。
-共 47 条断言。
+脚本自己起 A/B 两个 daemon（47200 / 47201，另有一个只验跨网关闭的 C 节点 47202），走完建群 →
+后 8 位加入 → 共享 32 MiB → 下载 → SHA-256 比对 → 评论回流 → WS 推送 → Web UI 数据通路，
+最后打印 `PASS` / `FAIL`。
+共 65 条断言。
 
 限速与组队这一组（5 条）：B 侧 `POST /api/settings/limits {"uploadKbps":512,"downloadKbps":512}`
 后 `sessionUploadLimitKbps` / `sessionDownloadLimitKbps` 必须读回 512，改成 0 必须读回 0，
@@ -513,6 +565,14 @@ bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 组队 2 条：下载期间 9 次采样 `teammates` 字段都在（读口接上了），且全程为 0 —— 这一轮只有 A 一个
 做种者，按 spec §306 做种者不计入队友。队友 ≥1 的画面取证在 `windows/scripts/capture-team-ui.sh`
 （三个 daemon，S 做种 + C1/C2 同时下载），见 `docs/windows-ui.md` §6.1。
+
+跨网发现 18 条：A 侧默认开、地址是已部署的 Worker、内核里 `active=true`、`kernel_started` 里
+`tracker=on`、建群后出现 `tracker_started` 且确实发起注册（本机 DNS 被拦时日志是
+`tracker_register_failed`，失败可接受 —— 断言的是「有尝试」，不是「注册成功」）。另起一个
+启动前就把 `trackerEnabled` 写成 `false` 的 C 节点（47202）：`kernel_started tracker=off` 且
+`tracker_disabled`，建群后没有任何 `tracker_service_started` / `tracker_register` /
+`tracker_announce`；运行期 POST `{"enabled":true}` 只落盘，回包 `restartRequired=true` 且
+`active=false`。P7 关闭态的界面取证见 `docs/windows-ui.md` §6.2。
 
 最后一条验绿色版：用 `cmd` 把 `JAVA_HOME` 清空、`PATH` 只留 `C:\Windows\System32`（复现
 「目标机没装 Java」），再启动 `dist/Huchuan/Huchuan.exe`，要求 47290 上的 `/api/health` 通，

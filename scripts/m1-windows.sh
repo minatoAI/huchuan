@@ -20,8 +20,11 @@
 #   6. limit   ：全局限速下发内核后**读回**会话里生效的值（512 ↔ 0），并采队友数，
 #                确认做种者不计入队友（spec §306）；≥1 的组队取证见
 #                windows/scripts/capture-team-ui.sh
+#   7. tracker ：跨网发现默认开、地址是已部署的 Worker，建群后确实发起注册尝试
+#                （本机 DNS 被拦，失败可接受）；另起一个启动前就关掉 tracker 的 C 节点，
+#                要求 kernel_started tracker=off、建群后一条 tracker 请求都没有
 #
-# 端口用文档里写死的固定值 47200 / 47201。占用就 FAIL，不静默换端口 ——
+# 端口用文档里写死的固定值 47200 / 47201 / 47202。占用就 FAIL，不静默换端口 ——
 # 换端口等于没验「默认端口能起」。
 #
 # 关于「手动地址」：同机两个 daemon 的 mDNS 也会互相发现，B 有可能经 LAN 候选先连上。
@@ -35,21 +38,32 @@ ART="$ROOT/artifacts/m1-windows"
 
 DATA_A="$ART/a-data"
 DATA_B="$ART/b-data"
+DATA_C="$ART/c-data"
 SHARE_DIR="$ART/a-share"
 SHARE_FILE="$SHARE_DIR/payload-32m.bin"
 OUT_A="$ART/daemon-A.out"
 OUT_B="$ART/daemon-B.out"
+OUT_C="$ART/daemon-C.out"
 LOG_A="$ART/daemon-A.log"
 LOG_B="$ART/daemon-B.log"
+LOG_C="$ART/daemon-C.log"
 
 PORT_A=47200
 PORT_B=47201
+# C 只验「跨网关闭」，跑完就在本轮收掉，不参与主流程。
+PORT_C=47202
 # 绿色版断言单独占一个端口：它要独占「没人监听」这个前提，才能证明 daemon 是自己拉起来的。
 PORT_PKG=47290
 MSG_A=47300
 MSG_B=47310
+MSG_C=47320
 BT_A=51500
 BT_B=51510
+BT_C=51520
+
+# 默认的跨网发现地址：与 daemon 的 SettingsStore.DEFAULT_TRACKER_BASE_URL 同一个值
+# （docs/deploy-cloudflare.md 里部署的那个 Worker）。换地址时两处一起改。
+TRACKER_URL="https://huchuan-relay.autoai233.workers.dev"
 
 FILE_BYTES=33554432
 # 给 A 的共享文件压 8 MiB/s：顺带验单文件限速，并让 WS 的 tick 采样有东西可采。
@@ -83,6 +97,7 @@ die() {
 
 PID_A=""
 PID_B=""
+PID_C=""
 WS_PID=""
 
 port_pid() { # 监听该端口的进程 pid（没有就空）
@@ -105,15 +120,17 @@ huchuan_pids() {
 }
 
 cleanup() {
-  for pid in "$WS_PID" "$PID_A" "$PID_B"; do
+  for pid in "$WS_PID" "$PID_A" "$PID_B" "$PID_C"; do
     [ -n "$pid" ] || continue
     kill -9 "$pid" >/dev/null 2>&1 || true
   done
   WS_PID=""
   PID_A=""
   PID_B=""
+  PID_C=""
   kill_port "$PORT_A"
   kill_port "$PORT_B"
+  kill_port "$PORT_C"
   kill_port "$PORT_PKG"
   # 给 bash 一点时间把「Killed」这类作业消息吐出来，别让它落在 PASS 后面
   sleep 0.5
@@ -167,7 +184,7 @@ command -v java      >/dev/null 2>&1 || die "java 不在 PATH（要 JDK 17+）"
 command -v curl      >/dev/null 2>&1 || die "curl 不在 PATH"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum 不在 PATH（脚本要独立重算 SHA-256）"
 
-for port in "$PORT_A" "$PORT_B"; do
+for port in "$PORT_A" "$PORT_B" "$PORT_C"; do
   if port_busy "$port"; then
     die "端口 $port 已被占用（pid $(port_pid "$port")）：先停掉手动起的 daemon 再跑本脚本。"
   fi
@@ -268,6 +285,33 @@ chk "group.created (gid=$GID)" "$([ -n "$GID" ] && echo 1 || echo 0)"
 chk "group.invite_code_16 (code=$INVITE)" "$([ "$INVITE_LEN" = "16" ] && echo 1 || echo 0)"
 chk "group.invite_tail8 (tail8=$TAIL8)" \
   "$([ "$TAIL8" = "$(printf '%s' "$INVITE" | tail -c 8)" ] && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 3b. 跨网发现（开）
+# 默认开 + 内置地址：daemon 把地址交给内核，群一建好 tracker 线程就开始注册。
+# 这台机器的 DNS 被拦，注册失败是预期结果 —— 断言的是「确实发起了尝试」，不是注册成功。
+say ""
+say "--- A 跨网发现：默认开、地址是已部署的 $TRACKER_URL"
+TRACKER_A=$(get "http://127.0.0.1:$PORT_A/api/settings/tracker")
+T_ENABLED=$(bval "$TRACKER_A" enabled)
+T_BASE=$(sval "$TRACKER_A" baseUrl)
+T_ACTIVE=$(bval "$TRACKER_A" active)
+chk "tracker.default_on (enabled=$T_ENABLED)" "$([ "$T_ENABLED" = "true" ] && echo 1 || echo 0)"
+chk "tracker.deployed_base ($T_BASE)" "$([ "$T_BASE" = "$TRACKER_URL" ] && echo 1 || echo 0)"
+chk "tracker.active_in_kernel (active=$T_ACTIVE)" "$([ "$T_ACTIVE" = "true" ] && echo 1 || echo 0)"
+chk "tracker.kernel_started_on" \
+  "$(grep -q "event=kernel_started .*tracker=on .*tracker_base=$TRACKER_URL" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+chk "tracker.group_watched (gid=$GID)" \
+  "$(grep -q "event=tracker_started gid=$GID " "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+# 注册尝试：成功（tracker_register）与失败（tracker_register_failed）都算；等 30 s 给 DNS 超时。
+T_ATTEMPT=""
+i=0
+while [ "$i" -lt 60 ]; do
+  T_ATTEMPT=$(grep -o 'event=tracker_register_failed\|event=tracker_register ' "$LOG_A" 2>/dev/null | head -1)
+  [ -n "$T_ATTEMPT" ] && break
+  sleep 0.5
+  i=$((i + 1))
+done
+chk "tracker.register_attempted (${T_ATTEMPT:-none})" "$([ -n "$T_ATTEMPT" ] && echo 1 || echo 0)"
 
 # ------------------------------------------------------------------ 4. A 共享 32 MiB
 say "--- A 共享 $((FILE_BYTES / 1024 / 1024)) MiB"
@@ -450,6 +494,61 @@ chk "web.state_has_session_limits" \
 SET_SAVED=$(post "http://127.0.0.1:$PORT_A/api/settings" '{"userName":"A-Node-User"}')
 chk "settings.user_name_saved" \
   "$(printf '%s' "$SET_SAVED" | grep -q '"userName":"A-Node-User"' && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 10b. 跨网发现（关）
+# 关闭状态必须是「内核里根本没有 tracker」：不是把开关置灰，也不是发请求失败。
+# 造一个启动前就写好 settings.json 的数据目录（trackerEnabled=false），建群也不该出现
+# 任何 tracker 线程或请求；kernel_started 必须是 tracker=off。
+say ""
+say "--- 跨网发现关闭（C 节点，settings.json 里 trackerEnabled=false）"
+mkdir -p "$DATA_C" || die "建不出 $DATA_C"
+printf '%s' '{"format":"huchuan-daemon-settings/1","trackerEnabled":false,"trackerBaseUrl":"'"$TRACKER_URL"'"}' > "$DATA_C/settings.json"
+launch_daemon "$PORT_C" "$MSG_C" "$BT_C" "$DATA_C" "$LOG_C" "$OUT_C" C-Node
+PID_C=$LAST_PID
+wait_health "$PORT_C" 60 > /dev/null || die "C 起不来：$(why_not "$OUT_C")（日志 $OUT_C）"
+
+TRACKER_C=$(get "http://127.0.0.1:$PORT_C/api/settings/tracker")
+TC_ENABLED=$(bval "$TRACKER_C" enabled)
+TC_ACTIVE=$(bval "$TRACKER_C" active)
+TC_BASE=$(sval "$TRACKER_C" baseUrl)
+chk "tracker.off_setting_read_back (enabled=$TC_ENABLED active=$TC_ACTIVE)" \
+  "$([ "$TC_ENABLED" = "false" ] && [ "$TC_ACTIVE" = "false" ] && echo 1 || echo 0)"
+chk "tracker.off_base_still_stored ($TC_BASE)" "$([ "$TC_BASE" = "$TRACKER_URL" ] && echo 1 || echo 0)"
+chk "tracker.kernel_started_off" \
+  "$(grep -q 'event=kernel_started .*tracker=off' "$LOG_C" 2>/dev/null && echo 1 || echo 0)"
+chk "tracker.disabled_reason_logged" \
+  "$(grep -q 'event=tracker_disabled .*reason=base_url_empty' "$LOG_C" 2>/dev/null && echo 1 || echo 0)"
+
+# 建一个群：开着的时候这里会拉起 tracker 线程并注册；关着就一条请求都不该有。
+OFF_GROUP=$(post "http://127.0.0.1:$PORT_C/api/groups" '{"name":"tracker-off-group"}')
+OFF_GID=$(sval "$OFF_GROUP" id)
+chk "tracker.off_group_created (gid=$OFF_GID)" "$([ -n "$OFF_GID" ] && echo 1 || echo 0)"
+sleep 3
+chk "tracker.off_no_service" \
+  "$(grep -q 'event=tracker_service_started' "$LOG_C" 2>/dev/null && echo 0 || echo 1)"
+chk "tracker.off_no_register_request" \
+  "$(grep -q 'event=tracker_register_failed\|event=tracker_register ' "$LOG_C" 2>/dev/null && echo 0 || echo 1)"
+chk "tracker.off_no_announce_request" \
+  "$(grep -q 'event=tracker_announce' "$LOG_C" 2>/dev/null && echo 0 || echo 1)"
+
+# 运行期改开关：只落盘，内核不动（重启后生效）；回包必须把这件事说清楚。
+TRACKER_ON=$(post "http://127.0.0.1:$PORT_C/api/settings/tracker" '{"enabled":true}')
+chk "tracker.toggle_persisted (enabled=$(bval "$TRACKER_ON" enabled))" \
+  "$([ "$(bval "$TRACKER_ON" enabled)" = "true" ] && echo 1 || echo 0)"
+chk "tracker.toggle_needs_restart (restartRequired=$(bval "$TRACKER_ON" restartRequired) active=$(bval "$TRACKER_ON" active))" \
+  "$([ "$(bval "$TRACKER_ON" restartRequired)" = "true" ] && [ "$(bval "$TRACKER_ON" active)" = "false" ] && echo 1 || echo 0)"
+chk "tracker.toggle_logged" \
+  "$(grep -q 'event=api_tracker_set enabled=true .*restart_required=true' "$LOG_C" 2>/dev/null && echo 1 || echo 0)"
+
+post "http://127.0.0.1:$PORT_C/api/shutdown" '{}' > /dev/null
+i=0
+while [ "$i" -lt 20 ]; do
+  port_busy "$PORT_C" || break
+  sleep 0.5
+  i=$((i + 1))
+done
+chk "tracker.off_node_stopped" "$(port_busy $PORT_C && echo 0 || echo 1)"
+PID_C=""
 
 # ------------------------------------------------------------------ 11. 绿色版：没有 Java 的机器
 # 复现「目标机没装 Java」：用 cmd 把 JAVA_HOME 清空、PATH 只留 System32，再双击同一个 exe。

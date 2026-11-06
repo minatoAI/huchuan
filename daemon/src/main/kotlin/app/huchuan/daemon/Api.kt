@@ -78,15 +78,18 @@ class Api(private val daemon: Daemon) {
     }
 
     /**
-     * `/api/settings`（用户名等通用设置）与 `/api/settings/limits`（全局限速）共用这条路由。
+     * `/api/settings`（用户名等通用设置）、`/api/settings/limits`（全局限速）、
+     * `/api/settings/tracker`（跨网发现）共用这条路由。
      *
-     * 限速是唯一需要「下发内核」的设置项：改完必须立刻 applySettings，不能只落 settings.json ——
-     * 落盘的只是下次启动要恢复的目标值。
+     * 限速是唯一需要「运行期下发内核」的设置项：改完必须立刻 applySettings，不能只落
+     * settings.json —— 落盘的只是下次启动要恢复的目标值。tracker 正相反：内核只在 start 时
+     * 装配它，所以只落盘，回包里用 restartRequired 说明还没生效。
      */
     private fun settingsRoute(request: HttpRequest, rest: List<String>): HttpResponse {
         if (rest.isNotEmpty()) {
             return when (rest[0]) {
                 "limits" -> limitsRoute(request)
+                "tracker" -> trackerRoute(request)
                 else -> fail("E_NOT_FOUND", request.path, 404)
             }
         }
@@ -158,6 +161,65 @@ class Api(private val daemon: Daemon) {
                     ),
                 )
                 ok(jobj("limits" to daemon.limitsJson()))
+            }
+            else -> methodNotAllowed(request)
+        }
+    }
+
+    /**
+     * 跨网发现（P7 的开关 + 只读地址）。
+     *
+     * GET 给当前设置与内核现状。POST 只校验并落盘：
+     *   - `enabled`：布尔，默认开；
+     *   - `baseUrl`：http(s) 地址，写进 settings.json，下次启动传给内核。
+     *
+     * 内核的 tracker 只在 start 时装配（core 明确不支持运行期换基址），所以 POST 之后
+     * `restartRequired` 会是 true，直到进程重启；`active` 始终是内核此刻的真值。
+     */
+    private fun trackerRoute(request: HttpRequest): HttpResponse {
+        return when (request.method) {
+            "GET" -> ok(jobj("tracker" to daemon.trackerJson()))
+            "POST" -> {
+                val body = request.json() as? J.Obj
+                    ?: return fail("E_BAD_JSON", "body 必须是 JSON 对象", 400)
+                val enabled = if (body.fields.containsKey("enabled")) {
+                    body.bool("enabled")
+                        ?: return fail("E_BAD_TRACKER", "enabled 必须是布尔", 400)
+                } else {
+                    null
+                }
+                val baseUrl = if (body.fields.containsKey("baseUrl")) {
+                    val raw = body.str("baseUrl")
+                        ?: return fail("E_BAD_TRACKER", "baseUrl 必须是字符串", 400)
+                    val normalized = SettingsStore.normalizeBaseUrl(raw)
+                    if (normalized.isEmpty() || !SettingsStore.isValidTrackerBaseUrl(normalized)) {
+                        return fail("E_BAD_TRACKER", "baseUrl 必须是 http:// 或 https:// 开头的地址", 400)
+                    }
+                    normalized
+                } else {
+                    null
+                }
+                if (enabled == null && baseUrl == null) {
+                    return fail("E_BAD_TRACKER", "至少给一项：enabled / baseUrl", 400)
+                }
+                val nextEnabled = enabled ?: daemon.settings.trackerEnabled
+                val nextBase = baseUrl ?: daemon.settings.trackerBaseUrl
+                if (nextEnabled && nextBase.isEmpty()) {
+                    return fail("E_BAD_TRACKER", "跨网发现要一个 tracker 地址", 400)
+                }
+                val changed = daemon.settings.applyTracker(enabled, baseUrl)
+                if (changed) daemon.bump("tracker_changed")
+                val state = daemon.trackerJson()
+                daemon.log.event(
+                    "api_tracker_set",
+                    mapOf(
+                        "enabled" to state.bool("enabled").toString(),
+                        "base" to (state.str("baseUrl") ?: ""),
+                        "changed" to changed.toString(),
+                        "restart_required" to state.bool("restartRequired").toString(),
+                    ),
+                )
+                ok(jobj("tracker" to state))
             }
             else -> methodNotAllowed(request)
         }

@@ -258,6 +258,12 @@ button {
 
 .field-note.is-error { color: var(--danger); }
 
+/* P7 跨网发现的只读地址：任意长度都不许把抽屉撑出横向滚动 */
+.tracker-base {
+  font-family: var(--font-num);
+  word-break: break-all;
+}
+
 .search {
   display: flex;
   align-items: center;
