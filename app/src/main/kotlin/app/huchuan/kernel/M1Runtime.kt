@@ -160,6 +160,10 @@ class M1Runtime(context: Context) {
                 shareDir.mkdirs()
                 inboxDir.mkdirs()
                 acquireMulticastLock()
+                // 跨网发现（tracker）的基址必须在 kernel.start() 之前交给内核：内核只在这一刻
+                // 建 TrackerService，起来之后再改是被忽略的（core 记 tracker_config_ignored）。
+                // 开关关掉就传空串 —— 内核口径是「空串 = 整个功能关闭」，不建线程、不发请求。
+                applyTrackerBaseUrl()
                 kernel.start()
                 started = true
                 // 内核不持久化限速：设置留在 SharedPreferences，进程一起来就重新下发。
@@ -172,7 +176,8 @@ class M1Runtime(context: Context) {
                         " bt_port=" + kernel.localBtPort() +
                         " data_dir=" + dataDir.absolutePath +
                         " keyseed_box=" + secretBox.scheme +
-                        " multicast_lock=" + (multicastLock?.isHeld == true),
+                        " multicast_lock=" + (multicastLock?.isHeld == true) +
+                        " tracker=" + if (kernel.trackerEnabled) "on" else "off",
                 )
             } catch (t: Throwable) {
                 startError = t.toString()
@@ -213,6 +218,46 @@ class M1Runtime(context: Context) {
             Log.w(TAG, "event=multicast_lock_failed error=" + t)
         }
     }
+
+    // ------------------------------------------------------------------ 跨网发现（tracker）
+
+    /**
+     * 把 P7 的「跨网发现」设置交给内核，**只能在 kernel.start() 之前**调。
+     *
+     * 内核的 tracker 基址是启动期配置：起来之后再改会被忽略（core 记 tracker_config_ignored），
+     * 所以这里一次冷启动只读一次盘，没有热更新。开关关掉 → 空串 → 内核只留一条
+     * `tracker_disabled reason=base_url_empty`，不建 TrackerService、一条请求都不发。
+     */
+    private fun applyTrackerBaseUrl() {
+        val base = prefs.trackerBaseUrlForKernel()
+        kernel.setTrackerBaseUrl(base)
+        Log.i(
+            TAG,
+            "event=tracker_config enabled=" + (if (base.isEmpty()) "off" else "on") +
+                " base=" + (base.ifEmpty { "-" }) +
+                " configured_base=" + (prefs.trackerBaseUrl.ifEmpty { "-" }),
+        )
+    }
+
+    /**
+     * P7「跨网发现」开关：落盘 + 一条日志。
+     *
+     * 改的是**下一次冷启动**的行为：内核只接受启动前给基址，运行中的 tracker 不动
+     * （中途换基址会打断 passkey 连续性，core 明确不支持）。界面用 [trackerRestartNeeded]
+     * 提示「下次启动生效」，不假装已生效。
+     */
+    fun setTrackerDiscoveryEnabled(enabled: Boolean) {
+        prefs.trackerDiscoveryEnabled = enabled
+        Log.i(
+            TAG,
+            "event=tracker_setting enabled=" + (if (enabled) "on" else "off") +
+                " apply=next_start base=" + (prefs.trackerBaseUrl.ifEmpty { "-" }),
+        )
+    }
+
+    /** 设置与运行中的内核不一致（改了开关但还没冷启动）。P7 据此显示「下次启动生效」。 */
+    val trackerRestartNeeded: Boolean
+        get() = started && kernel.trackerBaseUrl != prefs.trackerBaseUrlForKernel()
 
     // ------------------------------------------------------------------ 群与文件
 

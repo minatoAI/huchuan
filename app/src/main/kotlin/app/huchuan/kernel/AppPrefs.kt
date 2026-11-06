@@ -7,11 +7,14 @@ import app.huchuan.core.LocalDeviceStore
 import app.huchuan.core.NotificationLevel
 
 /**
- * 本机设置（P1 用户名 / P7 全局限速 / P4 单文件限速 / 通知档）。落 SharedPreferences，进程重启不丢。
+ * 本机设置（P1 用户名 / P7 全局限速 / 跨网发现 / P4 单文件限速 / 通知档）。落 SharedPreferences，进程重启不丢。
  *
  * 两份限速都落盘、都由宿主在设置变化时立刻下发内核，内核自己不做持久化：
  * 全局限速是 session 级（[M1Runtime.applyGlobalLimits]），单文件限速挂在 torrent handle 上
  * （[M1GroupStore.setFileUploadLimit]）。通知档仍只有本地含义，等 M2 的通知通道。
+ *
+ * 跨网发现（tracker）的两项不一样：内核只接受「start() 之前」给一次基址，
+ * 所以这里只负责落盘，由 [M1Runtime.start] 在内核起来之前读一次（见 [trackerBaseUrlForKernel]）。
  */
 class AppPrefs(context: Context) : LocalDeviceStore {
 
@@ -66,6 +69,29 @@ class AppPrefs(context: Context) : LocalDeviceStore {
         }
         .toMap()
 
+    // ------------------------------------------------------------------ 跨网发现（P7）
+
+    /** tracker 基址。默认就是已部署的那个 Worker 地址（内核里没有写死任何线上地址）。 */
+    var trackerBaseUrl: String
+        get() = prefs.getString(KEY_TRACKER_BASE, DEFAULT_TRACKER_BASE).orEmpty().trim()
+        set(value) {
+            prefs.edit().putString(KEY_TRACKER_BASE, value.trim()).apply()
+        }
+
+    /** P7「跨网发现」开关，默认开。关掉 = 交给内核空串（内核口径：空串 = 整个功能关闭）。 */
+    var trackerDiscoveryEnabled: Boolean
+        get() = prefs.getBoolean(KEY_TRACKER_DISCOVERY, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_TRACKER_DISCOVERY, value).apply()
+        }
+
+    /**
+     * 真正交给内核的基址：开关关掉、或地址为空，都是空串 —— 内核据此不建 TrackerService、
+     * 一条请求都不发（docs/core.md §3.5「关闭时」）。
+     */
+    fun trackerBaseUrlForKernel(): String =
+        if (trackerDiscoveryEnabled) trackerBaseUrl else ""
+
     /** 群通知档；M1 只在 P7 里存，不产生系统通知。 */
     fun notificationLevel(groupId: String): NotificationLevel {
         val raw = prefs.getString(KEY_NOTIFY + groupId, null) ?: return NotificationLevel.SYSTEM_BUBBLE
@@ -83,5 +109,10 @@ class AppPrefs(context: Context) : LocalDeviceStore {
         private const val KEY_UNLIMITED = "unlimited"
         private const val KEY_NOTIFY = "notify."
         private const val KEY_FILE_LIMIT = "file_limit."
+        private const val KEY_TRACKER_BASE = "tracker_base_url"
+        private const val KEY_TRACKER_DISCOVERY = "tracker_discovery"
+
+        /** 已部署的 relay（Worker）地址；只在宿主里出现这一次，内核不许写死。 */
+        const val DEFAULT_TRACKER_BASE = "https://huchuan-relay.autoai233.workers.dev"
     }
 }

@@ -242,6 +242,36 @@ class HuchuanState(
         touch()
     }
 
+    // ------------------------------------------------------------------ P7 跨网发现（tracker）
+
+    /** 只有接了内核的壳才有这一项：静态壳里没有任何「跨网」行为可以开关。 */
+    val trackerAvailable: Boolean get() = runtime != null
+
+    /** P7「跨网发现」开关的当前值（落盘值；内核在冷启动时读它）。 */
+    val trackerDiscoveryEnabled: Boolean
+        get() {
+            @Suppress("UNUSED_EXPRESSION")
+            revision
+            return runtime?.prefs?.trackerDiscoveryEnabled ?: false
+        }
+
+    /** 设置与运行中的内核不一致时提示「下次启动生效」。 */
+    val trackerRestartNeeded: Boolean
+        get() {
+            @Suppress("UNUSED_EXPRESSION")
+            revision
+            return runtime?.trackerRestartNeeded ?: false
+        }
+
+    /** 改开关只落盘 + 记日志；真正生效在下一次冷启动（内核只接受启动前的基址）。 */
+    suspend fun setTrackerDiscoveryEnabled(enabled: Boolean) {
+        val runtime = runtime
+        if (runtime != null) {
+            withContext(Dispatchers.IO) { runtime.setTrackerDiscoveryEnabled(enabled) }
+        }
+        touch()
+    }
+
     private suspend fun applyGlobal(kind: GlobalLimitKind, kbps: Int) {
         val runtime = runtime
         if (runtime == null) {
