@@ -1,11 +1,13 @@
-# Windows 壳 · 八页 Web UI（已接真 daemon）
+# Windows 壳 · 十页 Web UI（已接真 daemon）
 
-- 结论：P0–P7 八页全部实现，纯静态（HTML + 手写 CSS + 原生 JS，零依赖、零 CDN）。
+- 结论：P0–P9 十页全部实现，纯静态（HTML + 手写 CSS + 原生 JS，零依赖、零 CDN）。
   数据不再来自内存假数据，而是 **daemon 的 REST + WebSocket**（`docs/daemon-api.md`）。
 - 公开种子（磁力导入 / 公开条目 / 本机移除）已接进 P3 / P4，口径与文案同 Android：
   「公开」「等待来源」「本机文件」「磁力链接」「移除」。
+- 链接分享（W1）已接进 P4 / P8 / P9：P4「…」→「分享链接」创建 7 天链接并进 P8，
+  二维码由页面本地编码并画成 SVG（`js/qrcode.js`，不出网）；P7「分享管理」→ P9 列表与撤销。
 - 一条命令出结果：`bash scripts/build-windows.sh` → 编译 → 起一个带料的 daemon →
-  逐页截图 → 16 张门禁逐张断言，再补 3 张公开种子截图（同一套离屏截图与断言）。
+  逐页截图 → 18 张门禁逐张断言，再补 3 张公开种子截图（同一套离屏截图与断言）。
 - 壳只负责窗口与 WebView2：启动时拉起 daemon、退出时带走它，业务逻辑一行都不在 `main.cpp` 里。
 
 ## 1. 怎么起、怎么连
@@ -60,7 +62,7 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 
 | 参数 | 取值 | 作用 |
 | --- | --- | --- |
-| `route` | `p0`…`p7`；取证别名 `p3-magnet` / `p4-public` | 直接落到某一页，跳过开屏 |
+| `route` | `p0`…`p9`；取证别名 `p3-magnet` / `p4-public` / `p8-share` / `p9-list` | 直接落到某一页，跳过开屏 |
 | `theme` | `light` / `dark` | 强制主题（默认跟随系统） |
 | `network` | `pass` / `limited` / `fail` | 强制自检结论；不带 = 用真实自检（daemon 在不在） |
 | `hold` | `boot` / `checking` / `result` | 把 P0 停在某个阶段，供截图 |
@@ -68,9 +70,10 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 | `api` | `http://host:port` | 浏览器里指定 daemon 地址（跨源场景 / 换端口调试） |
 | `manual` | `host:port`（逗号分隔） | 加入群时的手动候选，填对方的消息层端口 |
 
-`p3-magnet` / `p4-public` 只给截图取证用，正常导航不带（见 §6.3）：前者落到 P3 并直接
-打开「磁力链接」输入，后者落到 P4 并选中本群第一条公开条目。两者的页面名仍是 `p3` / `p4`，
-所以截图任务表的 `page` / `--shot-page` 不用改。
+`p3-magnet` / `p4-public` / `p8-share` / `p9-list` 只给截图取证用，正常导航不带（见 §6.3 / §6.4）：
+前两者分别落到 P3 的磁力输入、P4 的第一条公开条目；`p8-share` / `p9-list` 会先确保 daemon 里有
+一条有效分享（没有就用本群第一个私有文件建一条 7 天的），再落到 P8 / P9。页面名仍是
+`p3` / `p4` / `p8` / `p9`，所以截图任务表的 `page` / `--shot-page` 不用改。
 
 壳自己的开关（不属于页面参数，正常双击一个都不带）：`--daemon-jar=`、`--daemon-port=`、
 `--daemon-data-dir=`（给测试用独立数据目录，别动 `%LOCALAPPDATA%\Huchuan\daemon`）。
@@ -80,7 +83,7 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 | 参数 | 取值 | 作用 |
 | --- | --- | --- |
 | `--shot` | PNG 绝对路径 | 离屏渲染一张图写盘后退出（WebView2 `CapturePreview`），不抓屏 |
-| `--shot-page` | `p0`…`p7` | 等到 `document.body.dataset.page` 等于这一页再截；只决定等哪一页，落到哪一页仍由 `--route=` 决定 |
+| `--shot-page` | `p0`…`p9` | 等到 `document.body.dataset.page` 等于这一页再截；只决定等哪一页，落到哪一页仍由 `--route=` 决定 |
 | `--shot-delay` | 毫秒，默认 1200 | 导航完成后最少等多久再截（留出首帧、字体、接口回来） |
 | `--shot-timeout` | 毫秒，默认 12000 | 等 `--shot-page` 的上限，超时就按当前页截并记一条告警 |
 
@@ -91,11 +94,12 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 
 ```
 windows/resources/web/
-  index.html          壳页面：一个 #app 容器 + 两个脚本，不含业务
+  index.html          壳页面：一个 #app 容器 + 脚本，不含业务
   css/tokens.css      颜色 / 间距 / 字号令牌，浅深两套（取值同 Android Theme.kt）
-  css/app.css         版面与组件（列表、chip、开关、进度、抽屉、开屏）
+  css/app.css         版面与组件（列表、chip、开关、进度、抽屉、二维码、溢出菜单、开屏）
   js/data.js          daemon 客户端：Api（REST/WS）+ Store（同步读 + 异步写）
-  js/app.js           路由 + 八页视图 + 事件（文案表 COPY 在文件顶部）
+  js/qrcode.js        本地二维码编码器（字节模式 / M 级 / 版本 1–10；只出矩阵与 SVG，不出网）
+  js/app.js           路由 + 十页视图 + 事件（文案表 COPY 在文件顶部）
 windows/scripts/
   dev-server.mjs      开发用静态服务器（node 内置模块，零依赖；只在不想起 daemon 时用）
   capture-ui.ps1      逐页截图取证：离屏截图是门禁，GDI 抓图降级为兜底诊断（纯 ASCII，见 §5 的坑）
@@ -126,6 +130,10 @@ daemon 最近一次快照，任何写操作之后都会收敛回 daemon 的真�
 
 WS 只负责说「变了」，不搬数据：收到 `state`（有东西变了）或 `tick`（传输速率/进度变了）
 就防抖 120 ms 重拉一次 `/api/state`。
+
+链接分享是**第二份镜像**：它不在 `/api/state` 里，所以 P8 / P9 打开时每 2 s 拉一次
+`GET /api/shares`（离开这两页立刻停），其余页面照旧只吃 WS。P8 的状态行从「等待访客」
+走到「传输中 42%」靠的就是这次轮询。
 
 ### 3.1 重绘不打断输入
 
@@ -203,49 +211,47 @@ P3 页面本身没有输入框：`Enter` 打开「添加文件」弹层；弹层
 「仅局域网」；如果设置与内核现状差一次重启，开关下面多一行「重启后生效」（daemon 的
 `trackerRestartRequired`），不把「已点的值」冒充成「已经生效」。
 
-### 3.4 链接分享（W1）：本轮只有接口，页面没有入口
+### 3.4 链接分享（W1）：P4 → P8 → P9
 
-daemon 侧的链接分享已经全通（端点、日志、过期、撤销、WebRTC 发送端），但按本轮边界
-**`windows/resources/web/` 一个元素都没加**：页面上还看不到「分享链接」这个动作。
-这一段把「将来接页面时要读哪份数」先钉住，免得接的时候又去猜。
+入口与出口（与 Android 同构，`docs/design/link-share.md` §3）：
 
-接口与字段口径见 `docs/daemon-api.md` §3.6，页面要用的只有这些：
+- **P4「…」→「分享链接」**：`POST /api/shares {fileId, expireDays: 7}` → 进 P8（`#/p8/<token>`）。
+  创建中停在同一页显示「创建中」，失败显示一句话 +「重试」，不弹窗。
+- **P7 抽屉「分享管理」**（右侧是有效链接条数）→ P9（`#/p9`）；P9 点行 → 该链接的 P8，撤销在 P9。
+- 分享服务不可用（`GET /api/shares` 的 `available=false`，例如缺 WebRTC 原生库）时，这两处入口都不出现，
+  与 Android 的 `linkAvailable` 同口径；直接深链到 P8 会显示「没有这条分享」。
+
+页面读的是 daemon 的分享对象，字段一个不改名（`docs/daemon-api.md` §3.6）：
 
 | 界面上的 | 数据来源 | 判定 |
 | --- | --- | --- |
+| P8 二维码 | `share.qrText` | 与 `link` 同值；`js/qrcode.js` 本地编成模块矩阵、页面画 SVG，不调用任何在线二维码服务 |
+| P8 链接文本 /「复制链接」 | `share.link` | `navigator.clipboard`，失败退回 `execCommand`；「已复制」在行内留 1.6 s |
+| P8 状态行 | `share.status` + `share.progressPercent` | `waiting` 等待访客 · `connecting` 访客已加入 · `transferring` 传输中 N% · `done` / `failed` / `revoked` / `expired` / `file-missing` 已结束（带原因） |
+| P8 剩余有效期 | `share.expiresAt`（参考 `createdAt`） | 向上取整：N 天后 / N 小时后 / N 分钟后失效，过了就是「已失效」。`createdAt` 只用来兜住 Worker 时钟快一两秒的情况，不让刚建好的链接显示「8 天」 |
 | P9 列表的一行 | `GET /api/shares` 的 `shares[]` | 只排除 `status` 是 `revoked` / `expired` / `file-missing` 的；`done` / `failed` 仍显示（链接还能再给下一位访客取） |
-| 二维码 | `share.qrText` | 就是链接本身（`https://huchuan-a9f.pages.dev/#s=<token>`），编码它，不拼别的 |
-| 「7 天后失效」 | `share.expiresAt` | 服务端给的时间，页面不自己从创建时间推算 |
-| 文件名 / 大小 | `share.fileName` / `share.sizeBytes` | 创建时从本机文件取，列表不重新读盘 |
-| 「正在发送 42%」 | `share.progressPercent`（或状态接口的 `bytesSent` / `bytesTotal`） | 只有 `status=transferring` 时出现；完成即 `done` / `finished` |
-| 「被访问 n 次」 | `share.transfers` | daemon 记的取件完成次数（不是 Worker 的 visitCount） |
-| 「分享服务未配置」 | `GET /api/shares` 的 `available=false` + `reason` | 链接层不可用（缺原生库等）。`/api/shares` 本身仍然 200，页面显示一句原因并禁用入口 |
-| 撤销 | `DELETE /api/shares/{token}` | 不可逆破坏动作，允许一次确认；回包 `remoteRevoked=false` 不等于失败，是「服务端还没同步」 |
+| P9 文件名 / 被访问 n 次 | `share.fileName` / `share.transfers` | 文件名创建时定下，列表不重新读盘；次数是 daemon 记的取件完成次数（不是 Worker 的 visitCount） |
+| P9 撤销 | `DELETE /api/shares/{token}` | 不可逆破坏动作，允许一次确认；回包 `remoteRevoked=false` 只表示服务端还没同步，本机记录已经撤销 |
 
-为什么这一轮不接界面：设计里的入口是 P9「分享管理」与 P8 二维码页（`docs/design/link-share.md` §3），
-属于下一轮；本轮先把 daemon 的契约、发送端与验收跑通，界面接上去时只做展示与一次确认。
+二维码为什么自己写编码器：要编的是一条约 60 字节的固定字符串，为它多一个构建依赖与一份第三方许可
+不划算。`js/qrcode.js` 是字节模式、纠错等级 M、版本 1–10 的标准实现；真实链接 59 字节落在
+**版本 4（33×33）**，与设计里「版本 3–4」一致。独立验证见 §6.4。
 
-不进界面也能手动验（daemon 在跑时）：
+P4 的「…」里只有「分享链接」一项：单文件限速在 Windows 是页内控件（§8 第 11 条），不重复收进菜单；
+公开 / 取消公开这两个动作 Windows 端还没做（§9）。
 
-    curl -s http://127.0.0.1:47200/api/shares
-    curl -s -X POST -H 'Content-Type: application/json' \
-         --data-binary '{"fileId":"<群里的 40 位 fileId>"}' \
-         http://127.0.0.1:47200/api/shares
-    # 浏览器打开返回的 link（或把 qrText 编码成二维码）
+分享不在 `/api/state` 里，所以 P8 / P9 打开时每 2 s 拉一次 `/api/shares`，离开就停（见 §3 结尾）。
 
-端到端证据：`artifacts/link-share-win/e2e/`（`result.json`、`view-done.png`、浏览器日志、
-daemon 的 `link_*` 日志摘录）。它跑的是真 Worker + 真 WebRTC：daemon 发 8 MiB，
-Edge headless 打开 Pages 接收页收字节并自己算 SHA-256，两个 SHA 与字节数都对得上。
-复跑：`node daemon/e2e/link-share-e2e.mjs --port 47200 --file <8 MiB 文件>`，
-或直接跑 `bash scripts/m1-windows.sh`（§5 的第 9 组断言）。
+端到端证据：`artifacts/link-share-win/e2e/`（真 Worker + 真 WebRTC：daemon 发 8 MiB，Edge headless
+打开 Pages 接收页收字节并自己算 SHA-256，两个 SHA 与字节数都对得上）；界面这条链路的证据见 §6.4。
 
-已知边界（都是设计口径，不是本轮缺陷）：
+已知边界（设计口径，不是缺陷）：
 
-- **同时 1 个访客**（Worker 房间的硬上限）。链接可以先后给多个人，列表中 `transfers` 累加；
-  同一个文件被建成两条链接时，daemon 也只放一个访客进来（另一条记 `file-busy`，页面等不到 offer）。
+- **同时 1 个访客**（Worker 房间的硬上限）。链接可以先后给多个人，`transfers` 累加；同一文件被建成
+  两条链接时 daemon 也只放一个访客进来（另一条记 `file-busy`）。
 - 浏览器接收页单文件上限 **1 GiB**（OPFS / 内存降级），更大的走 App。
 - **没有 TURN**：对称 NAT / CGNAT 下打洞失败会如实显示「无法直连」。
-- 分享期间 daemon 要在线；进程退出链接变 offline（Worker 的 `/api/share/{token}` 四态之一）。
+- 分享期间 daemon 要在线；进程退出链接变 offline。有效期上限 7 天，过期不续期。
 
 ## 4. 内嵌：资源表怎么来的（现在只是兜底）
 
@@ -269,7 +275,7 @@ html / css / js / svg / png / woff2，按路径排序后：
 ## 5. 构建与验收
 
 ```bash
-bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 16 张门禁截图 + 3 张公开种子补充图
+bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 18 张门禁截图 + 3 张公开种子补充图
 bash scripts/build-windows.sh --no-evidence  # 只编译
 bash scripts/build-windows.sh --clean        # 先清 windows/build
 bash scripts/package-windows.sh              # 绿色版：jlink runtime + exe + jar → dist/Huchuan/
@@ -305,7 +311,7 @@ bash windows/scripts/capture-tracker-ui.sh   # 跨网发现关闭态的一张取
 进程退出码、尝试次数、尺寸、颜色数、主色占比、亮度、探针原文）。每页最多重跑 3 次（`-Attempts`）。
 
 门禁跑完后再跑一轮**公开种子补充截图**（§6.3）：同样是 `capture-ui.ps1` + 一次性 exe，任务表由
-`build-windows.sh` 现场生成 `public-capture-jobs.json`，索引单独写 `public-index.json`，不挤进那 16 张。
+`build-windows.sh` 现场生成 `public-capture-jobs.json`，索引单独写 `public-index.json`，不挤进那 18 张。
 脚本另外按屏 grep 探针原文（`公开` / `等待来源` / `移除` / `btih:` / `导入`），像素断言照旧。
 
 两个已经踩过的坑，改这里之前先看一眼：
@@ -350,9 +356,9 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 
 ## 6. 截图清单
 
-构建门禁的 `artifacts/windows/ui/` 共 16 张，每张一个独立进程；同一轮构建还会补 3 张公开种子图
-（§6.3，索引单独一份 `public-index.json`）。另有 §6.1 / §6.2 两个脚本产的 4 张也落在同一目录。
-涉及数据的断言写的是取证 daemon 那份料的字面：
+构建门禁的 `artifacts/windows/ui/` 共 18 张（§6.4 的 P8 / P9 两张是这一轮加的），每张一个独立进程；
+同一轮构建还会补 3 张公开种子图（§6.3，索引单独一份 `public-index.json`）。另有 §6.1 / §6.2
+两个脚本产的 4 张也落在同一目录。涉及数据的断言写的是取证 daemon 那份料的字面：
 
 | 文件 | 页 | 状态 | 断言文案 |
 | --- | --- | --- | --- |
@@ -368,7 +374,9 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 | `p4-file.png` | P4 | 文件详情：进度、开关、限速、评论 | 单文件限速 |
 | `p5-new-group.png` | P5 | 新群组：邀请码后 8 位 / 加入 / 新建群组 | 新建群组 |
 | `p6-members.png` | P6 | 成员列表 + 邀请码 | 邀请码 |
-| `p7-settings.png` | P7 | 设置抽屉：用户名 / 全局限速 / 通知 / 跨网发现 / 网络状态 | 全局限速 |
+| `p7-settings.png` | P7 | 设置抽屉：用户名 / 全局限速 / 通知 / 跨网发现 / 分享管理 / 网络状态 | 全局限速 |
+| `p8-share.png` | P8 | 链接分享：本地二维码 + 链接 + 复制链接 + 7 天后失效 + 等待访客（§6.4） | 复制链接 |
+| `p9-list.png` | P9 | 分享管理：文件名 / 7 天后失效 · 被访问 0 次 / 撤销（§6.4） | 被访问 |
 | `p2-home-dark.png` | P2 | 深色 | 老板的群 |
 | `p4-file-dark.png` | P4 | 深色 | 单文件限速 |
 | `p7-settings-dark.png` | P7 | 深色 | 全局限速 |
@@ -418,7 +426,7 @@ daemon 还用 `--device-name=Tracker-Off` 认领 health，避免把占着同一�
 
 ### 6.3 公开种子三张（构建脚本的后半段）
 
-`bash scripts/build-windows.sh` 在 16 张门禁之后，用同一个取证 daemon 再跑一轮离屏截图。
+`bash scripts/build-windows.sh` 在 18 张门禁之后，用同一个取证 daemon 再跑一轮离屏截图。
 daemon 里那条公开条目是随机 infohash + `timeoutMs=0` 导入的：没有来源，但条目已建好，
 `scope=public`、`sizeKnown=false`，正好是「等待来源」那一态。
 
@@ -435,20 +443,52 @@ daemon 里那条公开条目是随机 infohash + `timeoutMs=0` 导入的：没�
 任务表由构建脚本现场写到 `artifacts/windows/ui/public-capture-jobs.json`（源码里没有第四份任务表），
 断言分两层：`capture-ui.ps1` 的页名 + 文案 + 像素照旧；脚本另外 grep 截图那一刻的探针原文，
 把「公开」「等待来源」「移除」「btih:」「导入」逐条钉住（文件名「远山」不含「公开」，不会误命中）。
-索引是 `public-index.json`，三张都 `mode=offscreen`、`failed=0` 才算过；16 张门禁的 `index.json`
+索引是 `public-index.json`，三张都 `mode=offscreen`、`failed=0` 才算过；18 张门禁的 `index.json`
 不受影响。
+
+### 6.4 链接分享两张（P8 / P9）
+
+构建门禁里的 `p8-share` / `p9-list` 用两个取证别名落到页面（§1.3）：`p8-share` 先确保 daemon 里
+有一条有效分享（没有就用本群第一个私有文件 `POST /api/shares` 一条 7 天的），再落 P8；
+`p9-list` 复用同一条（同一个 daemon），落 P9。
+
+| 文件 | 页 | 状态 | 断言文案 |
+| --- | --- | --- | --- |
+| `p8-share.png` | P8 | 本地二维码（版本 4）+ 链接 + 复制链接 + 7 天后失效 + 等待访客 | 复制链接 |
+| `p9-list.png` | P9 | 一行：文件名 / 7 天后失效 · 被访问 0 次 / 撤销 | 被访问 |
+
+两张与其余 16 张走同一套离屏截图 + DOM / 像素断言；同名 `.log` 里有截图那一刻的
+`DOM 探针(shot)` 原文。另有三条可重跑的机读证据：
+
+- `bash artifacts/windows/share-ui-check.sh`：Edge headless + CDP 真实点击链路 —— P4「…」→
+  「分享链接」→ P8（二维码 / 链接 / 复制 / 有效期 / 状态）→ 返回 P2 → P7「分享管理」→ P9
+  （文件名 / 有效期 / 被访问次数 / 撤销）→ 点行回 P8 → 返回 → 撤销（一次确认）→ 行消失；
+  再验 `?route=p9-list` / `?route=p8-share` 两个别名。日志 `artifacts/windows/share-ui-check.log`。
+- `bash artifacts/windows/qr-check/run.sh`：编码器本身的独立验证 —— 6 个用例（版本 1 / 2 / 4 / 10、
+  UTF-8、213 字节上限）画成 PNG 交给 ZXing 3.5.3 解码，与原文逐字比。
+- `bash artifacts/windows/qr-shot-check.sh`：从 `p8-share.png` 里把二维码解出来，和取证 daemon
+  日志里 `link_share_created` 的 link 逐字比 —— 同一张图、同一条链接。
+
+**网络依赖**：这两张会真的向 Pages 的 Worker 登记一条 7 天有效链接（与 `scripts/m1-windows.sh` 的
+链接分享验收同一条依赖）。pages.dev 不可达时这两张会失败，其余 16 张不受影响；daemon 的
+`link_share_created` 里能看到这次登记。
 
 ## 7. 页面与文案
 
 文案表在 `windows/resources/web/js/app.js` 顶部（`COPY`），逐条对应
 `docs/design/product-spec.md` §3 各页「文案」行。改文案的顺序：先改 spec，再改 `COPY`，
-再跑一次 `bash scripts/build-windows.sh` 让截图断言跟着更新（16 张门禁的断言文案在
+再跑一次 `bash scripts/build-windows.sh` 让截图断言跟着更新（18 张门禁的断言文案在
 `ui-capture-jobs.json`；公开种子三张的任务表由 `build-windows.sh` 现场生成，见 §6.3）。
 
 P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增的三条 Windows 文案，spec §3 P7 的元素表
 与文案行还没列进去（`docs/design/` 不归本任务改）；合并时由设计 agent 补进 spec，以免两处各说一套。
 
-导航与状态全部纯 JS：`#/p0`…`#/p7` 是路由，返回栈在 `Nav` 里，不依赖浏览器历史。
+P8 / P9 的文案取自 Android（`app/src/main/res/values/strings.xml` 的 `p8_*` / `p9_*`），只有两处
+Windows 口径：传输态是「传输中 42%」（Android 是「正在发送 42%」），终态一律从「已结束」起头
+（「已结束」「已结束 · 链接已撤销」「已结束 · 链接已过期」…），对应本轮的「已结束」需求。
+P8 没有做 Android 的那一次性 toast（「对方可见你的网络地址」，见 §9 第 9 条）。
+
+导航与状态全部纯 JS：`#/p0`…`#/p9` 是路由，返回栈在 `Nav` 里，不依赖浏览器历史。
 
 ## 8. 与 Android 端的差异
 
@@ -466,6 +506,11 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
 | 10 | 键盘 | 无 | `Enter` 提交当前页主操作（保存 / 加入 / 发送 / 创建；P3 上是打开「添加文件」弹层，磁力输入框里是导入），`Esc` 关弹层 / 抽屉或返回 |
 | 11 | 限速读数 | 下发后只写日志（`global_limit_applied … ok=`），界面显示用户设的值 | P7 多一行「内核读回」、P4 多一行「已生效 / 已设置」，直接把会话里生效的值显示出来 |
 | 12 | 公开种子 | P3「公开」chip、P4 磁力摘要 +「移除」 | 同样三处，文案一致。磁力摘要点按复制，提示是行内「已复制」1.6 秒（Android 是 Snackbar）；移除只藏本机列表，成功后回 P3 |
+| 13 | P8 二维码 | zxing 出 BitMatrix + Compose Canvas | `js/qrcode.js` 自写编码器（字节模式 / M 级 / 版本 1–10）+ SVG；用同一个 zxing 3.5.3 在构建机外解码验证（§6.4） |
+| 14 | P8「分享链接」按钮 | 拉起系统分享菜单（ACTION_SEND） | 就是「复制链接」：Windows 没有系统分享菜单，设计里这个出口就落成剪贴板（link-share.md §3 P8） |
+| 15 | P9 撤销 | AlertDialog 一次确认 | 同款 scrim + modal 一次确认；确认后行立刻消失，服务端没同步时本机照样算撤销（`remoteRevoked=false`） |
+| 16 | P8 / P9 刷新 | 控制器的 StateFlow（信令回调里推进） | `GET /api/shares` 每 2 s 轮询（分享不在 `/api/state`），离开两页就停；状态行的「等待 → 传输中 → 已结束」都靠它 |
+| 17 | P4「…」 | 菜单：公开 / 取消公开 + 分享链接 | 菜单只有「分享链接」：单文件限速在页内（第 11 条），公开 / 取消公开 Windows 未实现（§9） |
 
 ## 9. 当前限制
 
@@ -488,24 +533,28 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
    要重启进程才生效（页面显示「重启后生效」）；pages.dev 不可达时注册会失败，局域网不受影响。
 8. **无鉴权**：daemon 只监听 127.0.0.1，本机任何进程都能调它的 API。M1 接受这个前提。
 
-9. **链接分享没有页面入口**：daemon 的四条 `/api/shares` 端点、WebRTC 发送端与验收都已就位（§3.4），
-   但 `windows/resources/web/` 本轮没加元素。要分享只能用 API / 脚本；界面接线留给 P9 / P8 那一轮。
-   页面接上之前，绿色版里 `GET /api/shares` 的 `available` 已经验过（精简 runtime 能加载 WebRTC 原生库）。
+9. **链接分享已接页面，但仍是「分享者必须在线」的直连**：P8 / P9 的入口、二维码、撤销都通了（§3.4），
+   边界沿用设计口径 —— 同时 1 个访客、没有 TURN（对称 NAT 下显示「无法直连」）、接收页单文件上限 1 GiB、
+   daemon 退出后链接变 offline。另外两处 Windows 未做：P8 没有 Android 的一次性 toast
+   （「对方可见你的网络地址」，需要的话是一次 toast + localStorage 标记，不影响其它状态）；
+   P4「…」里没有「公开 / 取消公开」两项（公开条目目前从磁力导入，见 §8 第 17 条）。
 
 ## 10. 体积
 
 | 项 | 字节 |
 | --- | --- |
-| `index.html` | 947 |
+| `index.html` | 984 |
 | `css/tokens.css` | 2,573 |
-| `css/app.css` | 17,667 |
-| `js/data.js` | 22,377 |
-| `js/app.js` | 55,522 |
-| **页面资源合计** | **99,086**（预算 200 KB） |
-| `Huchuan.exe` | 402,432（WebView2 运行时是系统组件，不在 exe 内） |
-| `daemon.jar` | 18,045,580（含 core、libtorrent4j 的 x86_64 dll、WebRTC 原生包、jmdns、上面这份页面） |
+| `css/app.css` | 21,674 |
+| `js/data.js` | 28,800 |
+| `js/qrcode.js` | 15,916 |
+| `js/app.js` | 73,416 |
+| **页面资源合计** | **143,363**（140.0 KiB，预算 200 KB） |
+| `Huchuan.exe` | 446,976（WebView2 运行时是系统组件，不在 exe 内） |
+| `daemon.jar` | 18,058,923（含 core、libtorrent4j 的 x86_64 dll、WebRTC 原生包、jmdns、上面这份页面） |
 | `runtime/`（jlink） | 28,766,257（27.43 MiB，模块 `java.base,java.logging,java.net.http,jdk.crypto.ec`） |
-| **`dist/Huchuan` 合计** | **47,214,269**（45.03 MiB，拷走就能跑，目标机不用装 Java） |
+| **`dist/Huchuan` 合计** | **47,272,156**（45.08 MiB，按当前 exe + jar + runtime 相加；`dist/` 里还是 11-06 打的那份，本轮没重打） |
 
 2026-11-07 读数：链接分享把 webrtc-java 1.0.0 的原生包（DLL 22.8 MB）打进 jar，daemon.jar 从 8.1 MiB
-涨到 17.21 MiB；runtime 因为 `java.net.http` 多 0.55 MiB。页面资源本身没变（96.7 KiB）。
+涨到 17.22 MiB；runtime 因为 `java.net.http` 多 0.55 MiB。页面这一轮为 P8 / P9 增加了 `qrcode.js`
+（15.9 KB）与分享页样式、数据接口，页面资源从 96.7 KiB 涨到 140.0 KiB。

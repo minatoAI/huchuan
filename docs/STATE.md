@@ -54,7 +54,8 @@
 （无。目标项全部落地，见下）
 
 ## 已完成
-- 链接分享（W1 接收页 / 内核 link 层 / Android P8+P9 / Windows daemon 适配）→ 两端 8 MiB 端到端、浏览器独立 SHA 一致；线上发版待 wrangler 重新授权
+- 链接分享（W1 接收页 / 内核 link 层 / Android P8+P9 / Windows daemon 适配）→ 两端 8 MiB 端到端、浏览器独立 SHA 一致；挂机 10 分钟仍可接收（11 次采样）；线上发版待 wrangler 重新授权
+- 分享者等待预算与访客建链预算分离（core fbd24a2）；链接分享断言 78→119
 - 系统分享入口（ACTION_SEND）→ 真机六格；设计稿的透明 Activity 方案被真机推翻，改挂 MainActivity
 - 跨网窗口（UPnP/NAT-PMP）→ 44 条断言，本机实测映射成功
 - E2E 公开种子端到端 → A 发布 32 MiB、B 纯磁力经 pubBtPort 取元数据并下载、SHA 一致；变异 16 条红（manager 复跑 PASS/FAIL）

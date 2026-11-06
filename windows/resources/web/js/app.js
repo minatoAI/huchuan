@@ -154,6 +154,7 @@ const COPY = {
   p9_revoke: '撤销',
   p9_revoke_title: '撤销分享',
   p9_revoke_confirm: '撤销后这条链接立即失效',
+  p9_revoke_failed: '撤销失败',
   p9_cancel: '取消',
 
   // 通用
@@ -1309,14 +1310,14 @@ function shareTerminal(share) {
 }
 
 /** 创建 / 撤销失败的 code → 一句话；不认识的码也不把 daemon 的英文原因甩到界面上。 */
-function shareFailureLabel(code) {
+function shareFailureLabel(code, fallback) {
   if (code === 'E_LINK_UNAVAILABLE') return COPY.p8_not_configured;
   if (code === 'E_LINK_REGISTRY') return COPY.p8_server_unreachable;
   if (code === 'E_LINK_TOO_MANY') return COPY.p8_too_many;
   if (code === 'E_NO_LOCAL_FILE') return COPY.p8_no_local;
   if (code === 'E_FILE_CHANGED') return COPY.p8_file_changed;
   if (code === 'E_NO_FILE') return COPY.p8_no_file;
-  return COPY.p8_create_failed;
+  return fallback || COPY.p8_create_failed;
 }
 
 /**
@@ -1331,7 +1332,7 @@ function viewShare() {
     const link = share.link || share.qrText;
     const revoked = share.status === ShareStatus.REVOKED;
     const transfer = share.status === ShareStatus.TRANSFERRING;
-    const qr = revoked ? '' : QRCode.svg(share.qrText || link);
+    const qr = !revoked && (share.qrText || link) ? QRCode.svg(share.qrText || link) : '';
 
     body =
       (qr ? '<div class="qr-box">' + qr + '</div>' : '') +
@@ -1490,7 +1491,7 @@ function confirmRevokeShare() {
     State.revokeError = '';
     render();
   }, function (error) {
-    State.revokeError = shareFailureLabel(error && error.code);
+    State.revokeError = shareFailureLabel(error && error.code, COPY.p9_revoke_failed);
     render();
   });
 }
