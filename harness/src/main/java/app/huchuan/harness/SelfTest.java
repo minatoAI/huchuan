@@ -71,6 +71,7 @@ public final class SelfTest {
             tracker();
             crossNet();
             crossNetWindow();
+            linkShare();
             signBytes();
             json();
             framing();
@@ -124,6 +125,14 @@ public final class SelfTest {
      */
     private static void crossNetWindow() {
         CrossNetWindowSelfTest.run(SelfTest::check);
+    }
+
+    /**
+     * 链接分享的服务端交互层：分享登记 / 撤销 / 列表 + 信令状态机 + 断线重连 + 超时。
+     * 装置是本机 mock HTTP+WS（[MockLinkServer]），不跑 WebRTC；断言全在 [LinkSelfTest] 里。
+     */
+    private static void linkShare() {
+        LinkSelfTest.run(SelfTest::check);
     }
 
     private static void check(String name, boolean ok) {

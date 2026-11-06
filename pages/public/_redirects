@@ -1,0 +1,5 @@
+# 链接分享接收页（W1）：/r/<shareId> 与 /#s=<token> 都落到同一张静态页。
+# token 只在 fragment 里，不随请求发出；路由不认 token，只认路径形状。
+# 目标写成目录而不是 *.html：Pages 会把 /x/index.html 归一成 /x/，写成 .html 会被判成环并忽略。
+/r/*  /recv/  200
+/     /recv/  200

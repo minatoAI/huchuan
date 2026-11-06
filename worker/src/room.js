@@ -47,7 +47,12 @@ export class SignalRoom {
     const client = pair[0];
     const server = pair[1];
 
-    if (role === "guest" && this.state.getWebSockets("guest").length >= SIGNAL_ROOM_MAX_GUESTS) {
+    if (role === "guest") {
+      // 同一个页面重连（ep 不变）时接管旧 socket：否则「最多 1 个访客」会把重连挡在门外。
+      this.takeover(request.headers.get("x-huchuan-ep") || "");
+    }
+
+    if (role === "guest" && this.guestsInRoom().length >= SIGNAL_ROOM_MAX_GUESTS) {
       // 房间最多 1 个访客：多余的连接当场拒绝（link-share.md §12-3）
       this.state.acceptWebSocket(server, ["guest"]);
       server.serializeAttachment({ role: "guest", joined: false, visitorId: null });
@@ -59,6 +64,7 @@ export class SignalRoom {
     this.state.acceptWebSocket(server, [role]);
     if (role === "sharer") {
       server.serializeAttachment({ role: "sharer", dev: request.headers.get("x-huchuan-dev") || "", joined: true });
+      this.replayIncoming(server, meta);
     } else {
       server.serializeAttachment({ role: "guest", ep: request.headers.get("x-huchuan-ep") || "", joined: false, visitorId: null });
     }
@@ -67,6 +73,45 @@ export class SignalRoom {
 
   async meta() {
     return (await this.storage.get("meta")) || null;
+  }
+
+  /** 房间里的访客（不含已被同一 ep 新连接接管的旧 socket）。 */
+  guestsInRoom() {
+    return this.state.getWebSockets("guest").filter((ws) => !(ws.deserializeAttachment() || {}).replaced);
+  }
+
+  /**
+   * 接管：同一 ep 的访客又连上来（浏览器重连），旧 socket 让位，不占名额也不吃 join 限速。
+   * 旧 socket 的 attachment 先标记 replaced，getWebSockets 里就立刻不算它了——
+   * 不依赖 close() 何时从 getWebSockets 消失。
+   */
+  takeover(ep) {
+    if (!ep) return;
+    for (const guest of this.state.getWebSockets("guest")) {
+      const attachment = guest.deserializeAttachment() || {};
+      if (attachment.ep !== ep || attachment.replaced) continue;
+      guest.serializeAttachment({ ...attachment, joined: false, replaced: true });
+      this.shutdown(guest, 4006, "replaced");
+    }
+  }
+
+  /**
+   * 分享者（重）连上时，把已经在等的访客再报一遍。
+   * 房间不保存 offer，但访客的 joined 状态在 attachment 里，所以重放不需要访客重新 join
+   * （spike 记的缺口：分享者断线重连后访客收不到 share-incoming）。
+   */
+  replayIncoming(socket, meta) {
+    for (const guest of this.state.getWebSockets("guest")) {
+      const attachment = guest.deserializeAttachment() || {};
+      if (!attachment.joined) continue;
+      this.send(socket, {
+        t: "share-incoming",
+        shareId: (meta && meta.shareId) || "",
+        visitorId: attachment.visitorId,
+        epPub: attachment.epPub || null,
+        resumed: true,
+      });
+    }
   }
 
   async loadMeta(request) {
@@ -179,6 +224,9 @@ export class SignalRoom {
     const meta = await this.meta();
     if (meta && meta.revoked) return;
     if (attachment.role === "sharer") {
+      // 分享者刚重连、旧 socket 才断的情况：还有别的分享者在线就不是 peer-left
+      const others = this.state.getWebSockets("sharer").filter((socket) => socket !== ws);
+      if (others.length > 0) return;
       for (const guest of this.state.getWebSockets("guest")) {
         this.send(guest, { t: "bye", code: "peer-left" });
       }

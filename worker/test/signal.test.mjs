@@ -285,6 +285,88 @@ test("撤销之后过期的分享，/signal 一律 410", async () => {
   }
 });
 
+test("分享者断线重连：房间重放 share-incoming，访客不用重新 join", async () => {
+  const identity = await createIdentity();
+  const env = createTestEnv(workerModule);
+  const ctx = createCtx();
+  const { token, shareId } = await newShare(env, identity);
+
+  const firstSharer = (await openSharer(env, ctx, shareId, identity)).webSocket;
+  const guest = (await openGuest(env, ctx, shareId, "guestpage1")).webSocket;
+  await joinRoom(guest, token);
+  const joined = await guest.nextJson();
+  assert.equal(joined.t, "joined");
+  const firstIncoming = await firstSharer.nextJson();
+  assert.equal(firstIncoming.t, "share-incoming");
+
+  firstSharer.close();
+  await settle(env);
+  const left = await guest.nextJson();
+  assert.deepEqual(left, { t: "bye", code: "peer-left" }, "访客先收到 peer-left");
+
+  // 分享者换一条 socket 回来：房间把还在等的访客重放给新的分享者
+  const secondSharer = (await openSharer(env, ctx, shareId, identity)).webSocket;
+  const replay = await secondSharer.nextJson();
+  assert.equal(replay.t, "share-incoming");
+  assert.equal(replay.visitorId, joined.visitorId, "重放的是同一个访客");
+  assert.equal(replay.resumed, true);
+
+  // 访客仍在房间里，新 offer 直接可达，不需要再发 share-join
+  secondSharer.send(JSON.stringify({ t: "offer", sdp: "v=0 resumed offer", sig: "ab" }));
+  const offer = await guest.nextJson();
+  assert.equal(offer.t, "offer");
+  assert.equal(offer.sdp, "v=0 resumed offer");
+});
+
+test("同一 ep 的访客重连：接管旧 socket，不占「最多 1 个访客」的名额", async () => {
+  const identity = await createIdentity();
+  const env = createTestEnv(workerModule);
+  const ctx = createCtx();
+  const { token, shareId } = await newShare(env, identity);
+
+  const sharer = (await openSharer(env, ctx, shareId, identity)).webSocket;
+  const firstGuest = (await openGuest(env, ctx, shareId, "guestpage1")).webSocket;
+  await joinRoom(firstGuest, token);
+  const firstJoined = await firstGuest.nextJson();
+  await sharer.nextJson();
+
+  // 同一个 ep 再连一次（浏览器断线重连），不能因为名额被自己的旧 socket 占着而拿到 busy
+  const resumedResponse = await openGuest(env, ctx, shareId, "guestpage1");
+  assert.equal(resumedResponse.status, 101);
+  const resumedGuest = resumedResponse.webSocket;
+  assert.equal((await firstGuest.closed()).code, 4006, "旧 socket 被接管");
+
+  await joinRoom(resumedGuest, token);
+  const resumedJoined = await resumedGuest.nextJson();
+  assert.equal(resumedJoined.t, "joined");
+  assert.equal(typeof resumedJoined.visitorId, "string");
+
+  const incoming = await sharer.nextJson();
+  assert.equal(incoming.t, "share-incoming");
+  assert.equal(incoming.visitorId, resumedJoined.visitorId);
+  assert.notEqual(resumedJoined.visitorId, firstJoined.visitorId);
+});
+
+test("分享者换连接后，旧 socket 关闭不再误发 peer-left", async () => {
+  const identity = await createIdentity();
+  const env = createTestEnv(workerModule);
+  const ctx = createCtx();
+  const { token, shareId } = await newShare(env, identity);
+
+  const firstSharer = (await openSharer(env, ctx, shareId, identity)).webSocket;
+  const guest = (await openGuest(env, ctx, shareId, "guestpage1")).webSocket;
+  await joinRoom(guest, token);
+  await guest.nextJson();
+  await firstSharer.nextJson();
+
+  const secondSharer = (await openSharer(env, ctx, shareId, identity)).webSocket;
+  assert.equal((await secondSharer.nextJson()).t, "share-incoming");
+
+  firstSharer.close();
+  await settle(env);
+  await assert.rejects(() => guest.next(300), /timeout/, "还有分享者在线时不该发 peer-left");
+});
+
 /** 数一数分享者在这条 socket 上收到了几个 share-incoming（不阻塞） */
 async function countIncoming(socket) {
   let count = 0;

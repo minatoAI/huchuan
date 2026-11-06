@@ -204,4 +204,12 @@ object Domains {
     const val CHECK = "huchuan/chk1/v1"
     const val GROUP = "huchuan/group1/v1"
     const val GROUP_HASH = "huchuan/gh1/v1"
+
+    // 链接分享（docs/design/link-share.md §5–§6）。三个 domain 与 worker/src/{signal,share}.js 逐字一致：
+    //   ws     签名 WS 分享者查询串 [deviceId, nonce, ts]
+    //   share  签名 offer [token, dtlsFp, expiresAt]
+    //   revoke 签名撤销 [deviceId, token, ts, nonce]
+    const val LINK_WS = "huchuan/ws1/v1"
+    const val LINK_SHARE = "huchuan/share1/v1"
+    const val LINK_REVOKE = "huchuan/revoke1/v1"
 }

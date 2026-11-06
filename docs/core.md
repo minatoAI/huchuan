@@ -1,7 +1,8 @@
 # core/ · M1 内核（无 UI）
 
-- 版本：2026-11-06 · 内核 agent · 对应协议 v0（docs/design/protocol.md，唯一事实源）
+- 版本：2026-11-07 · 内核 agent · 对应协议 v0（docs/design/protocol.md，唯一事实源）
 - 状态：**M1 全流程在桌面 JVM 上用两个独立进程跑通**（建群 → 后 8 位加入 → 32 MiB 共享/下载/SHA 一致 → 评论 3 s 内入库 → 全程 dht_nodes=0）
+- 本轮（链接分享服务端交互层）：新增 `core/.../link/` 包（`app.huchuan.core.link`）—— `ShareRegistry`（创建 / 列出 / 查询 / 撤销，HttpURLConnection + 内核自带 Json，不引新依赖）、`SignalClient`（`/signal` 信令房间与 idle → signaling → connected → transferring → done/failed 状态机）、`Transport` 抽象（open/send/close/onMessage，core 不依赖 java.net.http，桌面与 Android 各自注入）。建链预算 15 s、传输空闲 90 s、断线按 1/2/4/8/16 s（30 s 封顶）重新 join。**WebRTC 实现不在 core**，本层只到 SDP/ICE 收发；harness 用本机 mock HTTP+WS 跑 78 条断言。接口、口径与验收见 §3.11
 - 本轮（告警线程 NPE）：修掉「公开会话开 DHT、导入磁力约 2 分钟后进程死在 `SessionManager-alertsLoop`」的致命崩溃。根因是**版本错配**：我们自编的 arm64 `.so`（libtorrent RC_2_1 head）报 `num_alert_types=108`，而 libtorrent4j-2.1.0-39 的 `AlertType` 映射表只填到 104 —— 105/106/107 三个槽是 null，其中 107 `ip_ban_alert`（`ip_block` 类）正是 DHT 探测流量会触发的那条，`AlertType.fromSwig` 返回 null 后在 `switch` 里取 `ordinal()` 直接 NPE。修法是在建会话前用反射把 null 槽补成 `AlertType.UNKNOWN`（只跳过真正未知的类型，已知类型一个不动）+ 公开会话 `alert_mask` 收窄到 `status|error|storage|port_mapping`（不订 `ip_block`）。**这是规避不是根治**，根治要换 .so 或升依赖。真机 MIX 2S 跑满 6 分钟存活、无 FATAL、crash=0、补表日志 `filled=105,106,107`。详见 §3.8
 - 上一轮（M1.7 跨网 BT 可达性）：修掉「ip_filter 只放行私网 → 公网 peer 被我们自己拒掉」的硬阻塞（AGENTS §9）。私有会话的 ip_filter 改成**动态白名单**：基础私网段 + 消息层确认的群成员公网地址（`peer.announce.btHost`、tracker 候选、手动 IP:port、上次建链端点），运行期整份重建；成员离线不移除、端点被新 announce 替换或退群时撤销（理由见 §3.7）。同时按 public-swarm §4.1 给 `peer.announce` 补可选 `pubBtPort`（协议 §10），公开条目不再整轮跳过，改为对每个成员各拨一次公开会话端口（`sess=pub`）。harness 新增 `selftest.crossnet checks=58`，`bash scripts/m1-headless.sh` 全 PASS。接口与断言见 §3.7，口径表见 §6
 - 上一轮（M1.6 跨网发现）：内核接上自建 tracker（协议 §3.2）—— 建群 / 入群时登记 `groupHash20`，每群一条线程按**服务端下发的 interval**（默认 600 s、下限 300 s）announce；passkey 每小时轮换（`hex(HMAC-SHA256(kGrp, "huchuan/trk1/v1"‖gid‖小时整数))`），换小时先重新注册（带 `prevPasskey` 做连续性证明）再 announce；回来的 peers 进候选表，与 mDNS / 手动地址按 §3.4 合并去重、**优先级最低**（`CandidateMerge`）。配置项 `trackerBaseUrl` 为空 = 整个功能关闭：只失去跨网那一档，局域网照常，不报错、零请求。私有群的 infohash 仍然不进 DHT / PEX / LSD（协议 §8 不变），上报给 tracker 的只有伪 swarm 的 `groupHash20`；日志里 passkey 只留前 4 字符。接口与口径见 §3.5，常量见 §6
@@ -25,12 +26,12 @@ bash scripts/m1-headless.sh
 
 1. `./gradlew :core:jar :core:m1Deps :core:m1Native`（构建内核 + 拉依赖 + 解出 `libtorrent4j.dll`）
 2. `javac` 编译 harness（`harness/src/main/java`）
-3. 跑字节层自检 `SelfTest`（376 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃；**公开种子一组 99 条**（§3.6 / §3.9：公开会话 DHT 开 / 私有会话 DHT 关、端口 ≥ 6881、per-torrent flags 清零与 0x380000、公开拒 private 与私有拒 public、磁力加种落进公开会话、五种失败文案、同 infohash 两种 scope 正反两种顺序去重、13 条告警类型映射表补洞与公开会话 alert_mask 收窄（含 30 s 真会话 DHT 收告警 soak，见 §3.8），以及本节 §3.9 的 31 条发布 / 取消公开 / 重启隐藏断言）；**本轮新增跨网可达性一组 58 条**（§3.7：私网 / 公网 / 主机名的 IP 字面量分类与归一、真 BtSession 的动态 filter 真值、群知识四类来源并入 + 端点替换 / 退群撤销、pubBtPort 的 JSON 往返与签名域、两个真内核的 pubBtPort 广播 + 公开条目拨公开会话））
+3. 跑字节层自检 `SelfTest`（498 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃；**公开种子一组 99 条**（§3.6 / §3.9：公开会话 DHT 开 / 私有会话 DHT 关、端口 ≥ 6881、per-torrent flags 清零与 0x380000、公开拒 private 与私有拒 public、磁力加种落进公开会话、五种失败文案、同 infohash 两种 scope 正反两种顺序去重、13 条告警类型映射表补洞与公开会话 alert_mask 收窄（含 30 s 真会话 DHT 收告警 soak，见 §3.8），以及本节 §3.9 的 31 条发布 / 取消公开 / 重启隐藏断言）；**本轮新增跨网可达性一组 58 条**（§3.7：私网 / 公网 / 主机名的 IP 字面量分类与归一、真 BtSession 的动态 filter 真值、群知识四类来源并入 + 端点替换 / 退群撤销、pubBtPort 的 JSON 往返与签名域、两个真内核的 pubBtPort 广播 + 公开条目拨公开会话）；**本轮链接分享一组 78 条**（§3.11：注册表请求体 / 撤销签名 / 列表鉴权、mock WS 上的 idle→connected 状态机、断线重连、超时 FAILED、撤销后新访客 410））
 4. 起 A、B 两个 JVM 进程跑 M1 全流程，然后只用 grep 复核日志
 
 产物：`artifacts/m1/log-A.log`、`log-B.log`、`selftest.log`、`a-data/`、`b-data/`（含 `state.json`、`identity.txt`、`downloads/`）。`artifacts/` 不进版本库。
 
-一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **2 分 20 秒左右**（§3.8 的告警 soak 固定占 30 s）（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；跨网发现要起两个真内核 + 两个本机 mock tracker，~8 s；本轮跨网可达性自检要起一个 BtSession + 三个内核（含公开会话），~10 s）；脚本的 35 条 CHECK 全 PASS（自检 376 条另计，其中公开种子 99 条、跨网发现 68 条、跨网可达性 58 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
+一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **2 分 20 秒左右**（§3.8 的告警 soak 固定占 30 s）（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；跨网发现要起两个真内核 + 两个本机 mock tracker，~8 s；本轮跨网可达性自检要起一个 BtSession + 三个内核（含公开会话），~10 s）；脚本的 35 条 CHECK 全 PASS（自检 498 条另计，其中公开种子 99 条、跨网发现 68 条、跨网可达性 58 条、链接分享 78 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
 
 本轮新增的三条硬断言在 harness 里。`scripts/m1-headless.sh` 本轮不动，它仍然只看 harness 的退出码（`process.rc_0_0` / `catchup.process_rc_0_0_0`）：harness 判 FAIL 即整轮 FAIL，脚本输出里也有对应的证据行。
 
@@ -94,6 +95,15 @@ G1/G3/G4 的运行时验证不在这条脚本里（脚本本轮不动），用�
 | `LocalSession.kt` | 私有 / 公开两个会话共用的读口（含 `peerSnapshot` / `connectPeer`），配合 `M1Kernel.sessionOf` 让「这文件在本机走到哪了、该拨哪一套会话」只有一套读数 | — |
 | `IpAllowlist.kt` | ip_filter 动态白名单的纯函数口径：IP 字面量归一（去 `[]` / `%zone`，主机名不收）、私网段判定、公网候选筛选（排除回环 / CGNAT / 组播 / 保留段）、去重排序。SelfTest 直接钉住 | §8 · AGENTS §9 |
 | `EntryScope.kt` | 条目去重 `FileEntryMerge`：同一 infohash 同时存在 private 与 public 时只留 private（file.add 与 file.list 同一处） | 公开条目（public-swarm §1.1） |
+
+链接分享的服务端交互层另起一个包 `core/src/main/kotlin/app/huchuan/core/link/`（包名 `app.huchuan.core.link`），与 m1 内核解耦：只依赖身份签名、`Json` 与 JDK，不含 WebRTC，也不直接依赖 `java.net.http`。
+
+| 文件 | 职责 | 依据 |
+|---|---|---|
+| `LinkModel.kt` | `LinkRole` / `LinkState` / `LinkDefaults` / `LinkTimeouts` / `ShareFile` / `ShareEndpoint` / 三个结果类型 / `LinkEvents` / `LinkProtocol`（token、Base32、URL、SDP 指纹、三个签名域字段） | link-share.md §5 §6 |
+| `Transport.kt` | `Transport`（open/send/close/onMessage）与 `TransportFactory`；桌面 / Android / harness 各自实现，core 只认接口 | spike §6 |
+| `ShareRegistry.kt` | `POST /api/share`、`GET /api/shares`、`GET /api/share/{token}`、`DELETE /api/share/{id}`；地址来自构造参数，空串回落到 `https://huchuan-a9f.pages.dev`，非法则 `enabled=false` | worker/src/share.js、link-share.md §6 §8 |
+| `SignalClient.kt` | 分享者 / 访客的 `/signal` 房间、offer/answer/ice/bye、15 s 建链预算、90 s 传输空闲、断线重连、访客 offer 验签（DTLS 指纹） | worker/src/signal.js、room.js、spike §4 |
 
 数据落在 `<dataDir>`：`identity.txt`（PKCS8 + X509 公钥）、`state.json`（群/成员/文件/评论/公钥）、`bt/`、`downloads/`；
 公开会话另有自己的目录 `public/data`（公开下载落盘）与 `public/meta/<infohash>.torrent`（元数据缓存），与 `bt/` 完全隔离。
@@ -889,6 +899,93 @@ magnet 的 `btih` 与新 infohash 一致；public 条目出现（scope=public、
 （core 里的默认关闭测试钩子 `-Dhuchuan.mutants=publish_private`），发布必然失败，脚本必须 `FAIL`。
 证据：`artifacts/e2e-public/log-A3.log` / `log-B3.log`；断言表见 `docs/reports/e2e-public.md`。
 
+### 3.11 链接分享服务端交互层（本轮 link/）
+
+**边界。** 这一层只做三件事：登记分享、撤销分享、交换信令。WebRTC（RTCPeerConnection / DataChannel / DTLS）由平台适配层提供；core 只通过 `Transport` 收发音令帧，代码里没有 `java.net.http`、OkHttp 或 WebRTC SDK。桌面与 Android 各自实现 `Transport` 并在构造 `SignalClient` 时注入；harness 的 `JavaWsTransport` 只是测试实现。
+
+**接口（Kotlin 写，Java 可直接调用；无 suspend、无默认参数依赖）**
+
+```kotlin
+val registry = ShareRegistry(identity, events)       // 默认 https://huchuan-a9f.pages.dev
+val created = registry.create(
+    listOf(ShareFile("file-id", "季度报告.pdf", 1024, "application/pdf")),
+    ttlSec = 7 * 24 * 3600,
+)
+created.ok; created.shareId; created.token; created.expiresAt
+created.link                                          // https://<域名>/#s=<26 字符>
+val listed = registry.list()                          // GET /api/shares?deviceId=
+val lookup = registry.get(created.token)              // 访客：available / offline / revoked / expired
+val revoked = registry.revoke(created.token, created.shareId)
+
+val sharer = SignalClient.forSharer(created.endpoint(), identity, transport, events, LinkTimeouts())
+sharer.start()
+sharer.sendOffer(sdpWithFingerprint)                  // 分享者：dtlsFp 从 SDP 自动提取并签名
+// 平台适配层：events.incoming -> 建 PeerConnection -> sendOffer；events.answer -> setRemoteDescription
+
+val guest = SignalClient.forGuest(lookup.endpoint(), null, transport, events, LinkTimeouts())
+guest.start()
+// events.offer -> setRemoteDescription + createAnswer -> guest.sendAnswer(answerSdp)
+guest.markTransferring()                              // DataChannel 打开
+guest.noteProgress()                                  // 每收到一块 / 一个 ack
+guest.finish()                                        // bye{done} -> DONE
+```
+
+`created.endpoint()` 只给分享者用（deviceId / pub 留空，身份由 `identity` 参数提供）；访客必须先用 `registry.get(token)` 拿 `pub`、`deviceId`、`expiresAt` 再 `endpoint()`，否则构造 `SignalClient(GUEST)` 会拒绝（没有公钥就验不了 offer）。
+
+**与 Worker 的字段对齐（代码是事实源：worker/src/share.js / signal.js / room.js）**
+
+| 面 | 客户端发送 | 说明 |
+|---|---|---|
+| 创建 | `POST /api/share` body `{token, deviceId, pub, files:[{name,size,mime}], ttlSec}` | token 客户端生成 26 字符；`fileId` 只留本机，不上线；ttl 夹到 [60, 604800] |
+| 列表 | `GET /api/shares?deviceId=` | 返回 `{shares:[...]}`；四态与过滤由 Worker 判 |
+| 查询 | `GET /api/share/{token}` | 访客拿 `{status, shareId, deviceId, pub, files, createdAt, expiresAt, visitCount}` |
+| 撤销 | `DELETE /api/share/{shareId 或 token}` body `{deviceId, token, ts, nonce, sig}` | `sig = signBytes("huchuan/revoke1/v1",[deviceId,token,ts,nonce])`，ts 为秒，±300 s |
+| 分享者 WS | `/signal?role=sharer&share=<shareId>&dev&ts&nonce&sig` | `sig = signBytes("huchuan/ws1/v1",[dev,nonce,ts])`；token **不进 URL** |
+| 访客 WS | `/signal?role=guest&share=<shareId>&ep=<16 字符>` | 匿名；连上后发 `share-join{token,epPub}` |
+| offer | `{t:"offer",sdp,sig}` | `sig = signBytes("huchuan/share1/v1",[token,dtlsFp,expiresAt])`；访客用注册表 pub 验 |
+| 其它帧 | `answer{sdp}` · `ice{candidate}` · `bye{code}` · `err{code}` | `share-incoming` 只服务端 → 分享者；`joined` 是访客配对成功 |
+
+**房间容量。** 同一分享同时只允许 1 个访客（link-share.md §12-3）。这是 Worker 房间的硬约束（`SIGNAL_ROOM_MAX_GUESTS=1`），客户端常量 `LinkDefaults.MAX_GUESTS=1` 只用于展示与断言；第二个访客会收到 `err{busy}`，`SignalClient` 归到 `busy` 失败，不会重连。
+
+**状态机与超时**
+
+| 从 → 到 | 触发 | 日志 / 事件 |
+|---|---|---|
+| IDLE → SIGNALING | `start()` / 重连尝试 | `link_state`、`link_connecting` |
+| SIGNALING → CONNECTED | 访客 `sendAnswer` 成功；分享者收到 `answer` | `link_connected` |
+| CONNECTED → TRANSFERRING | 平台调 `markTransferring()`（DataChannel 打开） | `link_transferring` |
+| TRANSFERRING → DONE | `finish()` 或收到 `bye{done}` | `link_done` |
+| 任意未终态 → FAILED | 15 s 信令预算超时、`err{...}`、撤销（`bye gone` / 410）、重连耗尽 | `link_timeout` / `link_failed` |
+| CONNECTED/TRANSFERRING → SIGNALING | 掉线（`bye{peer-left}` / 异常断开），`autoReconnect=true` | `link_reconnect` |
+
+- 建链预算 `LinkDefaults.SIGNAL_BUDGET_MS = 15_000`（§5-7）；从开始连接到 CONNECTED 一过就 `FAILED(connect-failed)`，这条路径不抛异常。
+- 传输空闲 `TRANSFER_IDLE_MS = 90_000`（§5-10）；`markTransferring()` 起算，`noteProgress()` 续期，超时 `FAILED(transfer-timeout)`。
+- 断线重连：Worker 不重放 `share-incoming`（spike §4），访客必须重开连接并重发 `share-join`。默认 1/2/4/8/16 s 退避（30 s 封顶、最多 5 次），可经 `LinkTimeouts` 改。分享者也重连（它不重连，访客回来也找不到房间）；分享者收到 `peer-left` 不重连自己，只回到等下一个访客的 SIGNALING。
+- 撤销：Worker 踢房间（`bye{gone}` / 新连接 HTTP 410）。已在传的字节由分享者本地关通道停掉；`SignalClient` 收到 410 / bye gone 一律 `FAILED(revoked)`，不再重连。
+
+**日志（可 grep）**
+
+`share_create` · `share_list` · `share_get` · `share_revoke` · `share_create_failed`；`link_start` · `link_open` · `link_send` · `link_recv` · `link_connected` · `link_state` · `link_reconnect` · `link_timeout` · `link_failed` · `link_close`。token 只打 `token_masked`（前 4 字符），SDP 只打 `sdp_bytes`，访客只打 `visitor` 前 8 位（§7）。
+
+**验收（harness `LinkSelfTest`，挂在 `SelfTest` 里，`bash scripts/m1-headless.sh` 会跑）**
+
+装置是本机 `MockLinkServer`：一个 ServerSocket 同时讲 HTTP 与 RFC 6455 WebSocket，按 worker 的语义校验分享签名、房间容量、撤销与 410。四组断言：
+
+1. 注册表：创建 / 列表 / 撤销的请求路径、body 字段、`content-type` 与撤销签名（用 `DeviceIdentity` 独立验，且换到 `share1` 域必须验不过）；撤销后列表不再返回、查询为 `revoked`。
+2. 信令：分享者带 `ws1` 签名连上（mock 验签），访客匿名连上；`share-incoming` → offer → answer 后两端都走完 `IDLE→SIGNALING→CONNECTED`；访客对 offer 的 `share1` 签名与 DTLS 指纹独立验一遍；随后进 `TRANSFERRING`。
+3. 断线：分享者关闭后访客进入重连并重新 join，回到 `CONNECTED`，`reconnectAttempts>=1`；新分享者重新带签名连上。
+4. 超时与撤销：不来的 `share-incoming` 在 250 ms 预算下 `FAILED(connect-failed)` 且不抛异常；撤销时房间里的两端都 `FAILED(revoked)`，新访客 HTTP 410、且没有发出 `share-join`。
+
+正向证据：`selftest.link checks=78 failures=0 requests=12 ws_upgrades=6 join_frames=2`；整轮 `selftest.checks=498 failures=0`。
+
+**未做 / 边界**
+
+- WebRTC 本身（PeerConnection、DataChannel、DTLS、ICE 选路、实际字节传输）不在 core，也不在本轮；`TRANSFERRING` 之后的字节路径由平台适配层负责。
+- 没有把 HTTP 也抽象成 Transport：`ShareRegistry` 直接用 `HttpURLConnection`（Android 26+ 与桌面都有）。如果 Android 侧实测被系统拦截，再抽 `HttpTransport`，本轮不做。
+- 本机分享记录（P9 的列表源）是宿主的持久化责任：`ShareRegistry.list()` 只用来对齐服务端撤销，不落盘。
+- mock 不是真 Worker：它复刻 `/api/share*` 与 `/signal` 的行为，用于客户端契约；Worker 自身的测试在 `worker/`（node --test），两边不互相替代。
+- `SignalClient` 只校验 offer 的签名与指纹；SDP 内容本身是平台适配层的输入，core 不解析。ICE 按非 trickle 设计与 SDP 一起发，`sendIce` 只用于补候选。
+
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。
@@ -910,6 +1007,7 @@ magnet 的 `btih` 与新 infohash 一致；public 条目出现（scope=public、
 | `huchuan-reconnect-dial` | 一条候选一个线程：TLS + hello 绑定，等 `isBound` 最多 6 s | 失败只影响这一条候选，退避由调度器统一记 |
 | `huchuan-crossnet` | 跨网分享窗口的**一次性**到期任务（调度器，不是轮询） | 只在窗口开着时存在，窗口一关就 shutdown；窗口没开时没有这条线程 |
 | `huchuan-tracker-<gid 前 4>` | 每个群一条：注册（小时轮换）→ announce → 券商候选；睡到「服务端 interval」与「本小时结束」里更早的那个 | 睡得分段（500 ms 一步），内核一关 ≈0.5 s 内退出；只在 `trackerBaseUrl` 非空时存在 |
+| `huchuan-link-<shareId 前 6>` | 每条 `SignalClient` 一条：信令状态机、超时与重连计时；Transport 回调只投递任务 | 只在有链接分享 / 取件时存在；`close()` 即 shutdown；与 m1 内核线程互不共享状态 |
 | 调用方线程 | `createGroup`/`addFile`/`comment` 同步执行 | `joinByTail8` 阻塞；`kernel.close()` 里会等最多 2 s 把 `event=stopped` 发出去 |
 
 群内状态用 `GroupRuntime` 内部的锁保护；跨群/公钥/持久化用 kernel 的 `stateLock`。
@@ -926,6 +1024,8 @@ magnet 的 `btih` 与新 infohash 一致；public 条目出现（scope=public、
 | slf4j-nop | `org.slf4j:slf4j-nop:2.0.7` | 只进 `m1Libs`（压掉 JmDNS 的 no-provider 提示） |
 
 版本全部写进 `gradle/libs.versions.toml`。`:core` 里另建了可解析配置 `m1Libs` 与任务 `m1Deps`/`m1Native`，保证桌面制品不进 `:app`；`:app:assembleDebug` 仍通过（12.0 MB）。
+
+链接分享（§3.11）**不新增依赖**：JSON 用内核自己的 `Json`，HTTP 用 `HttpURLConnection`（Android 26+ 与桌面 JDK 都有），WebSocket 由调用方注入 `Transport`。因此 `:core` 的依赖表与上一轮相同；harness 的 `JavaWsTransport` 用 JDK `java.net.http`，只在测试 classpath 上。
 
 ## 6. 协议实现对照（M1 15 个消息）
 
@@ -1028,7 +1128,10 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 - **「公开到群外」发布要对源文件做一次全量哈希。** 新建 private=0 的 infohash 必然要重算 piece，这一步省不掉；`SEED_MODE` 只免掉 libtorrent 加种时的**第二次**全量校验。`PublicBtSession` 里没有磁盘预算 / 进度事件，10 GB 级文件的发布会阻塞调用线程直到建种完成，宿主需要自己放到工作线程并显示「发布中」（UI 接线时处理）。
 - **取消公开是本地隐藏，不是群删除。** `unpublishPublic` 不广播 `file.del`（M2 才有），其他成员仍看得到这条公开条目；本机靠 `state.json` 的 `hidden` 在 `file.add` / `file.list` 入口丢弃同一 fileId，重启后仍然隐藏。`hidden` 目前没有上限（公开条目由用户逐个移除，规模与群文件上限 256 同阶），也没有「屏蔽 infohash」的 LRU（public-swarm §5.2 的另一半，未做）。
 - **公开会话与私有会话各占一份限速预算。** `upload_rate_limit` / `download_rate_limit` 是会话级的，libtorrent 没有跨会话共享令牌桶（pub2 §7.2 裁决 3）：设 512 KB/s 时最坏总峰值 2×。公开会话的 `setSessionUploadLimit` / `setSessionDownloadLimit` 与私有侧各自封顶。
-- **`app/` 与 `daemon/` 还没接 G1/G3/G4。** core 侧接口与落盘都已就绪（§3.1 有签名），UI 上这三块空白要等下一轮接线。
+- **链接分享只到信令层。** core 的 `link/` 没有 WebRTC：DataChannel、DTLS、ICE 选路与实际字节传输由平台适配层实现；`TRANSFERRING` 之后 core 只提供 `noteProgress` / `finish` / `abort` 三个口。桌面与 Android 的 `Transport` 实现本轮都没有进 core（harness 只有 `JavaWsTransport`），真机与真 Worker 的端到端验收未做。
+- **链接分享的 HTTP 没有 Transport 抽象。** `ShareRegistry` 直接持 `HttpURLConnection`；如果 Android 侧被系统策略拦住，或者要换 OkHttp，需要再抽 `HttpTransport`（本轮按「不引依赖」保持现状）。
+- **链接分享的本机列表不落盘。** `ShareRegistry.list()` 只用于把服务端 `revoked` 对齐回本机；P9 的记录、20 条上限与过期清理是宿主的持久化责任，core 不写 `state.json`。
+- **链接分享的 mock 不是真 Worker。** `MockLinkServer` 复刻的是 `/api/share*` 与 `/signal` 的客户端契约（签名、房间容量、撤销、410）；Worker 自身行为由 `worker/` 的 node --test 覆盖。两边不互相替代，也不证明真 pages.dev 部署可用。
 
 ## 10. 下一步
 
@@ -1039,4 +1142,5 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 3. 跨网接线：`daemon/` 把 `trackerBaseUrl` 从配置（daemon 自己的设置落盘处）读出来交给 `M1Kernel`（`app/` 已完成，见 `docs/reports/tracker-wiring.md`）；然后把拨号器从 `PeerReconnector` 里拆出来，让运行中的群也能按 tracker 的 peers 立刻重拨（本轮只喂候选表）。
 4. M2 剩余：换码换钥 group.rotate、删除（log.del/file.del）、可达性分层（`docs/design/nat-traversal.md` §8 的阶梯）。私有侧 magnet 加种明确不做（私有群只走消息层分发的种子）。
 5. 公开种子接 UI（另派）：P3 行「公开」chip、P3「导入磁力」弹层、P4「公开到群外」/「移除」+ 本地 infohash 屏蔽；内核侧 `addPublicMagnet`（§3.6）、`publishPublic` / `unpublishPublic`（§3.9）、`GroupFile.scope` / `GroupFile.magnet` / `file_scope_dedup` 已就绪，`peer.announce.pubBtPort` 与「公开条目对每个成员各拨一次」已接（§3.7）。剩下的是 UI 接线、真机 / 群外设备验收，以及发布时的「建种中」进度提示（10 GB 级文件会阻塞到哈希完成，见 §9）。
+5. 链接分享接平台适配层：桌面 / Android 各自实现 `Transport`（WebSocket）与 WebRTC（PeerConnection / DataChannel），P8 / P9 / W1 接 `ShareRegistry` / `SignalClient`；用真 Worker（pages.dev）和两台真机跑一次「扫码 → 直连 → 1 GiB」验收，补上本轮 mock 覆盖不到的真 NAT / DTLS 路径（§3.11）。
 5. 协议修订：把 §7 剩下没写死的地方（第 1 条的 hello 两阶段、第 5 条的多群 hello）写进协议，否则第三方实现没法互通；§7 的 2/3/4 已按 §10 实现完，protocol.md §13 的第 2/3/4 行可以结案（该表归设计 agent 维护，本轮未改）。
