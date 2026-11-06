@@ -6,7 +6,8 @@
 #   bash scripts/build-windows.sh --clean         先清掉 windows/build
 #
 # 产物：windows/build/Huchuan.exe（绿色版：旁边不需要 dll、不写注册表）
-# 证据：artifacts/windows/ui/（冷启动 + P0 三态 + P1–P7 + 深色，共 16 张）、index.json、build-report.md
+# 证据：artifacts/windows/ui/（门禁 16 张：冷启动 + P0 三态 + P1–P7 + 深色；
+#       另加公开种子 3 张：P3 公开行 / P4 公开条目 / 磁力弹层）、index.json、public-index.json、build-report.md
 #
 # 截图走 Huchuan.exe --shot=<png> 的离屏渲染（WebView2 CapturePreview），不抓屏：
 # 桌面会话不渲染（远程断开、显示器关闭、显示模式变化）时整屏 GDI 抓图只有一种颜色，
@@ -234,8 +235,31 @@ if [ "$EVIDENCE" = "1" ]; then
   curl -s -X POST -H 'Content-Type: application/json' \
     --data-binary "@$(winpath "$DEMO_DIR/comment.json")" \
     "http://127.0.0.1:47200/api/groups/$DEMO_GID/files/$DEMO_FID/comments" > /dev/null
+  # 公开种子补充图的料：随机 infohash + timeoutMs=0 —— 没有来源，条目照样建好，
+  # scope=public / sizeKnown=false，界面显示「公开 + 等待来源」（public-swarm §3.1）。
+  DEMO_HASH=$(head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  printf '{"magnet":"magnet:?xt=urn:btih:%s&dn=public-demo","name":"远山 4K.mp4","timeoutMs":0}' \
+    "$DEMO_HASH" > "$DEMO_DIR/magnet.json"
+  MAGNET_RESP=$(curl -s -m 30 -X POST -H 'Content-Type: application/json' \
+    --data-binary "@$(winpath "$DEMO_DIR/magnet.json")" \
+    "http://127.0.0.1:47200/api/groups/$DEMO_GID/files/import-magnet")
+  printf '%s' "$MAGNET_RESP" | grep -q "\"fileId\":\"$DEMO_HASH\"" \
+    || die "取证 daemon 磁力导入失败：$MAGNET_RESP"
+  DEMO_PUB_FID="$DEMO_HASH"
+  PUBLIC_READY=""
+  for _ in $(seq 1 20); do
+    PUB_FILE=$(curl -s -m 2 "http://127.0.0.1:47200/api/groups/$DEMO_GID/files/$DEMO_PUB_FID" 2>/dev/null || true)
+    if printf '%s' "$PUB_FILE" | grep -q '"scope":"public"' && \
+       printf '%s' "$PUB_FILE" | grep -q '"sizeKnown":false'; then
+      PUBLIC_READY=1
+      break
+    fi
+    sleep 0.25
+  done
+  [ -n "$PUBLIC_READY" ] \
+    || die "公开条目没有按 scope=public / sizeKnown=false 出现（fid=$DEMO_PUB_FID）：$PUB_FILE"
   [ -n "$DEMO_GID" ] && [ -n "$DEMO_FID" ] || die "取证 daemon 没建出群或文件"
-  ok "取证 daemon 就绪：群 $DEMO_GID 文件 $DEMO_FID"
+  ok "取证 daemon 就绪：群 $DEMO_GID 私有文件 $DEMO_FID 公开条目 $DEMO_PUB_FID"
 
   step "逐页离屏截图取证（冷启动 + P0 三态 + P1–P7 + 深色）"
   rm -rf "$ART/ui"                     # 先清旧的，避免失败时留着上次的截图冒充本次
@@ -260,9 +284,72 @@ if [ "$EVIDENCE" = "1" ]; then
   [ "$MODE" = "offscreen" ] || die "index.json 里没有离屏截图标记（mode=${MODE:-缺失}），这批截图不是 --shot 出的"
   [ "$FAILED" = "0" ] || die "有 ${FAILED:-?} 张截图没通过 DOM / 像素断言（见 artifacts/windows/ui/index.json）"
   cp "$ART/ui/p2-home.png" "$ART/huchuan-window.png"
-  ok "离屏截图 $SHOTS 张：artifacts/windows/ui（每张都断言了页名 + 页面文案 + 明暗底色）"
+  ok "离屏截图 $SHOTS 张（门禁）：artifacts/windows/ui（每张都断言了页名 + 页面文案 + 明暗底色）"
   if [ "$GDI_SHOTS" != "0" ]; then ok "另有 $GDI_SHOTS 张 GDI 兜底诊断图（*.gdi.png，不进判据）"; fi
   ok "首页截图：artifacts/windows/huchuan-window.png"
+
+  # --------------------------------------------- 5b. 公开种子补充证据（3 张）
+  # 不挤进 16 张主门禁：同一套离屏截图 + DOM/像素断言，任务表与索引单独一份。
+  # p3-magnet / p4-public 是取证别名（落 P3/P4，再打开磁力输入 / 选中公开条目），
+  # 页面名仍是 p3 / p4，见 docs/windows-ui.md §1.3。
+  step "公开种子补充截图（P3 公开行 / P4 公开条目 / 磁力弹层）"
+  PUBLIC_JOBS="$ART/ui/public-capture-jobs.json"
+  cat > "$PUBLIC_JOBS" <<'JOBS'
+{
+  "note": "公开种子的三张补充证据，与 16 张门禁同一套离屏截图 + DOM/像素断言，索引单独一份（public-index.json）。数据来自 scripts/build-windows.sh 起的取证 daemon：除私有文件外还有一条随机 infohash、无来源的公开条目（scope=public、sizeKnown=false）。p4-public 走 ?route=p4-public（落 P4 并选中第一条公开条目），p3-magnet 走 ?route=p3-magnet（落 P3 并打开「磁力链接」输入）。",
+  "jobs": [
+    {
+      "name": "p3-public",
+      "route": "p3",
+      "theme": "light",
+      "page": "p3",
+      "expect": "等待来源",
+      "shotDelayMs": 2200,
+      "describe": "P3 公开行：「公开」chip 在状态 chip 左侧；元数据未到时状态为「等待来源」，尺寸不写 0 B"
+    },
+    {
+      "name": "p4-public",
+      "route": "p4-public",
+      "theme": "light",
+      "page": "p4",
+      "expect": "移除",
+      "shotDelayMs": 2200,
+      "describe": "P4 公开条目：公开 chip + 磁力摘要（点按复制）+「移除」"
+    },
+    {
+      "name": "p3-magnet",
+      "route": "p3-magnet",
+      "theme": "light",
+      "page": "p3",
+      "expect": "导入",
+      "shotDelayMs": 2200,
+      "describe": "P3「添加文件」弹层 · 磁力链接：输入框 + 导入（同一弹层的另一项是「本机文件」）"
+    }
+  ]
+}
+JOBS
+  if ! powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$EVID_PS" \
+        -ExePath "$(winpath "$EXE")" -OutDir "$(winpath "$ART/ui")" \
+        -JobsPath "$(winpath "$PUBLIC_JOBS")" \
+        -IndexName public-index.json -NoGdiFallback >"$ART/ui/public-capture.stdout.log" 2>&1; then
+    tail -n 25 "$ART/ui/public-capture.stdout.log" >&2
+    die "公开种子补充截图失败（完整日志：artifacts/windows/ui/public-capture.stdout.log）"
+  fi
+  PUBLIC_INDEX="$ART/ui/public-index.json"
+  PUBLIC_FAILED=$(tr -d '\r' < "$PUBLIC_INDEX" | sed -n 's/.*"failed": *\([0-9]*\).*/\1/p' | head -n1)
+  PUBLIC_MODE=$(tr -d '\r' < "$PUBLIC_INDEX" | sed -n 's/.*"mode": *"\([a-z]*\)".*/\1/p' | head -n1)
+  PUBLIC_SHOTS=$(tr -d '\r' < "$PUBLIC_INDEX" | sed -n 's/.*"count": *\([0-9]*\).*/\1/p' | head -n1)
+  [ "$PUBLIC_MODE" = "offscreen" ] || die "public-index.json 里没有离屏截图标记（mode=${PUBLIC_MODE:-缺失}）"
+  [ "$PUBLIC_FAILED" = "0" ] || die "公开种子补充截图有 ${PUBLIC_FAILED:-?} 张没通过 DOM / 像素断言（见 artifacts/windows/ui/public-index.json）"
+  [ "$PUBLIC_SHOTS" = "3" ] || die "公开种子补充截图数量不对：$PUBLIC_SHOTS"
+  # 任务表的 expect 之外，再按屏钉住关键文案（文件名「远山」不含「公开」，所以「公开」只可能来自 chip）。
+  grep -q '公开' "$ART/ui/p3-public.log" 2>/dev/null || die "p3-public 里没有「公开」chip"
+  grep -q '等待来源' "$ART/ui/p3-public.log" 2>/dev/null || die "p3-public 里没有「等待来源」"
+  grep -q '公开' "$ART/ui/p4-public.log" 2>/dev/null || die "p4-public 里没有「公开」chip"
+  grep -q '移除' "$ART/ui/p4-public.log" 2>/dev/null || die "p4-public 里没有「移除」"
+  grep -q 'btih:' "$ART/ui/p4-public.log" 2>/dev/null || die "p4-public 里没有磁力摘要"
+  grep -q '导入' "$ART/ui/p3-magnet.log" 2>/dev/null || die "p3-magnet 里没有「导入」"
+  ok "公开种子补充截图 $PUBLIC_SHOTS 张：p3-public / p4-public / p3-magnet（索引 public-index.json）"
 fi
 
 # ------------------------------------------------------------ 6. 构建报告
@@ -287,10 +374,11 @@ CXX_VER=$(grep -h "CMAKE_CXX_COMPILER_VERSION" "$BUILD"/CMakeFiles/*/CMakeCXXCom
   echo "## 运行取证"
   if [ "$EVIDENCE" = "1" ]; then
     echo
-    echo "- 逐页截图：artifacts/windows/ui/（${SHOTS} 张，逐张断言页名 + 页面文案 + 明暗底色）"
+    echo "- 逐页截图：artifacts/windows/ui/（门禁 ${SHOTS} 张 + 公开种子补充 ${PUBLIC_SHOTS:-0} 张，逐张断言页名 + 页面文案 + 明暗底色）"
     echo "- 取证 daemon：daemon.jar ${JAR_STATE:-状态未记录}"
     echo "- 出图方式：Huchuan.exe --shot=<png>，WebView2 ICoreWebView2CapturePreview 离屏渲染（不抓屏，桌面不渲染也成立）"
-    echo "- 断言索引：artifacts/windows/ui/index.json"
+    echo "- 断言索引：artifacts/windows/ui/index.json（门禁）、artifacts/windows/ui/public-index.json（公开种子补充）"
+    echo "- 公开种子补充图：p3-public.png（P3 公开行）/ p4-public.png（P4 公开条目）/ p3-magnet.png（磁力弹层）"
     echo "- 首页截图：artifacts/windows/huchuan-window.png"
     if [ "${GDI_SHOTS:-0}" != "0" ]; then
       echo "- GDI 兜底诊断图：${GDI_SHOTS} 张（*.gdi.png，只供人工看，不进判据）"

@@ -2,7 +2,10 @@
 
 - 结论：P0–P7 八页全部实现，纯静态（HTML + 手写 CSS + 原生 JS，零依赖、零 CDN）。
   数据不再来自内存假数据，而是 **daemon 的 REST + WebSocket**（`docs/daemon-api.md`）。
-- 一条命令出结果：`bash scripts/build-windows.sh` → 编译 → 起一个带料的 daemon → 逐页截图 → 16 张逐张断言。
+- 公开种子（磁力导入 / 公开条目 / 本机移除）已接进 P3 / P4，口径与文案同 Android：
+  「公开」「等待来源」「本机文件」「磁力链接」「移除」。
+- 一条命令出结果：`bash scripts/build-windows.sh` → 编译 → 起一个带料的 daemon →
+  逐页截图 → 16 张门禁逐张断言，再补 3 张公开种子截图（同一套离屏截图与断言）。
 - 壳只负责窗口与 WebView2：启动时拉起 daemon、退出时带走它，业务逻辑一行都不在 `main.cpp` 里。
 
 ## 1. 怎么起、怎么连
@@ -57,13 +60,17 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 
 | 参数 | 取值 | 作用 |
 | --- | --- | --- |
-| `route` | `p0`…`p7` | 直接落到某一页，跳过开屏 |
+| `route` | `p0`…`p7`；取证别名 `p3-magnet` / `p4-public` | 直接落到某一页，跳过开屏 |
 | `theme` | `light` / `dark` | 强制主题（默认跟随系统） |
 | `network` | `pass` / `limited` / `fail` | 强制自检结论；不带 = 用真实自检（daemon 在不在） |
 | `hold` | `boot` / `checking` / `result` | 把 P0 停在某个阶段，供截图 |
-| `pick` | `1` | 进 P3 后自动点一次「添加文件」，用来无人值守地验壳的文件选择器 |
+| `pick` | `1` | 进 P3 后直接弹一次系统文件选择器（跳过「添加文件」弹层），用来无人值守地验壳桥 |
 | `api` | `http://host:port` | 浏览器里指定 daemon 地址（跨源场景 / 换端口调试） |
 | `manual` | `host:port`（逗号分隔） | 加入群时的手动候选，填对方的消息层端口 |
+
+`p3-magnet` / `p4-public` 只给截图取证用，正常导航不带（见 §6.3）：前者落到 P3 并直接
+打开「磁力链接」输入，后者落到 P4 并选中本群第一条公开条目。两者的页面名仍是 `p3` / `p4`，
+所以截图任务表的 `page` / `--shot-page` 不用改。
 
 壳自己的开关（不属于页面参数，正常双击一个都不带）：`--daemon-jar=`、`--daemon-port=`、
 `--daemon-data-dir=`（给测试用独立数据目录，别动 `%LOCALAPPDATA%\Huchuan\daemon`）。
@@ -126,12 +133,18 @@ WS 只负责说「变了」，不搬数据：收到 `state`（有东西变了）
 画完再还回去；草稿（`State.draftComment`）本来就存在状态里。所以正在打字时被刷新不会丢字、
 不会掉焦点。
 
-### 3.2 添加文件走壳的系统选择器
+### 3.2 添加文件：一个入口两项
 
-`POST /api/groups/{gid}/files` 要的是**本机绝对路径**，浏览器拿不到这个值（`<input type=file>`
-只给 File 对象）。P3 的工具栏因此只有一个「添加文件」按钮，路径由壳问系统要：
+P3 工具栏仍然只有一个「添加文件」按钮；点开是一个弹层，两项（同 Android 的 `AddFileSheet`）：
 
-    页面点「添加文件」
+| 项 | 做什么 |
+| --- | --- |
+| 本机文件 | 走壳的系统选择器；路径回传后 `POST /api/groups/{gid}/files` 建私有种子 |
+| 磁力链接 | 同一弹层里换成输入框 +「导入」；`POST /api/groups/{gid}/files/import-magnet` |
+
+**本机文件**的路径只能由壳给（浏览器拿不到 `<input type=file>` 的真实路径）：
+
+    点「本机文件」
       → window.chrome.webview.postMessage({type:'pick-file'})
       → 壳 PostMessage(WM_APP+1) 回消息循环，开 IFileOpenDialog（模态）
       → 选中：{type:'file-picked', path:'C:\\…\\a.mp4'}
@@ -140,20 +153,40 @@ WS 只负责说「变了」，不搬数据：收到 `state`（有东西变了）
 
 - 壳这一侧：`main.cpp` 的 `OnWebMessageReceived` → `PickFileAndReply`。对话框只收真实文件
   （`FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST`），和 daemon 那头的校验对齐。
-- 页面这一侧：`app.js` 的 `Shell`（`window.chrome.webview` 存在才有）、`pickFile`、
-  `addPickedFile`。壳桥不在（普通浏览器里）时点按钮只显示「只能在互传窗口里选文件」。
+- 页面这一侧：`app.js` 的 `Shell`（`window.chrome.webview` 存在才有）、`pickLocalFile`、`pickFile`、
+  `addPickedFile`。壳桥不在（普通浏览器里）时点「本机文件」只显示「只能在互传窗口里选文件」。
 - 日志：壳的 `shell.log` 里一进一出两条对称记录 —— `页面消息：{"type":"pick-file"}`、
   `回页面：{"type":"file-picked",…}`，排查时直接 grep `pick-file`。
-- 失败（daemon 拒绝、文件被删、权限不够）把 daemon 的 `error` 原文显示在按钮下面。
+- 失败（daemon 拒绝、文件被删、权限不够）把 daemon 的 `error` 原文显示在工具栏下面。
 
-P3 已经没有输入框了，所以 `Enter` 就是这一页的主操作（见 §8 第 10 行）。
+**磁力链接**：输入框占位「粘贴磁力链接」，右侧「导入」。导入中按钮变「导入中」，输入框与弹层
+都不许关；内核最多等 60 s 元数据（与 Android 同口径，`timeoutMs=60000`）。三种结果分开处理：
 
-### 3.3 组队、限速与跨网发现：页面读的是哪一份数
+- `ok=true`：元数据到手，条目建好，直接进 P4。
+- `ok=false`（`no_source` / `timeout` / `bad_metadata`）：条目**已经建好**，内核那一句话留在输入框
+  下面（不染红）；关掉弹层后 P3 里该条目显示「公开 + 等待来源」，元数据到手后随 `/api/state`
+  刷新自动变成尺寸/下载状态。不弹窗、不要求重试。
+- 请求失败（`invalid_link` / `duplicate` / 公开会话 503）：显示 daemon 的 `error` 原文并染红。
 
-这三处都容易「显示一个漂亮的假数」，所以来源写死在这里：
+弹层没有标题与关闭按钮：点空白处或 `Esc` 关闭；选「本机文件」时先收起弹层再弹系统选择器。
+取证参数 `pick=1` 跳过弹层直接弹选择器（见 §1.3）。
+
+P3 页面本身没有输入框：`Enter` 打开「添加文件」弹层；弹层里在磁力输入框按 `Enter` = 导入。
+
+### 3.3 公开、组队、限速与跨网发现：页面读的是哪一份数
+
+这几处都容易「显示一个漂亮的假数」，所以来源写死在这里：
+
+`data.js` 的 `toFile` 透传公开条目的 `scope` / `magnet` / `sizeKnown`（`scope` 缺字段按
+`private`，`sizeKnown` 缺字段按 `true`，与 daemon-api 的旧对端口径一致）。页面只看这三个字段，
+不按名字或状态猜。
 
 | 界面上的 | 数据来源 | 判定 |
 | --- | --- | --- |
+| P3 行内 chip「公开」 | `file.scope` | 仅 `public` 出现，固定在状态 chip 左侧；私有条目没有「私有」补位 chip |
+| P3/P4 状态「等待来源」 | `file.scope` + `file.sizeKnown` / `sizeBytes` | `fileAwaitingSource()`：公开且尺寸未知；尺寸整段不显示（不是 0 B） |
+| P4 磁力摘要 | `file.magnet` | 公开且磁力非空；只显示 `btih:` 前 16 位，点一下复制整条 |
+| P4「移除」 | 仅在公开条目出现 | `POST /api/groups/{gid}/files/{fid}/remove`：只藏本机列表，不广播、不删盘 |
 | P3 行内 chip「组队 n 人」 | `file.teammates`（daemon 直读 `kernel.teammates`） | `data.js` 的 `fileInTeam`：队友 ≥ 1 且进度 < 100；n = 队友数 + 1（含本机） |
 | P4「正在组队 · n 人」 | 同上 | 同一个 `fileInTeam`，进度到 100% 的同一拍消失 |
 | P7「内核读回」 | `settings.sessionUploadLimitKbps` / `sessionDownloadLimitKbps` | daemon 下发内核后读回的**会话真值**；0 显示「不限」 |
@@ -192,7 +225,7 @@ html / css / js / svg / png / woff2，按路径排序后：
 ## 5. 构建与验收
 
 ```bash
-bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 16 张离屏截图（约 55 秒）
+bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 16 张门禁截图 + 3 张公开种子补充图
 bash scripts/build-windows.sh --no-evidence  # 只编译
 bash scripts/build-windows.sh --clean        # 先清 windows/build
 bash scripts/package-windows.sh              # 绿色版：jlink runtime + exe + jar → dist/Huchuan/
@@ -207,8 +240,10 @@ bash windows/scripts/capture-tracker-ui.sh   # 跨网发现关闭态的一张取
    SHLWAPI / USER32 / WS2_32 / ole32）。离屏截图用的 WIC（`windowscodecs`）是 COM 运行时装起来的，
    只把 CLSID 编进 exe，导入表里不会多一行。
 3. **取证 daemon**：脚本自己起一个 daemon（`artifacts/windows/daemon/`，端口 47200），
-   建一个群「老板的群」、共享一个 1 MiB 文件、发一条评论。没有它，P2 是「还没有群组」，
-   P3/P4 会直接退回首页，逐页断言就没有对象了。用户名故意留空，冷启动才会落在 P1。
+   建一个群「老板的群」、共享一个 1 MiB 文件、发一条评论，再导入一条**无来源的公开磁力**
+   （随机 infohash + `timeoutMs=0` → `scope=public`、`sizeKnown=false`）。没有它，P2 是「还没有群组」，
+   P3/P4 会直接退回首页，逐页断言就没有对象了；公开条目缺席则 §6.3 的三张图没有对象。
+   用户名故意留空，冷启动才会落在 P1。
    **jar 过期就重打，不能只看它存不存在**：页面由这个 daemon 从 jar 里发出，jar 是旧的时候
    门禁照样能出一堆「合格」的图，判的却是旧页面 —— 所以脚本比 mtime：`daemon/src/**`、
    `core/src/**`、`windows/resources/web/**`、`daemon/build.gradle.kts`、
@@ -224,6 +259,10 @@ bash windows/scripts/capture-tracker-ui.sh   # 跨网发现关闭态的一张取
 
 逐张证据写进 `artifacts/windows/ui/index.json`（页名、断言文案、出图方式 `mode=offscreen`、
 进程退出码、尝试次数、尺寸、颜色数、主色占比、亮度、探针原文）。每页最多重跑 3 次（`-Attempts`）。
+
+门禁跑完后再跑一轮**公开种子补充截图**（§6.3）：同样是 `capture-ui.ps1` + 一次性 exe，任务表由
+`build-windows.sh` 现场生成 `public-capture-jobs.json`，索引单独写 `public-index.json`，不挤进那 16 张。
+脚本另外按屏 grep 探针原文（`公开` / `等待来源` / `移除` / `btih:` / `导入`），像素断言照旧。
 
 两个已经踩过的坑，改这里之前先看一眼：
 
@@ -267,7 +306,8 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 
 ## 6. 截图清单
 
-构建门禁的 `artifacts/windows/ui/` 共 16 张，每张一个独立进程（另有 §6.1 / §6.2 两个脚本产的 4 张也落在同一目录）。
+构建门禁的 `artifacts/windows/ui/` 共 16 张，每张一个独立进程；同一轮构建还会补 3 张公开种子图
+（§6.3，索引单独一份 `public-index.json`）。另有 §6.1 / §6.2 两个脚本产的 4 张也落在同一目录。
 涉及数据的断言写的是取证 daemon 那份料的字面：
 
 | 文件 | 页 | 状态 | 断言文案 |
@@ -280,7 +320,7 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 | `p0-failed.png` | P0 | 网络不可用，只有「重试」 | 网络不可用 |
 | `p1-username.png` | P1 | 用户名（预填设备名） | 最多 20 字 |
 | `p2-home.png` | P2 | 首页：搜索 / 设置 / ＋ / 群组行 | 老板的群 |
-| `p3-group.png` | P3 | 群组：添加文件 / 文件列表 / 成员入口 | 添加文件 |
+| `p3-group.png` | P3 | 群组：添加文件 / 文件列表（含一条公开条目）/ 成员入口 | 添加文件 |
 | `p4-file.png` | P4 | 文件详情：进度、开关、限速、评论 | 单文件限速 |
 | `p5-new-group.png` | P5 | 新群组：邀请码后 8 位 / 加入 / 新建群组 | 新建群组 |
 | `p6-members.png` | P6 | 成员列表 + 邀请码 | 邀请码 |
@@ -332,11 +372,34 @@ PNG 与 `tracker-index.json` 落在 `artifacts/windows/ui/`。
 这条取证用 47260，让壳通过 `--daemon-port=47260`（任务表的 `daemonPort` 字段）连它；
 daemon 还用 `--device-name=Tracker-Off` 认领 health，避免把占着同一端口的别人进程当成自己的。
 
+### 6.3 公开种子三张（构建脚本的后半段）
+
+`bash scripts/build-windows.sh` 在 16 张门禁之后，用同一个取证 daemon 再跑一轮离屏截图。
+daemon 里那条公开条目是随机 infohash + `timeoutMs=0` 导入的：没有来源，但条目已建好，
+`scope=public`、`sizeKnown=false`，正好是「等待来源」那一态。
+
+| 文件 | 页 | 状态 | 断言文案 |
+| --- | --- | --- | --- |
+| `p3-public.png` | P3 | 公开文件行：状态 chip 左侧「公开」，右侧「等待来源」，不写 0 B | 等待来源 + 公开 |
+| `p4-public.png` | P4 | 公开条目：公开 / 等待来源、磁力摘要（点按复制）、右上「移除」 | 移除 + 公开 + btih: |
+| `p3-magnet.png` | P3 | 「添加文件」弹层的磁力链接态：粘贴磁力链接 + 导入 | 导入 |
+
+两张 P3/P4 用取证**路由别名**落到指定状态（见 §1.3）：`p4-public` 让 P4 选中本群第一条公开
+条目（普通深链靠 `?file=<fid>`）；`p3-magnet` 让 P3 首次渲染就带着磁力输入弹层。页面名仍是
+`p3` / `p4`，所以 `--shot-page` 与 DOM 探针不受影响。
+
+任务表由构建脚本现场写到 `artifacts/windows/ui/public-capture-jobs.json`（源码里没有第四份任务表），
+断言分两层：`capture-ui.ps1` 的页名 + 文案 + 像素照旧；脚本另外 grep 截图那一刻的探针原文，
+把「公开」「等待来源」「移除」「btih:」「导入」逐条钉住（文件名「远山」不含「公开」，不会误命中）。
+索引是 `public-index.json`，三张都 `mode=offscreen`、`failed=0` 才算过；16 张门禁的 `index.json`
+不受影响。
+
 ## 7. 页面与文案
 
 文案表在 `windows/resources/web/js/app.js` 顶部（`COPY`），逐条对应
 `docs/design/product-spec.md` §3 各页「文案」行。改文案的顺序：先改 spec，再改 `COPY`，
-再跑一次 `bash scripts/build-windows.sh` 让截图断言跟着更新（断言文案在 `ui-capture-jobs.json`）。
+再跑一次 `bash scripts/build-windows.sh` 让截图断言跟着更新（16 张门禁的断言文案在
+`ui-capture-jobs.json`；公开种子三张的任务表由 `build-windows.sh` 现场生成，见 §6.3）。
 
 P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增的三条 Windows 文案，spec §3 P7 的元素表
 与文案行还没列进去（`docs/design/` 不归本任务改）；合并时由设计 agent 补进 spec，以免两处各说一套。
@@ -353,11 +416,12 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
 | 4 | 本机成员平台 | `Android` | `Windows` |
 | 5 | P3 文件列表 | 两行 ListItem（名称 / 大小·做种·进度 + 状态 chip） | 列对齐：名称+进度条 / 大小 / 做种 n / 状态 chip；窗口窄于 900px 折回单列 |
 | 6 | P4 版面 | 单栏纵向 | 双栏：左传输控制（进度、激活开关、单文件限速），右评论列表 + 输入行 |
-| 7 | 添加文件 | SAF `OpenDocument` | 壳调 `IFileOpenDialog`，把选中的绝对路径回传给页面（浏览器拿不到 `<input type=file>` 的真实路径）；两者都直接落内核 |
+| 7 | 添加文件 | SAF `OpenDocument` | 同一个「添加文件」弹层两项：本机文件走壳的 `IFileOpenDialog`（绝对路径回传，浏览器拿不到）；磁力链接在弹层里输入并导入。导入成功都直接进 P4 |
 | 8 | 复制邀请码 | ClipboardManager + Snackbar | `navigator.clipboard`，失败退回 `execCommand`；「已复制」在行内显示 1.6 秒 |
 | 9 | 主题 | `isSystemInDarkTheme()` | `prefers-color-scheme`；窗口标题栏与 WebView2 首帧底色跟着页面主题走 |
-| 10 | 键盘 | 无 | `Enter` 提交当前页主操作（保存 / 加入 / 发送 / 创建；P3 上是打开文件选择器），`Esc` 关闭抽屉或返回 |
+| 10 | 键盘 | 无 | `Enter` 提交当前页主操作（保存 / 加入 / 发送 / 创建；P3 上是打开「添加文件」弹层，磁力输入框里是导入），`Esc` 关弹层 / 抽屉或返回 |
 | 11 | 限速读数 | 下发后只写日志（`global_limit_applied … ok=`），界面显示用户设的值 | P7 多一行「内核读回」、P4 多一行「已生效 / 已设置」，直接把会话里生效的值显示出来 |
+| 12 | 公开种子 | P3「公开」chip、P4 磁力摘要 +「移除」 | 同样三处，文案一致。磁力摘要点按复制，提示是行内「已复制」1.6 秒（Android 是 Snackbar）；移除只藏本机列表，成功后回 P3 |
 
 ## 9. 当前限制
 
@@ -384,13 +448,13 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
 
 | 项 | 字节 |
 | --- | --- |
-| `index.html` | 973 |
-| `css/tokens.css` | 2,672 |
-| `css/app.css` | 16,489 |
-| `js/data.js` | 19,699 |
-| `js/app.js` | 44,735 |
-| **页面资源合计** | **84,568**（预算 200 KB） |
-| `Huchuan.exe` | 388,096（WebView2 运行时是系统组件，不在 exe 内） |
-| `daemon.jar` | 8,144,605（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
+| `index.html` | 947 |
+| `css/tokens.css` | 2,573 |
+| `css/app.css` | 17,667 |
+| `js/data.js` | 22,377 |
+| `js/app.js` | 55,522 |
+| **页面资源合计** | **99,086**（预算 200 KB） |
+| `Huchuan.exe` | 402,432（WebView2 运行时是系统组件，不在 exe 内） |
+| `daemon.jar` | 8,239,214（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
 | `runtime/`（jlink） | 28,186,664（26.88 MiB，模块 `java.base,java.logging,jdk.crypto.ec`） |
-| **`dist/Huchuan` 合计** | **36,719,365**（35.02 MiB，拷走就能跑，目标机不用装 Java） |
+| **`dist/Huchuan` 合计** | **36,828,310**（35.12 MiB，拷走就能跑，目标机不用装 Java） |

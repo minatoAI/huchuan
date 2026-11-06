@@ -44,19 +44,27 @@ const COPY = {
 
   // P3 群组
   p3_add_file: '添加文件',
+  p3_add_local: '本机文件',
+  p3_add_magnet: '磁力链接',
   p3_add_need_shell: '只能在互传窗口里选文件',
   p3_add_failed: '添加失败',
   p3_members: function (n) { return '成员（' + n + ' 人）'; },
   p3_seeding: '做种中',
   p3_sleeping: '休眠',
   p3_downloading: '下载中',
+  p3_waiting_source: '等待来源',
+  p3_scope_public: '公开',
   p3_team: function (n) { return '组队 ' + n + ' 人'; },
   p3_seeders: function (n) { return '做种 ' + n; },
   p3_empty: '还没有文件',
+  p3_magnet_hint: '粘贴磁力链接',
+  p3_magnet_import: '导入',
+  p3_magnet_importing: '导入中',
 
   // P4 文件详情
   p4_activate: '激活',
   p4_sleep: '休眠',
+  p4_remove: '移除',
   p4_teaming: function (n) { return '正在组队 · ' + n + ' 人'; },
   p4_seeders: function (n) { return '做种者 ' + n; },
   p4_waiting: '等待做种者',
@@ -136,6 +144,26 @@ const State = {
   replyTo: null,
   createOpen: false,
   copied: false,
+  // P3「添加文件」弹层：一个入口两项（本机文件 / 磁力链接），不新开页面。
+  addOpen: false,
+  addMode: 'menu',        // menu | magnet
+  magnetText: '',
+  magnetBusy: false,
+  magnetNote: '',         // 导入失败时显示在输入框下一行
+  magnetNoteError: false, // 非法 / 重复这类「被拒」才染红；无源 / 超时只是还没成
+  magnetCopied: false,
+  magnetCopiedTimer: null,
+};
+
+/**
+ * 取证态路由别名：只在 ?route= / --route= 里出现，正常导航不带。
+ *   p3-magnet  落 P3 并直接打开「磁力链接」输入（截图磁力弹层用）
+ *   p4-public  落 P4 并选中本群第一条公开条目（截图公开详情用）
+ * 页面名仍然是 p3 / p4，所以截图任务表的 --shot-page 不用改。
+ */
+const RouteAlias = {
+  'p3-magnet': { page: 'p3', add: 'magnet' },
+  'p4-public': { page: 'p4', public: true },
 };
 
 /* -------------------------------------------------------------- 小工具 */
@@ -166,7 +194,31 @@ function digitsOnly(text, max) {
   return String(text).replace(/\D/g, '').slice(0, max);
 }
 
+/** 公开条目：P3 的「公开」chip、P4 的磁力摘要与「移除」都只认这一个判断。 */
+function isPublicFile(file) {
+  return file.scope === FileScope.PUBLIC;
+}
+
+/**
+ * 元数据还没到手：公开条目 + 尺寸未知。此时既不下载也不做种，状态说「等待来源」，
+ * 尺寸也不显示（daemon 不给 sizeBytes，0 不是「零字节」，见 docs/daemon-api.md §3.3）。
+ * 口径同 Android 的 GroupFile.awaitingSource()。
+ */
+function fileAwaitingSource(file) {
+  return isPublicFile(file) && (file.sizeKnown === false || !(file.sizeBytes > 0));
+}
+
+/** 磁力摘要：只留 infohash 前 16 位，点一下复制整条（同 Android 的 magnetDigest）。 */
+function magnetDigest(magnet) {
+  const text = String(magnet || '');
+  const prefix = 'magnet:?xt=urn:btih:';
+  if (text.slice(0, prefix.length).toLowerCase() !== prefix) return text;
+  const infohash = text.slice(prefix.length).split('&')[0];
+  return infohash.length > 16 ? 'btih:' + infohash.slice(0, 16) + '…' : text;
+}
+
 function fileStateLabel(file) {
+  if (fileAwaitingSource(file)) return COPY.p3_waiting_source;
   if (file.state === FileState.SEEDING) return COPY.p3_seeding;
   if (file.state === FileState.DOWNLOADING) return COPY.p3_downloading;
   return COPY.p3_sleeping;
@@ -518,10 +570,14 @@ function renderGroupRows() {
 
 /* ------------------------------------------------------------ P3 群组 */
 function fileRow(file) {
-  const chips = [
-    '<span class="chip' + (file.state === FileState.SLEEPING ? '' : ' is-on') + '">' +
-      fileStateLabel(file) + '</span>',
-  ];
+  const chips = [];
+  // 「公开」只在公开条目出现，位置固定在状态 chip 左侧（public-swarm §6.2）；
+  // 私有条目没有任何补位 chip，不出现「私有」字样。
+  if (isPublicFile(file)) {
+    chips.push('<span class="chip">' + COPY.p3_scope_public + '</span>');
+  }
+  chips.push('<span class="chip' + (file.state === FileState.SLEEPING ? '' : ' is-on') + '">' +
+    fileStateLabel(file) + '</span>');
   if (fileInTeam(file)) {
     chips.push('<span class="chip is-on">' + COPY.p3_team(fileTeamSize(file)) + '</span>');
   }
@@ -529,13 +585,49 @@ function fileRow(file) {
     ? '<span class="cell-progress"><span class="progress"><i style="width:' + file.progressPercent +
       '%"></i></span><span class="cell-pct">' + file.progressPercent + '%</span></span>'
     : '';
+  // 元数据没到手时没有尺寸可写：不显示「0 B」，等来源。（同 Android 的 P3 行）
+  const size = fileAwaitingSource(file) ? '' : formatSize(file.sizeBytes);
 
   return '<button class="trow" data-act="open-file" data-id="' + file.id + '">' +
     '<span class="cell-main"><span class="cell-title">' + esc(file.name) + '</span>' + progress + '</span>' +
-    '<span class="cell-size">' + formatSize(file.sizeBytes) + '</span>' +
+    '<span class="cell-size">' + size + '</span>' +
     '<span class="cell-seeders">' + COPY.p3_seeders(file.seeders) + '</span>' +
     '<span class="cell-chips">' + chips.join('') + '</span>' +
     '</button>';
+}
+
+/**
+ * P3「添加文件」弹层：一个入口两项（public-swarm §6.1）—— 本机文件（壳的系统选择器）
+ * 与磁力链接（输入框 + 导入）。不新开页面；点空白处或 Esc 关闭。
+ */
+function addFileModal() {
+  if (!State.addOpen) return '';
+  const scrim = '<div class="scrim" data-act="close-add"></div>';
+
+  if (State.addMode === 'magnet') {
+    const busy = State.magnetBusy;
+    return scrim +
+      '<div class="modal" role="dialog" aria-label="' + COPY.p3_add_magnet + '">' +
+        '<div class="magnet-form">' +
+          '<input class="input" id="magnet-input" autocomplete="off" spellcheck="false" ' +
+            'placeholder="' + COPY.p3_magnet_hint + '" aria-label="' + COPY.p3_add_magnet + '" ' +
+            'value="' + esc(State.magnetText) + '" data-autofocus' + (busy ? ' disabled' : '') + '>' +
+          '<button class="btn btn-primary" data-act="import-magnet"' +
+            (busy || !State.magnetText.trim() ? ' disabled' : '') + '>' +
+            (busy ? COPY.p3_magnet_importing : COPY.p3_magnet_import) + '</button>' +
+        '</div>' +
+        (State.magnetNote
+          ? '<p class="field-note' + (State.magnetNoteError ? ' is-error' : '') + '">' +
+            esc(State.magnetNote) + '</p>'
+          : '') +
+      '</div>';
+  }
+
+  return scrim +
+    '<div class="modal" role="dialog" aria-label="' + COPY.p3_add_file + '">' +
+      '<button class="sheet-row" data-act="add-local">' + COPY.p3_add_local + '</button>' +
+      '<button class="sheet-row" data-act="add-magnet">' + COPY.p3_add_magnet + '</button>' +
+    '</div>';
 }
 
 function viewGroup() {
@@ -559,6 +651,7 @@ function viewGroup() {
       '<p class="field-note is-error" id="add-note" hidden></p>' +
       body +
     '</div></div>' +
+    addFileModal() +
     '</div>';
 }
 
@@ -590,15 +683,38 @@ function viewFile() {
     ? COPY.p4_seeders(file.seeders)
     : COPY.p4_waiting;
 
+  // 「公开」固定在状态 chip 左侧；元数据没到手时不写尺寸（不是 0 B）。
+  const publicChip = isPublicFile(file)
+    ? '<span class="chip">' + COPY.p3_scope_public + '</span>'
+    : '';
+  const size = fileAwaitingSource(file)
+    ? ''
+    : '<span>' + formatSize(file.sizeBytes) + '</span>';
+  // 公开条目的磁力摘要：一行，点一下复制整条链接；复制成功的提示在行内留 1.6 秒。
+  const magnet = isPublicFile(file) && file.magnet
+    ? '<div class="magnet-line">' +
+        '<button class="magnet-digest" data-act="copy-magnet" data-id="' + file.id + '" ' +
+          'title="' + esc(file.magnet) + '">' + esc(magnetDigest(file.magnet)) + '</button>' +
+        (State.magnetCopied ? '<span class="copied">' + COPY.p6_copied + '</span>' : '') +
+      '</div>'
+    : '';
+  // 「移除」只对公开条目出现（public-swarm §5.2）：私有条目的正确动作是「休眠」。
+  const removeAction = isPublicFile(file)
+    ? '<button class="btn btn-text" data-act="remove-file" data-id="' + file.id + '">' +
+      COPY.p4_remove + '</button>'
+    : '';
+
   return '<div class="screen">' +
-    topbar(file.name, { back: true }) +
+    topbar(file.name, { back: true, actions: removeAction }) +
     '<div class="content"><div class="page page-wide">' +
       '<div class="file-meta">' +
+        publicChip +
         '<span class="chip' + (file.state === FileState.SLEEPING ? '' : ' is-on') + '">' +
           fileStateLabel(file) + '</span>' +
-        '<span>' + formatSize(file.sizeBytes) + '</span>' +
+        size +
         '<span>' + COPY.p4_source(file.sourceMember) + '</span>' +
       '</div>' +
+      magnet +
       '<div class="file-grid">' +
         '<section class="panel stack">' +
           '<div class="stack-tight">' +
@@ -776,6 +892,99 @@ function addPickedFile(path) {
   });
 }
 
+/** 打开「添加文件」弹层（menu = 两项；magnet = 直接进输入态）。 */
+function openAddSheet(mode) {
+  State.addOpen = true;
+  State.addMode = mode === 'magnet' ? 'magnet' : 'menu';
+  State.magnetNote = '';
+  State.magnetNoteError = false;
+  render();
+}
+
+function closeAddSheet() {
+  if (State.magnetBusy) return;   // 导入中不许关（同 Android 的弹层）
+  State.addOpen = false;
+  State.addMode = 'menu';
+  State.magnetText = '';
+  State.magnetNote = '';
+  State.magnetNoteError = false;
+  render();
+}
+
+/** 「本机文件」：先关弹层，再走原来的壳选择器链路。 */
+function pickLocalFile() {
+  if (State.magnetBusy) return;
+  State.addOpen = false;
+  State.addMode = 'menu';
+  render();
+  pickFile();
+}
+
+/** 这四种是「被拒」（非法 / 重复 / 会话 / 群没了），文案染红；无源 / 超时只是还没成。 */
+function magnetRejected(code) {
+  return code === 'invalid_link' || code === 'duplicate' ||
+    code === 'session_error' || code === 'no_group';
+}
+
+/**
+ * 「磁力链接」→ POST /api/groups/{gid}/files/import-magnet。
+ *
+ * 与 Android 同口径：内核最多等 60 s 元数据。ok=true 直接进 P4；ok=false 时条目已经建好
+ * （no_source / timeout / bad_metadata），内核一句话留在输入框下面，列表里显示「等待来源」，
+ * 不弹窗、不要求重试。连请求都失败（非法 / 重复 / 503）才按错误处理。
+ */
+function importMagnet() {
+  const group = Store.group(State.groupId);
+  const input = document.getElementById('magnet-input');
+  const magnet = (input ? input.value : State.magnetText).trim();
+  if (!group || !magnet || State.magnetBusy) return;
+
+  State.magnetText = magnet;
+  State.magnetBusy = true;
+  State.magnetNote = '';
+  State.magnetNoteError = false;
+  render();
+
+  Store.importMagnet(group.id, magnet, '', 60000).then(function (result) {
+    State.magnetBusy = false;
+    if (result && result.ok) {
+      State.addOpen = false;
+      State.addMode = 'menu';
+      State.magnetText = '';
+      State.magnetNote = '';
+      State.fileId = result.fileId;
+      State.draftComment = '';
+      State.replyTo = null;
+      Nav.go('p4', result.fileId);
+      return;
+    }
+    State.magnetNote = (result && result.message) || COPY.p3_add_failed;
+    State.magnetNoteError = magnetRejected(result && result.code);
+    render();
+  }, function (error) {
+    State.magnetBusy = false;
+    State.magnetNote = (error && error.message) || COPY.p3_add_failed;
+    State.magnetNoteError = true;
+    render();
+  });
+}
+
+/** P4 磁力摘要：点一下复制整条链接。 */
+function copyMagnet(fileId) {
+  const group = Store.group(State.groupId);
+  const file = group && Store.file(group.id, fileId || State.fileId);
+  if (!file || !file.magnet) return;
+  copyText(file.magnet, function () {
+    State.magnetCopied = true;
+    render();
+    if (State.magnetCopiedTimer) clearTimeout(State.magnetCopiedTimer);
+    State.magnetCopiedTimer = setTimeout(function () {
+      State.magnetCopied = false;
+      render();
+    }, 1600);
+  });
+}
+
 function openGroup(groupId) {
   State.groupId = groupId;
   Nav.go('p3');
@@ -815,21 +1024,14 @@ function viewMembers() {
     '</div>';
 }
 
-function copyInviteCode() {
-  const group = Store.group(State.groupId);
-  if (!group) return;
-  const done = function () {
-    State.copied = true;
-    render();
-    setTimeout(function () {
-      State.copied = false;
-      render();
-    }, 1600);
-  };
-  // WebView2 里 navigator.clipboard 可能被拒；退回 execCommand，两条都失败就不假装复制成功。
+/**
+ * 复制一段文本：WebView2 里 navigator.clipboard 可能被拒，退回 execCommand；
+ * 两条都失败就不回调（不假装复制成功）。邀请码与磁力摘要共用这一条。
+ */
+function copyText(text, done) {
   const fallback = function () {
     const area = document.createElement('textarea');
-    area.value = group.inviteCode;
+    area.value = text;
     area.setAttribute('readonly', '');
     area.style.position = 'fixed';
     area.style.opacity = '0';
@@ -845,10 +1047,23 @@ function copyInviteCode() {
     if (ok) done();
   };
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(group.inviteCode).then(done, fallback);
+    navigator.clipboard.writeText(text).then(done, fallback);
   } else {
     fallback();
   }
+}
+
+function copyInviteCode() {
+  const group = Store.group(State.groupId);
+  if (!group) return;
+  copyText(group.inviteCode, function () {
+    State.copied = true;
+    render();
+    setTimeout(function () {
+      State.copied = false;
+      render();
+    }, 1600);
+  });
 }
 
 /* ------------------------------------------------------------ P7 设置 */
@@ -974,8 +1189,44 @@ document.addEventListener('click', function (event) {
       break;
 
     case 'add-file':
-      pickFile();
+      openAddSheet('menu');
       break;
+
+    case 'close-add':
+      closeAddSheet();
+      break;
+
+    case 'add-local':
+      pickLocalFile();
+      break;
+
+    case 'add-magnet':
+      State.addMode = 'magnet';
+      State.magnetNote = '';
+      State.magnetNoteError = false;
+      render();
+      break;
+
+    case 'import-magnet':
+      importMagnet();
+      break;
+
+    case 'copy-magnet':
+      copyMagnet(target.dataset.id);
+      break;
+
+    case 'remove-file': {
+      const group = Store.group(State.groupId);
+      const file = group && Store.file(group.id, target.dataset.id || State.fileId);
+      if (!group || !file) break;
+      // 移除后条目会从列表消失：先回 P3，免得 P4 退回列表里的第一条。
+      // 只藏本机列表，不广播、不删磁盘文件（docs/daemon-api.md §3.3）。
+      Nav.back();
+      Store.removeFile(group.id, file.id).catch(function (error) {
+        setAddNote((error && error.message) || COPY.p3_add_failed);
+      });
+      break;
+    }
 
     case 'save-name':
       saveUserName();
@@ -1094,6 +1345,13 @@ document.addEventListener('input', function (event) {
       break;
     }
 
+    case 'magnet-input': {
+      State.magnetText = el.value;
+      const button = app.querySelector('[data-act="import-magnet"]');
+      if (button) button.disabled = !State.magnetText.trim() || State.magnetBusy;
+      break;
+    }
+
     case 'upload-limit': {
       const group = Store.group(State.groupId);
       const file = group && Store.file(group.id, State.fileId);
@@ -1124,6 +1382,10 @@ document.addEventListener('input', function (event) {
 
 document.addEventListener('keydown', function (event) {
   if (event.key === 'Escape') {
+    if (State.addOpen) {
+      closeAddSheet();
+      return;
+    }
     if (State.createOpen) {
       State.createOpen = false;
       render();
@@ -1159,12 +1421,15 @@ document.addEventListener('keydown', function (event) {
   } else if (id === 'comment-input') {
     event.preventDefault();
     sendComment();
-  } else if (!id && State.route === 'p3' &&
+  } else if (id === 'magnet-input') {
+    event.preventDefault();
+    importMagnet();
+  } else if (!id && State.route === 'p3' && !State.addOpen &&
              !(event.target && event.target.closest &&
                event.target.closest('[data-act="add-file"]'))) {
-    // P3 没有输入框了：Enter 就是这一页的主操作（按钮自己聚焦时浏览器会补一次 click，跳过）
+    // P3 没有输入框：Enter 打开「添加文件」弹层（按钮自己聚焦时浏览器会补一次 click，跳过）
     event.preventDefault();
-    pickFile();
+    openAddSheet('menu');
   }
 });
 
@@ -1212,14 +1477,25 @@ function sendComment() {
   Shell.listen();   // P3 的「添加文件」要靠壳回传路径
 
   const initial = Params.get('route') || 'p0';
+  const alias = RouteAlias[initial] || { page: initial };
   // 先把 daemon 的快照拿下来再进开屏：P0 的自检判据就是「daemon 在不在」。
   Store.boot().then(function () {
     const first = Store.groups()[0];
     State.groupId = first ? first.id : '';
     Store.onChange(onDataChanged);
-    seedStack(initial, Params.get('file') || null);
+    // 取证别名 p4-public：直接把 P4 指向本群第一条公开条目（正常深链仍由 ?file= 指定）。
+    let seedFile = Params.get('file') || null;
+    if (!seedFile && alias.public && first) {
+      const pub = first.files.find(isPublicFile);
+      if (pub) seedFile = pub.id;
+    }
+    if (alias.add === 'magnet') {
+      State.addOpen = true;
+      State.addMode = 'magnet';
+    }
+    seedStack(alias.page, seedFile);
     if (Dev.pick === '1') {
-      // 无人值守地验证「页面 → 壳 → 系统选择器 → 回传」这条链：等页面稳定后自动点一次。
+      // 无人值守地验证「页面 → 壳 → 系统选择器 → 回传」这条链：等页面稳定后自动弹选择器。
       setTimeout(function () {
         if (State.route === 'p3') pickFile();
       }, 1200);

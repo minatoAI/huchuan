@@ -24,6 +24,12 @@ const FileState = {
   SLEEPING: 'sleeping',
 };
 
+/** 公开 / 私有：与 daemon 文件对象的 scope 字段同名同义（缺字段的旧对端按 private）。 */
+const FileScope = {
+  PRIVATE: 'private',
+  PUBLIC: 'public',
+};
+
 /** 通知档：与 daemon 的 notificationLevel 同名同义。 */
 const NotificationLevel = {
   SYSTEM_BUBBLE: 'bubble',
@@ -184,6 +190,11 @@ function toFile(json) {
     downloadRateBps: json.downloadRateBps || 0,
     uploadRateBps: json.uploadRateBps || 0,
     savedPath: json.savedPath || '',
+    // 公开条目的三个字段：P3 的「公开 / 等待来源」与 P4 的磁力摘要只读它们。
+    // sizeKnown 缺省按 true（老 daemon / 私有条目），公开条目在元数据到手前由 daemon 显式给 false。
+    scope: json.scope === FileScope.PUBLIC ? FileScope.PUBLIC : FileScope.PRIVATE,
+    magnet: json.magnet || '',
+    sizeKnown: json.sizeKnown !== false,
     comments: (json.comments || []).map(toComment),
   };
 }

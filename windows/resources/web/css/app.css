@@ -720,6 +720,55 @@ button {
   gap: var(--gap-sm);
 }
 
+/* ------------------------------------------------------ 添加文件弹层 P3 */
+/* 两项：本机文件 / 磁力链接（同 Android 的 AddFileSheet）。不加标题、不加关闭按钮：
+   点空白处或 Esc 关闭，一眼两项。 */
+.sheet-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 52px;
+  padding: 0 var(--gap-sm);
+  border-radius: var(--radius-sm);
+  font-size: 15px;
+  text-align: left;
+  transition: background-color 0.12s ease;
+}
+
+.sheet-row:hover { background: var(--hover); }
+
+.magnet-form {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+}
+
+.magnet-form .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* P4 磁力摘要：一行，点一下复制整条；「已复制」跟在后面 1.6 秒。 */
+.magnet-line {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  margin-bottom: var(--gap);
+}
+
+.magnet-digest {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-num);
+  font-size: 13px;
+  color: var(--brand);
+  text-align: left;
+}
+
+.magnet-digest:hover { text-decoration: underline; }
+
 /* ------------------------------------------------------------------ 邀请码 */
 .invite {
   display: flex;
