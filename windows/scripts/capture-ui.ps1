@@ -173,6 +173,7 @@ function Invoke-OffscreenShot($job, [string]$shot, [int]$delayMs, [int]$pageTime
     width = 0; height = 0; colors = 0; dominant = 0; luma = 0
   }
   $arguments = @()
+  if ($job.daemonPort) { $arguments += ('--daemon-port=' + [string]$job.daemonPort) }
   if ($job.route) { $arguments += ('--route=' + [string]$job.route) }
   if ($job.theme) { $arguments += ('--theme=' + [string]$job.theme) }
   if ($job.network) { $arguments += ('--network=' + [string]$job.network) }
@@ -232,6 +233,7 @@ function Invoke-GdiShot($job, [string]$shot) {
   $proc = $null
   try {
     $arguments = @()
+    if ($job.daemonPort) { $arguments += ('--daemon-port=' + [string]$job.daemonPort) }
     if ($job.route) { $arguments += ('--route=' + [string]$job.route) }
     if ($job.theme) { $arguments += ('--theme=' + [string]$job.theme) }
     if ($job.network) { $arguments += ('--network=' + [string]$job.network) }

@@ -88,14 +88,19 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
                 "msg_port_hint" to options.msgPortHint.toString(),
                 "bt_port_hint" to options.btPortHint.toString(),
                 "web_root" to (options.webRoot?.absolutePath ?: "jar:web"),
+                "tracker" to if (settings.trackerEnabled) "on" else "off",
+                "tracker_base" to settings.trackerBaseUrl,
             ),
         )
+        // 跨网发现：只在建内核时装配一次。关闭 = 传空串，core 就不建 tracker 服务，
+        // 局域网 mDNS 与手动地址一行都不受影响，也不会发出任何 tracker 请求。
         val created = M1Kernel(
             dataDir = options.dataDir,
             deviceName = options.deviceName,
             portHint = options.msgPortHint,
             btHint = options.btPortHint,
             events = events,
+            trackerBaseUrl = if (settings.trackerEnabled) settings.trackerBaseUrl else "",
         )
         created.start()
         kernel = created
@@ -298,6 +303,28 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         )
     }
 
+    // ------------------------------------------------------------ 跨网发现（P7）
+
+    /**
+     * 跨网发现的状态：用户设置 + 内核此刻的真值。
+     *
+     * 内核只在启动时装配 tracker（core 的 setTrackerBaseUrl 在 start 之后会被忽略），所以
+     * 「落盘的目标值」和「内核正在用的值」可能差一次进程重启；restartRequired 就是这一位。
+     * active 永远读内核（kernel.trackerEnabled），不拿刚点的开关冒充已生效。
+     */
+    fun trackerJson(): J.Obj = jobj(
+        "enabled" to jbool(settings.trackerEnabled),
+        "baseUrl" to jstr(settings.trackerBaseUrl),
+        "active" to jbool(kernel?.trackerEnabled == true),
+        "restartRequired" to jbool(trackerRestartRequired()),
+    )
+
+    private fun trackerRestartRequired(): Boolean {
+        val k = kernel ?: return false
+        val target = if (settings.trackerEnabled) settings.trackerBaseUrl else ""
+        return target != k.trackerBaseUrl
+    }
+
     // ------------------------------------------------------------------ 快照
 
     fun snapshot(): J.Obj {
@@ -334,11 +361,17 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         )
     }
 
-    /** 设置页要的全部：用户名 + 全局限速（含内核读回）。字段只在这里加一次，别处一律调它。 */
+    /** 设置页要的全部：用户名 + 全局限速（含内核读回）+ 跨网发现。字段只在这里加一次，别处一律调它。 */
     fun settingsJson(): J.Obj {
         val fields = LinkedHashMap<String, J>()
         fields["userName"] = jstr(settings.userName)
         fields.putAll(limitsJson().fields)
+        // /api/state 的 settings 里用带前缀的字段名：页面按 settings.tracker* 取，不跟
+        // /api/settings/tracker 回包里的 enabled/baseUrl 混名。
+        fields["trackerEnabled"] = jbool(settings.trackerEnabled)
+        fields["trackerBaseUrl"] = jstr(settings.trackerBaseUrl)
+        fields["trackerActive"] = jbool(kernel?.trackerEnabled == true)
+        fields["trackerRestartRequired"] = jbool(trackerRestartRequired())
         return J.Obj(fields)
     }
 

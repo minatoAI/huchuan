@@ -95,6 +95,8 @@ windows/scripts/
   ui-capture-jobs.json 截图任务表：页名 / 路由 / 主题 / 断言文案
   capture-team-ui.sh  组队通告 + 限速的三张取证图（起三个 daemon，见 §6.1）
   ui-capture-teammates.json 上面那三张的任务表（同一份 capture-ui.ps1，换 -JobsPath / -IndexName）
+  capture-tracker-ui.sh  跨网发现关闭态的一张取证图（一个 daemon，见 §6.2）
+  ui-capture-tracker.json 上面那张的任务表（用 --daemon-port 连取证装置）
   click-navigate.ps1  点击链路冒烟（可选，不进构建门禁）
 scripts/build-windows.sh   构建 + 内嵌 + 起取证 daemon + 截图
 scripts/package-windows.sh 绿色版打包：jlink runtime + exe + jar → dist/Huchuan/（见 docs/daemon-api.md §8）
@@ -146,9 +148,9 @@ WS 只负责说「变了」，不搬数据：收到 `state`（有东西变了）
 
 P3 已经没有输入框了，所以 `Enter` 就是这一页的主操作（见 §8 第 10 行）。
 
-### 3.3 组队与限速：页面读的是哪一份数
+### 3.3 组队、限速与跨网发现：页面读的是哪一份数
 
-两处都容易「显示一个漂亮的假数」，所以来源写死在这里：
+这三处都容易「显示一个漂亮的假数」，所以来源写死在这里：
 
 | 界面上的 | 数据来源 | 判定 |
 | --- | --- | --- |
@@ -157,10 +159,16 @@ P3 已经没有输入框了，所以 `Enter` 就是这一页的主操作（见 �
 | P7「内核读回」 | `settings.sessionUploadLimitKbps` / `sessionDownloadLimitKbps` | daemon 下发内核后读回的**会话真值**；0 显示「不限」 |
 | P7 输入框 | `settings.uploadLimitKbps` / `downloadLimitKbps` | 用户设的值，写 `POST /api/settings/limits` |
 | P4 单文件限速读回 | `file.uploadLimitKbps` + `file.uploadLimitInForce` | 已生效 / 已设置；core 没有按 torrent 读回限速的口子（daemon-api 缺口 G9） |
+| P7「跨网发现」开关 | `settings.trackerEnabled` | 落盘的设置；关掉 = 只走局域网 mDNS 与手动地址 |
+| P7 只读地址 / 「重启后生效」 | `settings.trackerBaseUrl` / `trackerRestartRequired` | 地址由 daemon 配（默认已部署的 Worker）；内核只在启动时装配 tracker，改完要重启进程才生效 |
 
 「不限」开关与输入框是同一件事的两面：开关打开 → 两项都按 0 下发（输入框同时置灰，与 Android 一致）；
 输入框里给出非 0 值 → 开关自动关掉（daemon 侧就是这么解释的，见 `docs/daemon-api.md` §3.1）。
 页面不缓存限速：每次重绘都从 `/api/state` 取，所以别人（脚本 / 另一台）改了限速，这里也会跟着变。
+
+跨网发现同理：开关写 `POST /api/settings/tracker`，页面不自己记状态。关掉时 P7 的「网络状态」说
+「仅局域网」；如果设置与内核现状差一次重启，开关下面多一行「重启后生效」（daemon 的
+`trackerRestartRequired`），不把「已点的值」冒充成「已经生效」。
 
 ## 4. 内嵌：资源表怎么来的（现在只是兜底）
 
@@ -189,6 +197,7 @@ bash scripts/build-windows.sh --no-evidence  # 只编译
 bash scripts/build-windows.sh --clean        # 先清 windows/build
 bash scripts/package-windows.sh              # 绿色版：jlink runtime + exe + jar → dist/Huchuan/
 bash windows/scripts/capture-team-ui.sh      # 组队通告 + 限速的三张取证图（三个 daemon，见 §6.1）
+bash windows/scripts/capture-tracker-ui.sh   # 跨网发现关闭态的一张取证图（一个 daemon，见 §6.2）
 ```
 
 四道关，任一不过脚本退出非 0：
@@ -258,7 +267,8 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 
 ## 6. 截图清单
 
-`artifacts/windows/ui/` 共 16 张，每张一个独立进程。涉及数据的断言写的是取证 daemon 那份料的字面：
+构建门禁的 `artifacts/windows/ui/` 共 16 张，每张一个独立进程（另有 §6.1 / §6.2 两个脚本产的 4 张也落在同一目录）。
+涉及数据的断言写的是取证 daemon 那份料的字面：
 
 | 文件 | 页 | 状态 | 断言文案 |
 | --- | --- | --- | --- |
@@ -274,7 +284,7 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 | `p4-file.png` | P4 | 文件详情：进度、开关、限速、评论 | 单文件限速 |
 | `p5-new-group.png` | P5 | 新群组：邀请码后 8 位 / 加入 / 新建群组 | 新建群组 |
 | `p6-members.png` | P6 | 成员列表 + 邀请码 | 邀请码 |
-| `p7-settings.png` | P7 | 设置抽屉：用户名 / 全局限速 / 通知 / 网络状态 | 全局限速 |
+| `p7-settings.png` | P7 | 设置抽屉：用户名 / 全局限速 / 通知 / 跨网发现 / 网络状态 | 全局限速 |
 | `p2-home-dark.png` | P2 | 深色 | 老板的群 |
 | `p4-file-dark.png` | P4 | 深色 | 单文件限速 |
 | `p7-settings-dark.png` | P7 | 深色 | 全局限速 |
@@ -304,11 +314,32 @@ C1 的 `teammates` 变成 1、`teamSize` = 2、`sessionUploadLimitKbps` 读回 5
 「内核读回 上行 512 KB/s」。截图与 `teammates-index.json` 落在同一个 `artifacts/windows/ui/`，
 同名 `.log` 是那一页的完整壳日志（含 `DOM 探针(shot)` 原文）。
 
+### 6.2 跨网发现（关闭态）的一张
+
+`bash windows/scripts/capture-tracker-ui.sh` 起一个专用 daemon（数据目录 `artifacts/windows/tracker/`），
+里面在启动前就写了 `trackerEnabled=false`；建一个群，然后离屏截 P7：
+
+| 文件 | 页 | 状态 | 断言文案 |
+| --- | --- | --- | --- |
+| `p7-tracker.png` | P7 | 跨网发现关闭：开关关、地址只读、网络状态「仅局域网」 | 仅局域网 |
+
+脚本先断言 API 与日志侧的事实：`/api/settings/tracker` 读回 `enabled=false active=false`、
+`kernel_started` 里 `tracker=off`、建群后没有 `tracker_service_started` / `tracker_register` /
+`tracker_announce`；截图那一步再断言 DOM 探针里有「跨网发现」「仅局域网」和地址原文，
+PNG 与 `tracker-index.json` 落在 `artifacts/windows/ui/`。
+
+为什么不用 47200：那是 daemon 的默认端口，同机可能已经被别的服务或别的 agent 的 daemon 占着。
+这条取证用 47260，让壳通过 `--daemon-port=47260`（任务表的 `daemonPort` 字段）连它；
+daemon 还用 `--device-name=Tracker-Off` 认领 health，避免把占着同一端口的别人进程当成自己的。
+
 ## 7. 页面与文案
 
 文案表在 `windows/resources/web/js/app.js` 顶部（`COPY`），逐条对应
 `docs/design/product-spec.md` §3 各页「文案」行。改文案的顺序：先改 spec，再改 `COPY`，
 再跑一次 `bash scripts/build-windows.sh` 让截图断言跟着更新（断言文案在 `ui-capture-jobs.json`）。
+
+P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增的三条 Windows 文案，spec §3 P7 的元素表
+与文案行还没列进去（`docs/design/` 不归本任务改）；合并时由设计 agent 补进 spec，以免两处各说一套。
 
 导航与状态全部纯 JS：`#/p0`…`#/p7` 是路由，返回栈在 `Nav` 里，不依赖浏览器历史。
 
@@ -342,7 +373,10 @@ C1 的 `teammates` 变成 1、`teamSize` = 2、`sessionUploadLimitKbps` 读回 5
 6. **绿色版自带 JRE**：`dist/Huchuan/` 里带着 jlink 裁出来的 `runtime/`（26.88 MiB），目标机
    不用装 Java。只有在既没有 `runtime/` 又没装 Java 的机器上（比如直接跑 `windows/build/Huchuan.exe`），
    壳才退回内嵌页面并显示「网络不可用」。打包见 `docs/daemon-api.md` §8。
-7. **跨网还没开**：只走局域网 mDNS + 手动地址，没有 tracker、没有打洞、没有端口映射窗口。
+7. **跨网发现已接，但没有打洞与端口映射**：默认开、地址是已部署的 Worker（P7 只读展示）；
+   关掉只走局域网 mDNS + 手动地址，P7 的网络状态显示「仅局域网」。私有群的 infohash 不进
+   DHT / PEX（协议 §8），tracker 只收 groupHash20。开关与地址只在 daemon 启动时装配，P7 改了
+   要重启进程才生效（页面显示「重启后生效」）；本机 DNS 被拦时注册会失败，局域网不受影响。
 8. **无鉴权**：daemon 只监听 127.0.0.1，本机任何进程都能调它的 API。M1 接受这个前提。
 
 ## 10. 体积
@@ -351,11 +385,11 @@ C1 的 `teammates` 变成 1、`teamSize` = 2、`sessionUploadLimitKbps` 读回 5
 | --- | --- |
 | `index.html` | 973 |
 | `css/tokens.css` | 2,672 |
-| `css/app.css` | 16,319 |
-| `js/data.js` | 18,395 |
-| `js/app.js` | 43,245 |
-| **页面资源合计** | **81,604**（预算 200 KB） |
-| `Huchuan.exe` | 385,024（WebView2 运行时是系统组件，不在 exe 内） |
-| `daemon.jar` | 8,107,170（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
+| `css/app.css` | 16,489 |
+| `js/data.js` | 19,699 |
+| `js/app.js` | 44,735 |
+| **页面资源合计** | **84,568**（预算 200 KB） |
+| `Huchuan.exe` | 388,096（WebView2 运行时是系统组件，不在 exe 内） |
+| `daemon.jar` | 8,144,605（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
 | `runtime/`（jlink） | 28,186,664（26.88 MiB，模块 `java.base,java.logging,jdk.crypto.ec`） |
-| **`dist/Huchuan` 合计** | **36,678,858**（34.98 MiB，拷走就能跑，目标机不用装 Java） |
+| **`dist/Huchuan` 合计** | **36,719,365**（35.02 MiB，拷走就能跑，目标机不用装 Java） |

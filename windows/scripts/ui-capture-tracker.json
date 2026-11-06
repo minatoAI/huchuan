@@ -1,0 +1,16 @@
+{
+  "note": "P7「跨网发现」关闭态的一张取证图。page 必须等于 document.body.dataset.page，expect 必须出现在截图那一刻的 DOM 探针里。数据来自 windows/scripts/capture-tracker-ui.sh 的装置：daemon 启动前就写了 trackerEnabled=false，所以 P7 显示开关=关、地址只读、网络状态=仅局域网。daemonPort 让壳连到这台装置专用的端口（47200 可能被同机别的服务占着，见 docs/windows-ui.md §6.2）。",
+  "jobs": [
+    {
+      "name": "p7-tracker",
+      "route": "p7",
+      "theme": "light",
+      "page": "p7",
+      "expect": "仅局域网",
+      "daemonPort": 47260,
+      "shotDelayMs": 2000,
+      "shotTimeoutMs": 20000,
+      "describe": "P7 设置抽屉：跨网发现关闭（开关关 + 只读地址 + 网络状态仅局域网）"
+    }
+  ]
+}

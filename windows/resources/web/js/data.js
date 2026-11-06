@@ -109,6 +109,8 @@ const Api = (function () {
     patchSettings: function (patch) { return call('POST', '/api/settings', patch); },
     limits: function () { return call('GET', '/api/settings/limits'); },
     setLimits: function (patch) { return call('POST', '/api/settings/limits', patch); },
+    tracker: function () { return call('GET', '/api/settings/tracker'); },
+    setTracker: function (patch) { return call('POST', '/api/settings/tracker', patch); },
     shutdown: function () { return call('POST', '/api/shutdown', {}); },
     wsUrl: function () { return base.replace(/^http/, 'ws') + '/ws'; },
   };
@@ -202,6 +204,11 @@ const Store = (function () {
     // 内核读回：会话里真正生效的值（0 = 不限），与上面两个「用户设置」是两回事
     sessionUploadLimitKbps: 0,
     sessionDownloadLimitKbps: 0,
+    // 跨网发现：enabled 是落盘设置，active 是内核此刻有没有在跑（两者差一次进程重启）
+    trackerEnabled: true,
+    trackerBaseUrl: '',
+    trackerActive: false,
+    trackerRestartRequired: false,
   };
 
   let groups = [];
@@ -239,6 +246,10 @@ const Store = (function () {
     device.unlimited = data.settings ? data.settings.unlimited !== false : true;
     device.sessionUploadLimitKbps = (data.settings && data.settings.sessionUploadLimitKbps) || 0;
     device.sessionDownloadLimitKbps = (data.settings && data.settings.sessionDownloadLimitKbps) || 0;
+    device.trackerEnabled = data.settings ? data.settings.trackerEnabled !== false : true;
+    device.trackerBaseUrl = (data.settings && data.settings.trackerBaseUrl) || '';
+    device.trackerActive = !!(data.settings && data.settings.trackerActive);
+    device.trackerRestartRequired = !!(data.settings && data.settings.trackerRestartRequired);
 
     groups = (data.groups || []).map(toGroup);
     groupIndex = {};
@@ -432,6 +443,16 @@ const Store = (function () {
     setUnlimited: function (unlimited) {
       device.unlimited = !!unlimited;
       return silent(Api.setLimits({ unlimited: device.unlimited }).then(function () { return refresh(true); }));
+    },
+
+    /**
+     * 跨网发现开关。daemon 只把它落盘：tracker 在进程启动时装配，改完要重启才生效。
+     * 镜像里的 trackerActive / trackerRestartRequired 是 daemon 给的内核现状，
+     * 所以开关点了之后页面能同时说清「设置已关」和「本次进程里还没关」。
+     */
+    setTrackerEnabled: function (enabled) {
+      device.trackerEnabled = !!enabled;
+      return silent(Api.setTracker({ enabled: device.trackerEnabled }).then(function () { return refresh(true); }));
     },
 
     createGroup: function (name) {
