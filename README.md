@@ -14,7 +14,7 @@ Android 客户端用 Compose，Windows 客户端是 Win32 加 WebView2 壳。两
 | 评论 | 可用 | 每个文件一条签名追加日志，离线补差时逐条验签 |
 | 限速 | 可用 | 单文件限速与全局限速（上行、下行），下发内核后读回校验 |
 | 跨平台 | 可用 | Android 与 Windows 互通，同一协议、同一内核 |
-| 公开种子 | 未实现 | 只有设计文档 `docs/design/public-swarm.md`，客户端里没有入口 |
+| 公开种子 | 可用 | 私有文件可「公开到群外」另建公开种子做种，群成员用磁力导入；公开侧独立会话、独立端口与目录 |
 
 ## 平台与最低版本
 
@@ -50,7 +50,7 @@ bash scripts/build-windows.sh     # windows/build/Huchuan.exe，首次会从 NuG
 bash scripts/package-windows.sh   # dist/Huchuan/：exe + daemon.jar + 精简 JRE
 ```
 
-跨网发现的 tracker 用仓库里的 `worker/`，部署见 `docs/deploy-cloudflare.md`（`cd worker` 后 `npx --yes wrangler@3 login`、`npx --yes wrangler@3 deploy`）。
+跨网发现的 tracker 用仓库里的 `worker/`，入口用 `pages/` 转发（国内 `*.workers.dev` 被阻断，客户端走 `*.pages.dev`）。部署见 `docs/deploy-cloudflare.md`。
 
 ## 验收
 
@@ -61,13 +61,16 @@ bash scripts/package-windows.sh   # dist/Huchuan/：exe + daemon.jar + 精简 JR
 | `bash scripts/m1-headless.sh` | 两个 JVM 进程建群、后 8 位加入、32 MiB 传输、SHA-256 比对、评论往返，并断言 DHT 关闭 | JDK 17，不需要设备 |
 | `bash scripts/m1-windows.sh` | 两个 daemon 全程只走 HTTP 与 WS：建群、加入、共享、下载、评论、限速读回、tracker 接线 | Windows 与 MSVC |
 | `bash scripts/m1-device.sh --quick` | 真机与桌面 JVM 对端互通，P0 自检到 P6 成员页，两端 SHA-256 一致 | 一台 arm64 真机与 adb |
+| `bash scripts/e2e-public.sh` | 公开种子端到端：A 发布 32 MiB，B 只拿磁力经公开会话取元数据并下载，两端 SHA-256 一致 | JDK 17，不需要设备 |
+| `bash scripts/verify-notify.sh` | 通知三档：系统气泡 / 静音 / 仅应用内，含权限撤销 | 一台 Android 13+ 真机与 adb |
+| `bash scripts/verify-tracker-wiring.sh` | 跨网发现开关：开启有注册尝试，关闭零请求 | 一台真机与 adb |
 
 `scripts/m2-team-verify.sh` 与 `scripts/verify-targetsdk37.sh` 绑定了具体设备序列号（环境变量可覆盖），用前先读脚本头部注释。
 
 ## 隐私边界
 
 - 私有群里每个 torrent 固定带 `DISABLE_DHT | DISABLE_LSD | DISABLE_PEX`（`0x380000`）。会话层关闭 DHT 与 LSD、清空 bootstrap 节点、关闭 UPnP 与 NAT-PMP，群的 infohash 不会进入任何公网发现面。
-- `ip_filter` 只放行私网与回环地址，因此当前版本的文件传输只在同一局域网内成立。跨网发现（自建 Worker tracker）与手动 IP:port 已在代码里，但公网方向的 BitTorrent 连接被这条 filter 挡着，把群成员的公网地址并入 filter 还没做。
+- `ip_filter` 放行私网、回环与**消息层确认过的群成员公网地址**（来自 `peer.announce`、tracker 候选、手动 IP:port），未登记的公网地址一律拒绝。跨网传输是否真的通，还取决于两端的 NAT 类型；本项目的验收只覆盖局域网与同机回环，没有做过真实跨网实测。
 - mDNS 广播只带版本、群 id、BT 端口与会话标识，不带群名，也不带在线人数。
 - 跨网发现默认开着，默认地址是作者部署的一个 Worker 实例（`app/.../AppPrefs.kt`、`daemon/.../SettingsStore.kt` 里的默认值），不是本仓库自带的公共服务。它能看到你的公网 IP、由邀请码派生的群标识、设备 id 前缀与端口。要自己掌握这一跳就部署 `worker/` 换成自己的地址，或在设置里关掉「跨网发现」。
 
