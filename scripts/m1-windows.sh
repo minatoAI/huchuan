@@ -17,6 +17,9 @@
 #   4. web     ：A 的 Web UI 数据通路返回的是真数据（页面、data.js、/api/state）
 #   5. package ：绿色版 dist/Huchuan/Huchuan.exe 在「PATH 里没有 java、JAVA_HOME 为空」
 #                的环境里也能把 daemon 拉起来（复现没装 Java 的机器）
+#   6. limit   ：全局限速下发内核后**读回**会话里生效的值（512 ↔ 0），并采队友数，
+#                确认做种者不计入队友（spec §306）；≥1 的组队取证见
+#                windows/scripts/capture-team-ui.sh
 #
 # 端口用文档里写死的固定值 47200 / 47201。占用就 FAIL，不静默换端口 ——
 # 换端口等于没验「默认端口能起」。
@@ -297,6 +300,30 @@ JOIN_SRC_FOUND=$(grep -o 'event=join_via source=[a-z]*' "$LOG_B" 2>/dev/null | h
 if [ -n "$JOIN_SRC_FOUND" ]; then JOIN_SRC="$JOIN_SRC_FOUND"; fi
 chk "join.via_$JOIN_SRC" "$([ "$JOIN_SRC" != "unknown" ] && echo 1 || echo 0)"
 
+# ------------------------------------------------------------------ 5b. 全局限速（P7）
+# 断言的是「内核读回」而不是「daemon 回显了请求」：settings 里存的值和会话里生效的值是两回事，
+# libtorrent 的 settings_pack 不持久化，只有 applySettings 之后读回来的一手数据才算数。
+say "--- B 全局限速：下发 512 → 读回 512，下发 0 → 读回 0"
+LIMITS_512=$(post "http://127.0.0.1:$PORT_B/api/settings/limits" '{"uploadKbps":512,"downloadKbps":512}')
+LIM_UP=$(ival "$LIMITS_512" sessionUploadLimitKbps)
+LIM_DOWN=$(ival "$LIMITS_512" sessionDownloadLimitKbps)
+chk "limits.512_readback (up=$LIM_UP down=$LIM_DOWN)" \
+  "$([ "$LIM_UP" = "512" ] && [ "$LIM_DOWN" = "512" ] && echo 1 || echo 0)"
+
+LIMITS_ZERO=$(post "http://127.0.0.1:$PORT_B/api/settings/limits" '{"uploadKbps":0,"downloadKbps":0}')
+LIM_UP0=$(ival "$LIMITS_ZERO" sessionUploadLimitKbps)
+LIM_DOWN0=$(ival "$LIMITS_ZERO" sessionDownloadLimitKbps)
+chk "limits.0_readback (up=$LIM_UP0 down=$LIM_DOWN0)" \
+  "$([ "$LIM_UP0" = "0" ] && [ "$LIM_DOWN0" = "0" ] && echo 1 || echo 0)"
+
+LIMITS_GET=$(get "http://127.0.0.1:$PORT_B/api/settings/limits")
+chk "limits.get_matches_kernel ($(ival "$LIMITS_GET" sessionDownloadLimitKbps))" \
+  "$([ "$(ival "$LIMITS_GET" sessionDownloadLimitKbps)" = "0" ] && echo 1 || echo 0)"
+chk "limits.kernel_applied_log" \
+  "$(grep -q 'event=session_limit_applied .*session_up_kbps=512 .*ok=true' "$LOG_B" 2>/dev/null && echo 1 || echo 0)"
+chk "limits.no_apply_error" \
+  "$(grep -q 'event=session_limit_applied .*ok=false' "$LOG_B" 2>/dev/null && echo 0 || echo 1)"
+
 # ------------------------------------------------------------------ 6. B 看到文件并下载
 say "--- B 等文件清单、激活下载"
 SEEN_B=""
@@ -322,13 +349,25 @@ chk "download.activated (state=$ACT_STATE)" "$([ "$ACT_STATE" = "downloading" ] 
 
 TRANSFER_T0=$(date +%s)
 DETAIL_B=""
+# 下载期间顺带采样队友数：这一轮只有 A 一个做种者，按 spec §306 做种者不计入队友，
+# 所以 B 侧全程必须是 0（读口真的接上了，而不是恒 0 的占位字段 —— ≥1 的取证见
+# windows/scripts/capture-team-ui.sh 的三进程场景）。
+TEAM_MAX=0
+TEAM_SAMPLES=0
 i=0
 while [ "$i" -lt "$((WAIT_TRANSFER_S * 2))" ]; do
   DETAIL_B=$(get "http://127.0.0.1:$PORT_B/api/groups/$GID_B/files/$FID")
   case "$DETAIL_B" in *'"complete":true'*) break ;; esac
+  T=$(ival "$DETAIL_B" teammates)
+  if [ -n "$T" ]; then
+    TEAM_SAMPLES=$((TEAM_SAMPLES + 1))
+    [ "$T" -gt "$TEAM_MAX" ] && TEAM_MAX=$T
+  fi
   sleep 0.5
   i=$((i + 1))
 done
+chk "team.teammates_field_read ($TEAM_SAMPLES 次采样)" "$([ "$TEAM_SAMPLES" -gt 0 ] && echo 1 || echo 0)"
+chk "team.seeder_not_counted (teammates_max=$TEAM_MAX)" "$([ "$TEAM_MAX" = "0" ] && echo 1 || echo 0)"
 TRANSFER_S=$(( $(date +%s) - TRANSFER_T0 ))
 COMPLETE=$(bval "$DETAIL_B" complete)
 PCT=$(ival "$DETAIL_B" progressPercent)
@@ -402,6 +441,11 @@ chk "web.state_has_comment" "$(printf '%s' "$STATE_A" | grep -q "$COMMENT_BODY" 
 chk "web.state_file_complete" "$(printf '%s' "$STATE_A" | grep -q '"complete":true' && echo 1 || echo 0)"
 STATE_MEMBERS=$(ival "$STATE_A" memberCount)
 chk "web.state_member_count_2 ($STATE_MEMBERS)" "$([ "$STATE_MEMBERS" = "2" ] && echo 1 || echo 0)"
+# /api/state 是页面的唯一读口：队友数与全局限速的内核读回都得在这一份里（页面不另发请求）
+chk "web.state_has_teammates_field" "$(printf '%s' "$STATE_A" | grep -q '\"teammates\":' && echo 1 || echo 0)"
+chk "web.state_has_team_size" "$(printf '%s' "$STATE_A" | grep -q '\"teamSize\":' && echo 1 || echo 0)"
+chk "web.state_has_session_limits" \
+  "$(printf '%s' "$STATE_A" | grep -q '\"sessionUploadLimitKbps\":' && printf '%s' "$STATE_A" | grep -q '\"sessionDownloadLimitKbps\":' && echo 1 || echo 0)"
 
 SET_SAVED=$(post "http://127.0.0.1:$PORT_A/api/settings" '{"userName":"A-Node-User"}')
 chk "settings.user_name_saved" \

@@ -1,0 +1,35 @@
+{
+  "note": "组队通告 + 限速的三张取证图。page 必须等于 document.body.dataset.page，expect 必须出现在截图那一刻的 DOM 探针里。数据来自 windows/scripts/capture-team-ui.sh 的三进程装置：S 做种、C1/C2 同时下载同一个 32 MiB 文件（全局限速 128 KB/s，让传输停在「部分」状态），截图截的是 C1（daemon 在 47200）。队友数按 spec §306 观测：做种者不计入，所以 C1 的 teammates=1 → 界面 n=2。p7 那张在出图前把 C1 的上行改成 512 并读回，断言的是「内核读回」那一行而不是输入框。",
+  "jobs": [
+    {
+      "name": "p3-team",
+      "route": "p3",
+      "theme": "light",
+      "page": "p3",
+      "expect": "组队 2 人",
+      "shotDelayMs": 2000,
+      "shotTimeoutMs": 20000,
+      "describe": "P3 文件行：队友 ≥1 时出现「组队 n 人」chip（n = 队友数 + 1）"
+    },
+    {
+      "name": "p4-team",
+      "route": "p4",
+      "theme": "light",
+      "page": "p4",
+      "expect": "正在组队 · 2 人",
+      "shotDelayMs": 2000,
+      "shotTimeoutMs": 20000,
+      "describe": "P4 文件详情：「正在组队 · n 人」一行 + 单文件限速（KB/s + 读回）"
+    },
+    {
+      "name": "p7-limits",
+      "route": "p7",
+      "theme": "light",
+      "page": "p7",
+      "expect": "上行 512 KB/s",
+      "shotDelayMs": 2000,
+      "shotTimeoutMs": 20000,
+      "describe": "P7 设置抽屉：全局限速（KB/s 后缀 + 内核读回值）"
+    }
+  ]
+}

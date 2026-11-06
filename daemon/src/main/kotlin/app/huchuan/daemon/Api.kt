@@ -39,7 +39,7 @@ class Api(private val daemon: Daemon) {
             when (val group = segments[1]) {
                 "health" -> health(request)
                 "state" -> state(request)
-                "settings" -> settingsRoute(request)
+                "settings" -> settingsRoute(request, segments.drop(2))
                 "join" -> joinRoute(request)
                 "shutdown" -> shutdownRoute(request)
                 "logs" -> logsRoute(request)
@@ -77,15 +77,87 @@ class Api(private val daemon: Daemon) {
         return ok(daemon.snapshot())
     }
 
-    private fun settingsRoute(request: HttpRequest): HttpResponse {
+    /**
+     * `/api/settings`（用户名等通用设置）与 `/api/settings/limits`（全局限速）共用这条路由。
+     *
+     * 限速是唯一需要「下发内核」的设置项：改完必须立刻 applySettings，不能只落 settings.json ——
+     * 落盘的只是下次启动要恢复的目标值。
+     */
+    private fun settingsRoute(request: HttpRequest, rest: List<String>): HttpResponse {
+        if (rest.isNotEmpty()) {
+            return when (rest[0]) {
+                "limits" -> limitsRoute(request)
+                else -> fail("E_NOT_FOUND", request.path, 404)
+            }
+        }
         return when (request.method) {
             "GET" -> ok(jobj("settings" to daemon.settingsJson()))
             "POST" -> {
-                val body = request.json()
-                if (body == null) return fail("E_BAD_JSON", "body 必须是 JSON 对象", 400)
+                val body = request.json() as? J.Obj
+                    ?: return fail("E_BAD_JSON", "body 必须是 JSON 对象", 400)
                 daemon.settings.applyPatch(body)
+                if (body.fields.keys.any { LIMIT_FIELDS.contains(it) }) daemon.applySessionLimits()
                 daemon.bump("settings_changed")
                 ok(jobj("settings" to daemon.settingsJson()))
+            }
+            else -> methodNotAllowed(request)
+        }
+    }
+
+    /**
+     * 全局限速（P7）：GET 给当前设置 + 内核读回，POST 下发内核后回**内核读回值**。
+     *
+     * 回包里 `sessionUploadLimitKbps` / `sessionDownloadLimitKbps` 是会话里真正生效的值（读的是
+     * libtorrent 的 settings，不是 daemon 自己的记录）。读到的与要的不一样时 daemon 日志有一行
+     * `session_limit_applied … ok=false`，脚本可以断言它不出现。
+     */
+    private fun limitsRoute(request: HttpRequest): HttpResponse {
+        return when (request.method) {
+            "GET" -> ok(jobj("limits" to daemon.limitsJson()))
+            "POST" -> {
+                val body = request.json() as? J.Obj
+                    ?: return fail("E_BAD_JSON", "body 必须是 JSON 对象", 400)
+                val patch = LinkedHashMap<String, J>()
+                var positive = false
+                for ((apiKey, settingKey) in KPBS_FIELDS) {
+                    if (!body.fields.containsKey(apiKey)) continue
+                    val value = (body.fields[apiKey] as? J.Num)?.value
+                        ?: return fail("E_BAD_LIMIT", apiKey + " 必须是整数（0 = 不限）", 400)
+                    if (value < 0 || value > MAX_LIMIT_KBPS) {
+                        return fail(
+                            "E_BAD_LIMIT",
+                            apiKey + " 超出范围：0–" + MAX_LIMIT_KBPS + "（0 = 不限）",
+                            400,
+                        )
+                    }
+                    if (value > 0) positive = true
+                    // 请求体用 uploadKbps / downloadKbps（跟界面上的 KB/s 一致），落盘字段沿用旧名，
+                    // 免得老 settings.json 里的 uploadLimitKbps 认不出来。
+                    patch[settingKey] = jnum(value)
+                }
+                if (body.fields.containsKey("unlimited")) {
+                    val flag = body.fields["unlimited"] as? J.Bool
+                        ?: return fail("E_BAD_LIMIT", "unlimited 必须是布尔", 400)
+                    patch["unlimited"] = flag
+                } else if (positive) {
+                    // 显式给了一个非 0 的值就是要限速：顺手把「不限」开关关掉，
+                    // 否则调用方还得记得补一个 unlimited=false（Android 端的界面也是这么理解输入框的）。
+                    patch["unlimited"] = jbool(false)
+                }
+                if (patch.isEmpty()) {
+                    return fail("E_BAD_LIMIT", "至少给一项：uploadKbps / downloadKbps / unlimited", 400)
+                }
+                daemon.settings.applyPatch(J.Obj(patch))
+                val readBack = daemon.applySessionLimits()
+                daemon.bump("limits_changed")
+                daemon.log.event(
+                    "api_limits_set",
+                    mapOf(
+                        "session_up_kbps" to readBack.first.toString(),
+                        "session_down_kbps" to readBack.second.toString(),
+                    ),
+                )
+                ok(jobj("limits" to daemon.limitsJson()))
             }
             else -> methodNotAllowed(request)
         }
@@ -320,5 +392,14 @@ class Api(private val daemon: Daemon) {
 
     companion object {
         private const val DEFAULT_JOIN_TIMEOUT_MS = 25_000L
+
+        /** `/api/settings` 里会触及内核会话的那几个字段。 */
+        private val LIMIT_FIELDS = setOf("uploadLimitKbps", "downloadLimitKbps", "unlimited")
+
+        /** `/api/settings/limits` 的两个 KB/s 字段：请求体名字 → settings.json 里的字段名。 */
+        private val KPBS_FIELDS = listOf("uploadKbps" to "uploadLimitKbps", "downloadKbps" to "downloadLimitKbps")
+
+        /** 与 core 的 saneKbps 同一个上限（Int.MAX_VALUE / 1024），超出直接拒绝而不是悄悄截断。 */
+        private const val MAX_LIMIT_KBPS = Int.MAX_VALUE / 1024
     }
 }

@@ -107,6 +107,8 @@ const Api = (function () {
     },
     settings: function () { return call('GET', '/api/settings'); },
     patchSettings: function (patch) { return call('POST', '/api/settings', patch); },
+    limits: function () { return call('GET', '/api/settings/limits'); },
+    setLimits: function (patch) { return call('POST', '/api/settings/limits', patch); },
     shutdown: function () { return call('POST', '/api/shutdown', {}); },
     wsUrl: function () { return base.replace(/^http/, 'ws') + '/ws'; },
   };
@@ -159,6 +161,7 @@ function toFile(json) {
     seeders: json.seeders || 0,
     teammates: json.teammates || 0,
     uploadLimitKbps: json.uploadLimitKbps || 0,
+    uploadLimitInForce: !!json.uploadLimitInForce,
     downloadRateBps: json.downloadRateBps || 0,
     uploadRateBps: json.uploadRateBps || 0,
     savedPath: json.savedPath || '',
@@ -196,6 +199,9 @@ const Store = (function () {
     uploadLimitKbps: 0,
     downloadLimitKbps: 0,
     unlimited: true,
+    // 内核读回：会话里真正生效的值（0 = 不限），与上面两个「用户设置」是两回事
+    sessionUploadLimitKbps: 0,
+    sessionDownloadLimitKbps: 0,
   };
 
   let groups = [];
@@ -231,6 +237,8 @@ const Store = (function () {
     device.uploadLimitKbps = (data.settings && data.settings.uploadLimitKbps) || 0;
     device.downloadLimitKbps = (data.settings && data.settings.downloadLimitKbps) || 0;
     device.unlimited = data.settings ? data.settings.unlimited !== false : true;
+    device.sessionUploadLimitKbps = (data.settings && data.settings.sessionUploadLimitKbps) || 0;
+    device.sessionDownloadLimitKbps = (data.settings && data.settings.sessionDownloadLimitKbps) || 0;
 
     groups = (data.groups || []).map(toGroup);
     groupIndex = {};
@@ -400,11 +408,16 @@ const Store = (function () {
       return silent(Api.patchSettings({ userName: value }).then(function () { return refresh(true); }));
     },
 
+    /**
+     * 全局限速走 POST /api/settings/limits：daemon 会把它下发内核会话（applySettings，运行期生效），
+     * 回包里的 session*Kbps 是内核读回值。镜像里的 device.* 只是「用户想要的值」，
+     * 界面上「内核读回」那一行读的是 session*Kbps。
+     */
     setUploadLimit: function (kbps) {
       const value = Math.max(0, kbps | 0);
       device.uploadLimitKbps = value;
       later('upload', 400, function () {
-        silent(Api.patchSettings({ uploadLimitKbps: device.uploadLimitKbps }).then(function () { return refresh(true); }));
+        silent(Api.setLimits({ uploadKbps: device.uploadLimitKbps }).then(function () { return refresh(true); }));
       });
     },
 
@@ -412,13 +425,13 @@ const Store = (function () {
       const value = Math.max(0, kbps | 0);
       device.downloadLimitKbps = value;
       later('download', 400, function () {
-        silent(Api.patchSettings({ downloadLimitKbps: device.downloadLimitKbps }).then(function () { return refresh(true); }));
+        silent(Api.setLimits({ downloadKbps: device.downloadLimitKbps }).then(function () { return refresh(true); }));
       });
     },
 
     setUnlimited: function (unlimited) {
       device.unlimited = !!unlimited;
-      return silent(Api.patchSettings({ unlimited: device.unlimited }).then(function () { return refresh(true); }));
+      return silent(Api.setLimits({ unlimited: device.unlimited }).then(function () { return refresh(true); }));
     },
 
     createGroup: function (name) {
@@ -491,14 +504,21 @@ function groupSeedingCount(group) {
 
 function groupTeamSize(group) {
   return group.files.reduce(function (max, file) {
-    return fileInTeam(file) ? Math.max(max, file.teamSize) : max;
+    return fileInTeam(file) ? Math.max(max, fileTeamSize(file)) : max;
   }, 0);
 }
 
+/**
+ * 组队是否该出现在界面上（P3 的 chip 与 P4 的「正在组队」行共用这一个判定）。
+ * 口径同 Android 的 GroupFile.showsTeam()：内核给出的队友数 ≥ 1，且本机还在「部分」。
+ * 本机到 100% 时内核已经把 teammates 归零，这里再卡一次进度是给「进度满了、状态还没翻页」
+ * 的那一拍兜底，保证这一行立刻消失。
+ */
 function fileInTeam(file) {
-  return file.state === FileState.DOWNLOADING && file.teammates > 0;
+  return file.teammates > 0 && file.progressPercent < 100;
 }
 
+/** 界面上的「n 人」= 队友数 + 1（含本机，docs/design/product-spec.md:306）。 */
 function fileTeamSize(file) {
   return file.teammates + 1;
 }
