@@ -51,25 +51,80 @@ object LinkDefaults {
     const val MAX_FILE_BYTES = 1L shl 30
     const val MAX_FILE_NAME_BYTES = 255
 
-    /** 建链预算 15 s（§5-7）；传输期同一访客 90 s 无进展即收回（§5-10）。 */
-    const val SIGNAL_BUDGET_MS = 15_000L
+    /**
+     * 访客口径的建链预算 15 s（§5-7）：从 join 起算，握手必须在这个窗口内完成。
+     * 分享者只在「房里已经有访客」时按这个口径算；挂着等访客走 [SHARER_WAIT_FROM_EXPIRY]。
+     */
+    const val GUEST_CONNECT_BUDGET_MS = 15_000L
+
+    /** 旧名，等价于 [GUEST_CONNECT_BUDGET_MS]（宿主以前把它当成「一个连接的总时长」）。 */
+    const val SIGNAL_BUDGET_MS = GUEST_CONNECT_BUDGET_MS
+
+    /** 分享者等待预算的默认值：0 = 按分享剩余有效期推（见 [LinkTimeouts.sharerWaitMs]）。 */
+    const val SHARER_WAIT_FROM_EXPIRY = 0L
+
+    /** 传输期同一访客 90 s 无进展即收回（§5-10）。 */
     const val TRANSFER_IDLE_MS = 90_000L
 
-    /** 断线重连的退避（spike §4：没有 resume 帧，只能重新 join）。 */
+    /** 断线重连的退避（spike §4：没有 resume 帧，只能重新 join）：1/2/4/8/16 s，30 s 封顶。 */
     const val RECONNECT_BASE_MS = 1_000L
     const val RECONNECT_MAX_MS = 30_000L
     const val RECONNECT_MAX_ATTEMPTS = 5
+
+    /** 进入终态后多久关传输（给最后一帧留窗口）。 */
+    const val CLOSE_DELAY_MS = 100L
 }
 
-/** 每一步的超时预算；测试可以缩短。 */
-class LinkTimeouts @JvmOverloads constructor(
-    val signalBudgetMs: Long = LinkDefaults.SIGNAL_BUDGET_MS,
+/**
+ * 链接分享的三类预算。**访客口径和分享者口径是两件事，不要合成一个数**：
+ *
+ *   - [guestConnectBudgetMs]（默认 15 s，§5-7）：建链预算。访客从 join 起算；分享者在房里
+ *     出现访客的那一刻起算。握手（offer / answer / DTLS）必须在这个窗口内完成。
+ *   - [sharerWaitBudgetMs]（默认 0 = 按分享剩余有效期）：分享者「挂着等访客」的总时长。
+ *     等待期不判 connect-failed；信令连接保持，掉线按 1/2/4/8/16 s 退避重连，可反复接入访客。
+ *     访客在场时暂停计时，访客走了按剩余额度接着等；单次重连不续满、不耗尽这笔预算。
+ *   - [transferIdleMs]（默认 90 s，§5-10）：传输期同一访客无进展即收回。
+ *
+ * 测试可以缩短。[reconnectDelayMs] 与 [sharerWaitMs] 是纯函数，harness 直接断言。
+ */
+class LinkTimeouts(
+    val guestConnectBudgetMs: Long = LinkDefaults.GUEST_CONNECT_BUDGET_MS,
+    val sharerWaitBudgetMs: Long = LinkDefaults.SHARER_WAIT_FROM_EXPIRY,
     val transferIdleMs: Long = LinkDefaults.TRANSFER_IDLE_MS,
     val reconnectBaseMs: Long = LinkDefaults.RECONNECT_BASE_MS,
     val reconnectMaxMs: Long = LinkDefaults.RECONNECT_MAX_MS,
     val maxReconnectAttempts: Int = LinkDefaults.RECONNECT_MAX_ATTEMPTS,
-    val closeDelayMs: Long = 100L,
-)
+    val closeDelayMs: Long = LinkDefaults.CLOSE_DELAY_MS,
+) {
+
+    /**
+     * 兼容旧写法：以前只有一个「建链预算」，宿主把分享剩余有效期塞进来当分享者的等待时长
+     * （app/LinkSession.kt 的临时补丁）。现在它只表示 [sharerWaitBudgetMs]，
+     * 访客建链预算固定走 [guestConnectBudgetMs]，宿主不必再自己塞 TTL。
+     */
+    constructor(signalBudgetMs: Long) : this(sharerWaitBudgetMs = signalBudgetMs)
+
+    /**
+     * 分享者的等待预算：显式 [sharerWaitBudgetMs] > 0 就用它，否则等于分享剩余有效期
+     * （expiresAt - now），有效期缺失时回落到默认 TTL。永不为负、最少 1 ms ——
+     * 已经过期的分享交给 Worker 回 410，不在这里判死。
+     */
+    @JvmOverloads
+    fun sharerWaitMs(expiresAt: Long, nowMs: Long = System.currentTimeMillis()): Long {
+        if (sharerWaitBudgetMs > 0L) return sharerWaitBudgetMs
+        if (expiresAt > 0L) return (expiresAt - nowMs).coerceAtLeast(1L)
+        return (LinkDefaults.TTL_DEFAULT_SEC * 1000L).coerceAtLeast(1L)
+    }
+
+    /** 第 attempt 次（1 基）重连的退避：默认 1/2/4/8/16 s，[reconnectMaxMs] 封顶。 */
+    fun reconnectDelayMs(attempt: Int): Long {
+        var delay = reconnectBaseMs.coerceAtLeast(1L)
+        repeat((attempt - 1).coerceAtLeast(0)) {
+            delay = if (delay > reconnectMaxMs / 2L) reconnectMaxMs else delay * 2L
+        }
+        return delay.coerceIn(1L, reconnectMaxMs)
+    }
+}
 
 /**
  * 一条分享里的文件元信息。fileId 是本机内核的条目 id（P9 用它回到 P8 / 找到本地文件），

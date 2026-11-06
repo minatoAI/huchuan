@@ -32,7 +32,7 @@ import java.util.function.BooleanSupplier;
 /**
  * 链接分享服务端交互层的无头验收（harness，不碰真 WebRTC）。
  *
- * 四组断言，每组都有一个能把它打红的现实缺陷：
+ * 五组断言，每组都有一个能把它打红的现实缺陷：
  *   1. 注册表：POST /api/share、GET /api/shares、DELETE /api/share/{id} 的路径、请求体、
  *      鉴权字段（撤销签名）逐项对照 worker，签名用 DeviceIdentity 独立验一遍。
  *   2. 信令状态机：分享者 + 访客在本机 mock WS 上完成 share-join / share-incoming /
@@ -40,10 +40,15 @@ import java.util.function.BooleanSupplier;
  *      由访客验过，状态再进 TRANSFERRING。
  *   3. 断线重连：分享者掉线后访客按 spike 的结论重新 join（Worker 不重放 share-incoming），
  *      回到 CONNECTED；重连次数进日志。
- *   4. 超时与撤销：不来的 share-incoming 必须把状态打到 FAILED 且不抛异常；撤销后房间里的
- *      人收 bye gone，新访客连不上（HTTP 410，且根本没有 share-join 帧发出）。
+ *   4. 两套预算（§5-7）：分享者挂着等访客用**等待预算**（默认 = 分享剩余有效期），60 s 没
+ *      访客仍在线，中途掐一次连接也不把预算续满；等待预算耗尽（3 s TTL）才 FAILED(wait-expired)。
+ *      访客口径的建链预算固定 15 s，没等来 offer 就 FAILED(connect-failed)。
+ *   5. 超时与撤销：撤销后房间里的人收 bye gone，新访客连不上（HTTP 410，且根本没有
+ *      share-join 帧发出）；访客收工后分享者回到等待相，能接着接待下一个。
  *
  * 断言全走生产类：[ShareRegistry] / [SignalClient] / [LinkProtocol]。mock 只模拟服务端语义。
+ * 反向变异：-Dhuchuan.mutants=sharer_budget_15s 把分享者退回 15 s 固定预算，
+ * link.wait.sharer_alive_after_60s 必须 FAIL（命令见 docs/core.md §3.11）。
  */
 final class LinkSelfTest {
 
@@ -77,6 +82,7 @@ final class LinkSelfTest {
             byteLayer(counting);
             registryLayer(counting, server);
             signalLayer(counting, server, clients);
+            waitLayer(counting, server, clients);
             System.out.println("selftest.link checks=" + counts[0] + " failures=" + counts[1]
                     + " requests=" + server.requests().size()
                     + " ws_upgrades=" + server.upgrades().size()
@@ -122,7 +128,9 @@ final class LinkSelfTest {
         check.accept("link.sdp_without_fingerprint_empty",
                 LinkProtocol.INSTANCE.fingerprintOfSdp("v=0\r\n").isEmpty());
         check.accept("link.guest_limit_is_1", LinkDefaults.MAX_GUESTS == 1);
-        check.accept("link.signal_budget_15s", LinkDefaults.SIGNAL_BUDGET_MS == 15_000L);
+        check.accept("link.guest_connect_budget_15s", LinkDefaults.GUEST_CONNECT_BUDGET_MS == 15_000L);
+        check.accept("link.signal_budget_alias_15s", LinkDefaults.SIGNAL_BUDGET_MS == 15_000L);
+        check.accept("link.sharer_wait_defaults_to_expiry", LinkDefaults.SHARER_WAIT_FROM_EXPIRY == 0L);
         check.accept("link.transfer_idle_90s", LinkDefaults.TRANSFER_IDLE_MS == 90_000L);
     }
 
@@ -248,7 +256,9 @@ final class LinkSelfTest {
         Recorder ownerEvents = new Recorder("owner");
         Recorder guestEvents = new Recorder("guest");
         ShareRegistry registry = new ShareRegistry(server.baseUrl(), owner, new Recorder("signal-registry"));
-        LinkTimeouts fast = new LinkTimeouts(5_000L, 60_000L, 100L, 1_000L, 10, 60L);
+        // (guestConnect, sharerWait, transferIdle, reconnectBase, reconnectMax, attempts, closeDelay)
+        // sharerWait = 0 表示按分享剩余有效期推（这里 1 h），分享者整个用例里都不会等超时。
+        LinkTimeouts fast = new LinkTimeouts(5_000L, 0L, 60_000L, 100L, 1_000L, 10, 60L);
         TransportFactory factory = new TransportFactory() {
             @Override
             public Transport create() {
@@ -359,21 +369,218 @@ final class LinkSelfTest {
                 && rejectedUpgrade.status == 410
                 && created.getShareId().equals(rejectedUpgrade.shareId));
 
-        // ---- 超时：不来的 share-incoming 必须 FAILED，且不抛异常 ----
+        // ---- 等待预算到点：分享者挂着等访客，等满预算就 FAILED，且不抛异常 ----
         Recorder timeoutEvents = new Recorder("timeout");
         ShareCreateResult timeoutShare = registry.create(
                 List.of(new ShareFile("file-4", "slow.bin", 16L, "application/octet-stream")),
                 60L);
-        LinkTimeouts shortBudget = new LinkTimeouts(250L, 60_000L, 100L, 1_000L, 5, 60L);
+        // 显式等待预算 250 ms（默认是分享剩余有效期，这里缩短以便快速断言）。
+        LinkTimeouts shortBudget = new LinkTimeouts(5_000L, 250L, 60_000L, 100L, 1_000L, 5, 60L);
         SignalClient slow = SignalClient.Companion.forSharer(
                 timeoutShare.endpoint(), owner, factory, timeoutEvents, shortBudget);
         clients.add(slow);
         check.accept("link.timeout.start", slow.start());
         check.accept("link.timeout.failed", slow.awaitState(LinkState.FAILED, 5_000L));
-        check.accept("link.timeout.reason", "connect-failed".equals(slow.getFailureReason()));
-        check.accept("link.timeout.logged", timeoutEvents.logEvents.contains("link_timeout")
-                && timeoutEvents.transitions.contains("SIGNALING->FAILED"));
-        check.accept("link.timeout.failure_callback", "connect-failed".equals(timeoutEvents.lastFailure));
+        check.accept("link.timeout.reason", "wait-expired".equals(slow.getFailureReason()));
+        // 状态先翻、日志/回调随后写（setState 在锁内 notify），断言要等一下，不能读到半截。
+        check.accept("link.timeout.logged", await(
+                () -> timeoutEvents.logEvents.contains("link_timeout")
+                        && timeoutEvents.transitions.contains("SIGNALING->FAILED"), 2_000L));
+        check.accept("link.timeout.failure_callback",
+                await(() -> "wait-expired".equals(timeoutEvents.lastFailure), 2_000L));
+    }
+
+    /* -------------------------------------------------------------- 4. 两套预算（等待 vs 建链） */
+
+    /**
+     * 分享者「挂着等」和访客「建链」是两套预算，这里逐条钉住：
+     *   - 60 s 没有访客仍在线（等待预算 = 分享剩余有效期），中途掐一次连接也不续满；
+     *   - 等待预算只有 3 s（短 TTL）时到点 FAILED(wait-expired)，重连同样不续满；
+     *   - 接待完一个访客后仍能接待下一个（等待预算没被一次访问吃光）；
+     *   - 访客 15 s 没等来 offer 就 FAILED(connect-failed)。
+     *
+     * 反向变异：-Dhuchuan.mutants=sharer_budget_15s 把分享者改回 15 s 固定预算，
+     * link.wait.sharer_alive_after_60s 必须红（命令见 docs/core.md §3.11）。
+     */
+    private static void waitLayer(BiConsumer<String, Boolean> check, MockLinkServer server, List<SignalClient> clients) {
+        DeviceIdentity owner = DeviceIdentity.Companion.generate();
+        DeviceIdentity guest = DeviceIdentity.Companion.generate();
+        ShareRegistry registry = new ShareRegistry(server.baseUrl(), owner, new Recorder("wait-registry"));
+        TransportFactory factory = new TransportFactory() {
+            @Override
+            public Transport create() {
+                return new JavaWsTransport();
+            }
+        };
+        // 等待预算的断言不该耗在 1/2/4/8/16 s 的默认退避上：退避压到 100 ms，其余按默认。
+        LinkTimeouts fastReconnect = new LinkTimeouts(
+                LinkDefaults.GUEST_CONNECT_BUDGET_MS, LinkDefaults.SHARER_WAIT_FROM_EXPIRY,
+                60_000L, 100L, 1_000L, 10, 60L);
+
+        // ---- 纯函数口径：等待预算默认等于分享剩余有效期，显式参数优先 ----
+        LinkTimeouts defaults = new LinkTimeouts();
+        long now = System.currentTimeMillis();
+        check.accept("link.wait.budget_from_expiry",
+                Math.abs(defaults.sharerWaitMs(now + 120_000L) - 120_000L) <= 2_000L);
+        check.accept("link.wait.budget_explicit_wins",
+                new LinkTimeouts(LinkDefaults.GUEST_CONNECT_BUDGET_MS, 3_000L, 60_000L, 100L, 1_000L, 5, 60L)
+                        .sharerWaitMs(now + 120_000L) == 3_000L);
+        check.accept("link.wait.budget_never_negative", defaults.sharerWaitMs(now - 5_000L) >= 1L);
+        check.accept("link.wait.budget_without_expiry",
+                defaults.sharerWaitMs(0L) == LinkDefaults.TTL_DEFAULT_SEC * 1000L);
+        boolean backoffOk = defaults.reconnectDelayMs(1) == 1_000L
+                && defaults.reconnectDelayMs(2) == 2_000L
+                && defaults.reconnectDelayMs(3) == 4_000L
+                && defaults.reconnectDelayMs(4) == 8_000L
+                && defaults.reconnectDelayMs(5) == 16_000L
+                && defaults.reconnectDelayMs(6) == 30_000L;
+        check.accept("link.wait.reconnect_backoff_1_2_4_8_16", backoffOk);
+
+        // ---- ① 分享者等 60 s 无访客仍在线（等待预算 = 分享剩余有效期 ≈120 s）----
+        ShareCreateResult longShare = registry.create(
+                List.of(new ShareFile("file-wait", "wait.bin", 64L, "application/octet-stream")),
+                120L);
+        ShareEndpoint sharerEndpoint = longShare.endpoint();
+        long waitBudgetAtStart = fastReconnect.sharerWaitMs(longShare.getExpiresAt());
+        check.accept("link.wait.long_endpoint", sharerEndpoint != null);
+        Recorder ownerEvents = new Recorder("wait-owner");
+        SignalClient sharer = SignalClient.Companion.forSharer(sharerEndpoint, owner, factory, ownerEvents, fastReconnect);
+        ownerEvents.client = sharer;
+        clients.add(sharer);
+        long t0 = System.nanoTime();
+        check.accept("link.wait.sharer_start", sharer.start());
+        check.accept("link.wait.sharer_open", await(() -> ownerEvents.logEvents.contains("link_open"), 5_000L));
+        check.accept("link.wait.budget_logged", countEvent(ownerEvents, "link_wait") >= 1);
+
+        // 10 s 处由服务端掐一次连接：重连照旧，但等待预算不因此续满。
+        sleepUntil(t0, 10_000L);
+        boolean aliveBeforeDrop = sharer.getState() == LinkState.SIGNALING && !sharer.isTerminal();
+        MockLinkServer.Share dropRoom = server.shareByToken(longShare.getToken());
+        if (dropRoom != null && dropRoom.sharer != null) {
+            dropRoom.sharer.close(1001, "test-drop");
+        }
+        boolean reconnected = await(() -> countEvent(ownerEvents, "link_open") >= 2, 10_000L);
+
+        sleepUntil(t0, 60_000L);
+        long waitedMs = (System.nanoTime() - t0) / 1_000_000L;
+        String sharerStateAt60 = String.valueOf(sharer.getState());
+        check.accept("link.wait.sharer_alive_after_60s (state=" + sharerStateAt60 + " waited=" + waitedMs + "ms)",
+                sharer.getState() == LinkState.SIGNALING && !sharer.isTerminal());
+        check.accept("link.wait.sharer_reconnected_during_wait (opens="
+                        + countEvent(ownerEvents, "link_open") + " attempts=" + sharer.getReconnectAttempts() + ")",
+                aliveBeforeDrop && reconnected && countEvent(ownerEvents, "link_reconnect") >= 1);
+        check.accept("link.wait.sharer_no_timeout_while_waiting", countEvent(ownerEvents, "link_timeout") == 0);
+
+        // ---- ② 反向：等待预算只有 3 s（短 TTL）→ 到点 FAILED(wait-expired)，重连不续满 ----
+        ShareCreateResult shortShare = registry.create(
+                List.of(new ShareFile("file-short", "short.bin", 32L, "application/octet-stream")),
+                60L);
+        // 端点的 expiresAt 只影响客户端口径：Worker 记录仍是 60 s，所以 WS 升级不会被拒。
+        ShareEndpoint shortEndpoint = new ShareEndpoint(
+                shortShare.getBaseUrl(), shortShare.getShareId(), shortShare.getToken(),
+                System.currentTimeMillis() + 3_000L, "", "", LinkDefaults.MAX_GUESTS);
+        Recorder shortEvents = new Recorder("wait-short");
+        SignalClient shortSharer = SignalClient.Companion.forSharer(shortEndpoint, owner, factory, shortEvents, fastReconnect);
+        shortEvents.client = shortSharer;
+        clients.add(shortSharer);
+        long shortT0 = System.nanoTime();
+        check.accept("link.wait.short_start", shortSharer.start());
+        check.accept("link.wait.short_open", await(() -> shortEvents.logEvents.contains("link_open"), 2_000L));
+        sleepUntil(shortT0, 1_000L);
+        MockLinkServer.Share shortRoom = server.shareByToken(shortShare.getToken());
+        if (shortRoom != null && shortRoom.sharer != null) {
+            shortRoom.sharer.close(1001, "test-drop-short");
+        }
+        boolean shortTerminal = shortSharer.awaitTerminal(10_000L);
+        long shortElapsed = (System.nanoTime() - shortT0) / 1_000_000L;
+        check.accept("link.wait.short_failed (state=" + shortSharer.getState() + " elapsed=" + shortElapsed + "ms)",
+                shortTerminal && shortSharer.getState() == LinkState.FAILED);
+        check.accept("link.wait.short_reason", "wait-expired".equals(shortSharer.getFailureReason()));
+        check.accept("link.wait.short_reconnect_not_refilled (elapsed=" + shortElapsed + "ms)",
+                shortElapsed >= 2_700L && shortElapsed < 3_900L);
+        check.accept("link.wait.short_reconnect_happened", countEvent(shortEvents, "link_reconnect") >= 1);
+        check.accept("link.wait.short_timeout_logged", countEvent(shortEvents, "link_timeout") >= 1);
+
+        // ---- ③ 接待完一个访客后仍能接待下一个（等待预算没被一次访问吃光）----
+        ShareLookupResult lookup = registry.get(longShare.getToken());
+        ShareEndpoint guestEndpoint = lookup.endpoint();
+        check.accept("link.wait.guest_endpoint", guestEndpoint != null);
+        int incomingBefore = ownerEvents.incomingCount.get();
+        Recorder guest1Events = new Recorder("wait-guest1");
+        SignalClient guest1 = SignalClient.Companion.forGuest(guestEndpoint, guest, factory, guest1Events, fastReconnect);
+        guest1Events.client = guest1;
+        clients.add(guest1);
+        check.accept("link.wait.guest1_start", guest1.start());
+        check.accept("link.wait.guest1_connected", guest1.awaitState(LinkState.CONNECTED, 8_000L)
+                && sharer.awaitState(LinkState.CONNECTED, 8_000L));
+        check.accept("link.wait.guest1_incoming", ownerEvents.incomingCount.get() == incomingBefore + 1);
+        sharer.markTransferring();
+        guest1.markTransferring();
+        check.accept("link.wait.guest1_transferring", sharer.awaitState(LinkState.TRANSFERRING, 3_000L)
+                && guest1.awaitState(LinkState.TRANSFERRING, 3_000L));
+        guest1.finish();
+        check.accept("link.wait.guest1_done", guest1.awaitState(LinkState.DONE, 3_000L));
+        check.accept("link.wait.sharer_back_to_waiting", await(
+                () -> sharer.getState() == LinkState.SIGNALING && !sharer.isTerminal(), 5_000L));
+        check.accept("link.wait.visit_end_logged", countEvent(ownerEvents, "link_visit_end") >= 1
+                && countEvent(ownerEvents, "link_wait") >= 2);
+
+        await(() -> {
+            MockLinkServer.Share room = server.shareByToken(longShare.getToken());
+            return room != null && room.guest == null;
+        }, 5_000L);
+        Recorder guest2Events = new Recorder("wait-guest2");
+        SignalClient guest2 = SignalClient.Companion.forGuest(guestEndpoint, guest, factory, guest2Events, fastReconnect);
+        guest2Events.client = guest2;
+        clients.add(guest2);
+        check.accept("link.wait.guest2_start", guest2.start());
+        check.accept("link.wait.guest2_connected", guest2.awaitState(LinkState.CONNECTED, 8_000L)
+                && sharer.awaitState(LinkState.CONNECTED, 8_000L));
+        check.accept("link.wait.guest2_incoming", ownerEvents.incomingCount.get() == incomingBefore + 2);
+        check.accept("link.wait.sharer_not_failed", !sharer.isTerminal());
+
+        // ---- ④ 访客口径：15 s 没等来 offer → FAILED(connect-failed) ----
+        ShareCreateResult muteShare = registry.create(
+                List.of(new ShareFile("file-mute", "mute.bin", 32L, "application/octet-stream")),
+                120L);
+        MockLinkServer.Share muteRoom = server.shareByToken(muteShare.getToken());
+        Recorder muteSharerEvents = new Recorder("mute-sharer");
+        SignalClient muteSharer = SignalClient.Companion.forSharer(
+                muteShare.endpoint(), owner, factory, muteSharerEvents, fastReconnect);
+        muteSharerEvents.client = muteSharer;
+        clients.add(muteSharer);
+        check.accept("link.wait.mute_sharer_start", muteSharer.start());
+        check.accept("link.wait.mute_sharer_open", await(() -> muteSharerEvents.logEvents.contains("link_open"), 5_000L));
+        if (muteRoom != null) {
+            muteRoom.muteIncoming = true;
+        }
+        ShareEndpoint muteGuestEndpoint = registry.get(muteShare.getToken()).endpoint();
+        check.accept("link.wait.mute_guest_endpoint", muteGuestEndpoint != null);
+        Recorder guestTimeoutEvents = new Recorder("guest-timeout");
+        // 默认 LinkTimeouts：访客建链预算就是生产值 15 s。
+        SignalClient slowGuest = SignalClient.Companion.forGuest(
+                muteGuestEndpoint, guest, factory, guestTimeoutEvents, new LinkTimeouts());
+        guestTimeoutEvents.client = slowGuest;
+        clients.add(slowGuest);
+        long guestT0 = System.nanoTime();
+        check.accept("link.wait.guest_start", slowGuest.start());
+        boolean guestTerminal = slowGuest.awaitTerminal(25_000L);
+        long guestElapsed = (System.nanoTime() - guestT0) / 1_000_000L;
+        check.accept("link.wait.guest_15s_failed (state=" + slowGuest.getState() + " elapsed=" + guestElapsed + "ms)",
+                guestTerminal && slowGuest.getState() == LinkState.FAILED);
+        check.accept("link.wait.guest_15s_reason", "connect-failed".equals(slowGuest.getFailureReason()));
+        check.accept("link.wait.guest_15s_measured (elapsed=" + guestElapsed + "ms)",
+                guestElapsed >= 14_500L && guestElapsed < 20_000L);
+        check.accept("link.wait.guest_15s_logged", countEvent(guestTimeoutEvents, "link_timeout") >= 1);
+
+        // 可 grep 的实测值（断言只判上下界，这里把数字也留进日志）。
+        System.out.println("selftest.link.budgets"
+                + " wait_budget_ms=" + waitBudgetAtStart
+                + " waited60_ms=" + waitedMs + " sharer_state_at60=" + sharerStateAt60
+                + " short_elapsed_ms=" + shortElapsed + " short_state=" + shortSharer.getState()
+                + " short_reason=" + shortSharer.getFailureReason()
+                + " guest_elapsed_ms=" + guestElapsed + " guest_state=" + slowGuest.getState()
+                + " guest_reason=" + slowGuest.getFailureReason());
     }
 
     /* -------------------------------------------------------------- 工具 */
@@ -417,6 +624,35 @@ final class LinkSelfTest {
             }
         }
         return condition.getAsBoolean();
+    }
+
+    /** 等到 startNanos + millis（毫秒粒度，200 ms 一拍）。 */
+    private static void sleepUntil(long startNanos, long millis) {
+        long target = startNanos + millis * 1_000_000L;
+        while (true) {
+            long left = (target - System.nanoTime()) / 1_000_000L;
+            if (left <= 0L) {
+                return;
+            }
+            try {
+                Thread.sleep(Math.min(left, 200L));
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    private static int countEvent(Recorder recorder, String event) {
+        int count = 0;
+        synchronized (recorder.logEvents) {
+            for (String item : recorder.logEvents) {
+                if (event.equals(item)) {
+                    count++;
+                }
+            }
+        }
+        return count;
     }
 
     /** 记录事件与状态跳转；测试断言直接读列表，不需要解析日志。 */

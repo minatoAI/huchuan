@@ -27,6 +27,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   - 掉线：Worker 不重放 share-incoming（spike §4），访客必须重新 join。本类在
  *     peer-left / 异常断线后按 1/2/4/8/16 s 退避重开连接并重发 share-join；分享者同样
  *     重连，否则访客回来也找不到房间。
+ *   - 预算（§5-7）：访客口径的建链预算只在「握手」上用；分享者挂着等访客用的是等待预算
+ *     （默认 = 分享剩余有效期，见 LinkTimeouts.sharerWaitMs），期间不判 connect-failed，
+ *     访客在场时暂停计时，访客走了按剩余额度接着等 —— 一条链接因此可以长期有效、反复接入。
  *
  * 线程模型：所有状态跳转与消息处理都在一条 huchuan-link 线程上（Transport 回调只负责投递），
  * 因此 sendOffer / sendAnswer 可以安全地在事件回调里直接调用，不会和网络线程抢状态。
@@ -90,6 +93,18 @@ class SignalClient @JvmOverloads constructor(
     private var offerReceived = false
     private var everConnected = false
     private var reconnectPending = false
+
+    /** 分享者的等待相：true = 房里没有访客、正在挂着等。只有 SHARER 用。 */
+    private var waiting = false
+
+    /** 分享者等待预算总额（毫秒），start() 时定死。 */
+    private var waitBudgetMs = 0L
+
+    /** 等待预算的剩余额度（毫秒）；进入等待相时从这里起算，离开时把用掉的部分扣掉。 */
+    private var waitRemainingMs = 0L
+
+    /** 本轮等待相开始的时刻（System.nanoTime）。 */
+    private var waitingSinceNanos = 0L
     private var signalTimeout: ScheduledFuture<*>? = null
     private var transferTimeout: ScheduledFuture<*>? = null
     private var reconnectFuture: ScheduledFuture<*>? = null
@@ -99,12 +114,19 @@ class SignalClient @JvmOverloads constructor(
     fun start(): Boolean {
         if (closed.get()) return false
         if (!started.compareAndSet(false, true)) return true
+        if (role == LinkRole.SHARER) {
+            waitBudgetMs = resolveWaitBudgetMs()
+            waitRemainingMs = waitBudgetMs
+            enterWaiting()
+        }
         events.log(
             "link_start",
             mapOf(
                 "role" to roleName(),
                 "share" to share.shareId.take(8),
                 "guest_limit" to share.guestLimit.toString(),
+                "guest_budget_ms" to timeouts.guestConnectBudgetMs.toString(),
+                "wait_budget_ms" to waitBudgetMs.toString(),
             ),
         )
         submit { beginAttempt(0) }
@@ -286,7 +308,8 @@ class SignalClient @JvmOverloads constructor(
                 "role" to roleName(),
                 "attempt" to attempt.toString(),
                 "share" to share.shareId.take(8),
-                "budget_ms" to timeouts.signalBudgetMs.toString(),
+                "budget_ms" to currentBudgetMs().toString(),
+                "phase" to phaseName(),
             ),
         )
         scheduleSignalTimeout(gen)
@@ -362,6 +385,9 @@ class SignalClient @JvmOverloads constructor(
             "share-incoming" -> {
                 val visitor = msg.str("visitorId") ?: ""
                 incomingVisitorId = visitor
+                // 房里出现访客：等待预算暂停，改按访客口径的 15 s 等握手（不拿 TTL 等握手）。
+                leaveWaiting()
+                scheduleSignalTimeout(generation)
                 events.incoming(
                     msg.str("shareId") ?: share.shareId,
                     visitor,
@@ -443,7 +469,7 @@ class SignalClient @JvmOverloads constructor(
     private fun handleBye(code: String) {
         events.log("link_bye", mapOf("code" to code.ifEmpty { "?" }))
         when (code) {
-            "done" -> markDone("bye-done")
+            "done" -> if (role == LinkRole.SHARER) endVisit("bye-done") else markDone("bye-done")
             "gone" -> fail("revoked")
             "offline" -> {
                 if (everConnected && autoReconnect) scheduleReconnect("offline") else fail("offline")
@@ -451,10 +477,7 @@ class SignalClient @JvmOverloads constructor(
             "peer-left" -> {
                 if (role == LinkRole.SHARER) {
                     // 分享者的房间还活着：访客走了，回到等下一个访客的状态，不重连自己。
-                    cancelTransferTimeout()
-                    if (state == LinkState.CONNECTED || state == LinkState.TRANSFERRING) {
-                        setState(LinkState.SIGNALING)
-                    }
+                    endVisit("peer-left")
                 } else if (autoReconnect) {
                     scheduleReconnect("peer-left")
                 } else {
@@ -493,7 +516,20 @@ class SignalClient @JvmOverloads constructor(
             fail("revoked")
             return
         }
-        if (everConnected && autoReconnect) {
+        // 分享者是个长连接房间：等访客期间、以及房里的访客刚走之后，只要等待预算还有剩余就
+        // 重连（掉线即本次访问结束，回到等待相，按剩余额度续算，不续满）。
+        if (role == LinkRole.SHARER && autoReconnect) {
+            if (remainingWaitMs() > 0L) {
+                enterWaiting()
+                scheduleReconnect("closed")
+                return
+            }
+            if (waiting) {
+                fail("wait-expired")
+                return
+            }
+        }
+        if (autoReconnect && everConnected) {
             scheduleReconnect("closed")
             return
         }
@@ -510,12 +546,98 @@ class SignalClient @JvmOverloads constructor(
         events.log("link_connected", mapOf("role" to roleName(), "reason" to reason))
     }
 
+    /**
+     * 分享者这边的一次访问收工（访客发 bye{done}，或访客断开给了 bye{peer-left}）。
+     *
+     * 房间还活着、分享还没过期：回到「挂着等访客」的相，等待预算按剩余额度接着算，
+     * 下一个访客不用重新开链接。分享者自己调 [finish] 才是 DONE。
+     */
+    private fun endVisit(reason: String) {
+        if (closed.get() || isTerminal() || role != LinkRole.SHARER) return
+        cancelTransferTimeout()
+        cancelSignalTimeout()
+        events.log(
+            "link_visit_end",
+            mapOf(
+                "visitor" to incomingVisitorId.take(8),
+                "reason" to reason,
+                "state" to state.name.lowercase(),
+            ),
+        )
+        incomingVisitorId = ""
+        offerReceived = false
+        offerSdp = ""
+        if (state == LinkState.CONNECTED || state == LinkState.TRANSFERRING) {
+            setState(LinkState.SIGNALING)
+        }
+        enterWaiting()
+        scheduleSignalTimeout(generation)
+    }
+
     private fun markDone(reason: String) {
         if (closed.get() || isTerminal()) return
         events.log("link_done", mapOf("reason" to reason))
         setState(LinkState.DONE)
         cancelTimers()
         scheduleTransportClose()
+    }
+
+    /* ---------------------------------------------------------------- 分享者的等待预算 */
+
+    /** 分享者：进入「挂着等访客」的相。等待计时从这里起算，已经在等就不动刻度。 */
+    private fun enterWaiting() {
+        if (role != LinkRole.SHARER || waiting || closed.get() || isTerminal()) return
+        waiting = true
+        waitingSinceNanos = System.nanoTime()
+        events.log(
+            "link_wait",
+            mapOf(
+                "share" to share.shareId.take(8),
+                "wait_ms" to remainingWaitMs().toString(),
+                "budget_ms" to waitBudgetMs.toString(),
+            ),
+        )
+    }
+
+    /** 分享者：房里出现访客，暂停等待计时（用掉的部分扣掉，剩下的留给下一个）。 */
+    private fun leaveWaiting() {
+        if (role != LinkRole.SHARER || !waiting) return
+        val left = remainingWaitMs()
+        waitRemainingMs = left
+        waiting = false
+        events.log(
+            "link_visitor_engaged",
+            mapOf(
+                "visitor" to incomingVisitorId.take(8),
+                "budget_ms" to timeouts.guestConnectBudgetMs.toString(),
+                "wait_left_ms" to left.toString(),
+            ),
+        )
+    }
+
+    /** 等待预算的剩余额度：进入等待相后按经过的时间扣。 */
+    private fun remainingWaitMs(): Long {
+        if (role != LinkRole.SHARER) return 0L
+        val used = if (waiting) (System.nanoTime() - waitingSinceNanos) / 1_000_000L else 0L
+        return (waitRemainingMs - used).coerceAtLeast(0L)
+    }
+
+    /** 这一次尝试该看哪个预算（只用于日志与超时口径）。 */
+    private fun currentBudgetMs(): Long =
+        if (role == LinkRole.SHARER && waiting) remainingWaitMs() else timeouts.guestConnectBudgetMs
+
+    /**
+     * 分享者的等待预算：默认等于分享剩余有效期。
+     *
+     * 反向验收钩子（-Dhuchuan.mutants=sharer_budget_15s，默认关）：忽略分享有效期，退回 15 s
+     * 固定预算 —— 也就是修这个缺陷之前的样子。打开后 harness 的 link.wait.* 必须变红
+     * （docs/core.md §3.11）。显式 sharerWaitBudgetMs 仍然生效，否则变异会连"预算是参数"
+     * 这件事一起打掉，红的位置就不在等待预算上了。
+     */
+    private fun resolveWaitBudgetMs(): Long {
+        if (timeouts.sharerWaitBudgetMs > 0L) return timeouts.sharerWaitBudgetMs
+        if (sharerBudgetMutant()) return LinkDefaults.GUEST_CONNECT_BUDGET_MS
+        return timeouts.sharerWaitMs(share.expiresAt)
     }
 
     private fun scheduleReconnect(reason: String) {
@@ -533,7 +655,7 @@ class SignalClient @JvmOverloads constructor(
         reconnectAttempts = attempt
         reconnectPending = true
         invalidateTransport()
-        val delay = backoff(attempt)
+        val delay = timeouts.reconnectDelayMs(attempt)
         setState(LinkState.SIGNALING)
         events.log(
             "link_reconnect",
@@ -580,8 +702,18 @@ class SignalClient @JvmOverloads constructor(
         closeTransportQuietly(1000, code.take(60))
     }
 
+    /**
+     * 排一次「多久没进展就放弃」。两种口径，别混：
+     *   - 握手中（访客，或分享者的房里已经有访客）：建链预算 [LinkTimeouts.guestConnectBudgetMs]，
+     *     超时 FAILED(connect-failed)。
+     *   - 分享者挂着等访客：等待预算的剩余额度，超时 FAILED(wait-expired)。这笔额度跨重连、
+     *     跨访客累计，单次重连不会把它续满。
+     */
     private fun scheduleSignalTimeout(gen: Int) {
         cancelSignalTimeout()
+        val waitingForGuest = role == LinkRole.SHARER && waiting
+        val budget = if (waitingForGuest) remainingWaitMs() else timeouts.guestConnectBudgetMs
+        val step = if (waitingForGuest) "sharer-wait" else "signal"
         try {
             signalTimeout = executor.schedule(
                 {
@@ -589,13 +721,13 @@ class SignalClient @JvmOverloads constructor(
                         if (gen == generation && state == LinkState.SIGNALING && !closed.get() && !isTerminal()) {
                             events.log(
                                 "link_timeout",
-                                mapOf("step" to "signal", "budget_ms" to timeouts.signalBudgetMs.toString()),
+                                mapOf("step" to step, "budget_ms" to budget.toString(), "phase" to phaseName()),
                             )
-                            fail("connect-failed")
+                            fail(if (waitingForGuest) "wait-expired" else "connect-failed")
                         }
                     }
                 },
-                timeouts.signalBudgetMs,
+                budget.coerceAtLeast(1L),
                 TimeUnit.MILLISECONDS,
             )
         } catch (_: RejectedExecutionException) {
@@ -702,14 +834,6 @@ class SignalClient @JvmOverloads constructor(
         }
     }
 
-    private fun backoff(attempt: Int): Long {
-        var delay = timeouts.reconnectBaseMs.coerceAtLeast(1L)
-        repeat((attempt - 1).coerceAtLeast(0)) {
-            delay = if (delay > timeouts.reconnectMaxMs / 2L) timeouts.reconnectMaxMs else delay * 2L
-        }
-        return delay.coerceIn(1L, timeouts.reconnectMaxMs)
-    }
-
     private fun setState(next: LinkState) {
         val prev: LinkState
         synchronized(stateLock) {
@@ -781,6 +905,13 @@ class SignalClient @JvmOverloads constructor(
         LinkRole.GUEST -> "guest"
     }
 
+    /** 日志用：当前在用哪套预算（等访客 / 握手中）。 */
+    private fun phaseName(): String = when {
+        role == LinkRole.GUEST -> "connect"
+        waiting -> "wait"
+        else -> "connect"
+    }
+
     private fun closeReason(code: Int, reason: String): String = when (code) {
         -1, 0, 1006 -> "network"
         1000 -> "closed"
@@ -797,6 +928,17 @@ class SignalClient @JvmOverloads constructor(
     }
 
     companion object {
+        /**
+         * 反向验收钩子（-Dhuchuan.mutants=sharer_budget_15s，默认关）：把分享者的等待预算
+         * 退回固定的 15 s 建链预算，也就是修这个缺陷之前的样子。打开后 harness 的
+         * link.wait.* 那几条必须变红（docs/core.md §3.11 的复现命令）。
+         */
+        private val SHARER_BUDGET_15S: Boolean = System.getProperty("huchuan.mutants", "")
+            .split(",")
+            .any { it.trim() == "sharer_budget_15s" }
+
+        private fun sharerBudgetMutant(): Boolean = SHARER_BUDGET_15S
+
         /** 分享者：shareId / token 来自 ShareRegistry.create 的结果。 */
         fun forSharer(
             share: ShareEndpoint,

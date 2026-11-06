@@ -90,6 +90,11 @@ final class MockLinkServer implements Closeable {
         final long expiresAt;
         final AtomicInteger visitCount = new AtomicInteger();
         volatile boolean revoked;
+        /**
+         * 测试开关：为 true 时访客的 share-join 不再转给分享者（分享者"装死"）。
+         * 用来把访客晾在 SIGNALING 上，验证访客口径的 15 s 建链预算。
+         */
+        volatile boolean muteIncoming;
         volatile Rfc6455 sharer;
         volatile Rfc6455 guest;
 
@@ -640,12 +645,14 @@ final class MockLinkServer implements Closeable {
                         "shareId", str(share.shareId),
                         "visitorId", str(connection.visitorId)
                 )));
-                sharer.sendText(Json.INSTANCE.write(obj(
-                        "t", str("share-incoming"),
-                        "shareId", str(share.shareId),
-                        "visitorId", str(connection.visitorId),
-                        "epPub", str(message.str("epPub") == null ? "" : message.str("epPub"))
-                )));
+                if (!share.muteIncoming) {
+                    sharer.sendText(Json.INSTANCE.write(obj(
+                            "t", str("share-incoming"),
+                            "shareId", str(share.shareId),
+                            "visitorId", str(connection.visitorId),
+                            "epPub", str(message.str("epPub") == null ? "" : message.str("epPub"))
+                    )));
+                }
                 return;
             }
             if ("answer".equals(type) || "ice".equals(type) || "bye".equals(type)) {
@@ -951,6 +958,9 @@ final class MockLinkServer implements Closeable {
             this.share = share;
             this.in = socket.getInputStream();
             this.out = socket.getOutputStream();
+            // 升级后这条连接是长连接（分享者要挂很久等访客）：撤掉 HTTP 阶段的 10 s 读超时，
+            // 否则 mock 会每 10 s 把空闲的 WS 掐掉（客户端看到 1006），这不是 worker 的行为。
+            socket.setSoTimeout(0);
         }
 
         void start() {
