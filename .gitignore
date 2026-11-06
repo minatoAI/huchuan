@@ -13,6 +13,7 @@ captures/
 # 不纳入版本库的临时目录
 .worktrees/
 spikes/
+!docs/spikes/
 artifacts/
 windows/build/
 windows/.tools/
