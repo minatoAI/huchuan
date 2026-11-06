@@ -1,7 +1,9 @@
 package app.huchuan.daemon
 
+import app.huchuan.core.FileScope
 import app.huchuan.core.m1.GroupRuntime
 import app.huchuan.core.m1.J
+import app.huchuan.core.m1.PublicMagnetResult
 import app.huchuan.core.m1.jarr
 import app.huchuan.core.m1.jbool
 import app.huchuan.core.m1.jnum
@@ -325,16 +327,22 @@ class Api(private val daemon: Daemon) {
     private fun filesRoute(request: HttpRequest, group: GroupRuntime, rest: List<String>): HttpResponse {
         if (rest.isEmpty()) {
             return when (request.method) {
-                "GET" -> ok(jobj(
-                    "files" to jarr(group.files().map { daemon.fileJson(group, it) }),
-                    "fileCount" to jnum(group.files().size.toLong()),
-                ))
+                "GET" -> {
+                    val files = daemon.visibleFiles(group)
+                    ok(jobj(
+                        "files" to jarr(files.map { daemon.fileJson(group, it) }),
+                        "fileCount" to jnum(files.size.toLong()),
+                    ))
+                }
                 "POST" -> addFile(request, group)
                 else -> methodNotAllowed(request)
             }
         }
+        // 磁力导入是集合级动作：/files/import-magnet（fileId 一律 40 位 hex，不会撞）。
+        if (rest.size == 1 && rest[0] == "import-magnet") return importMagnet(request, group)
         val fileId = rest[0]
-        val entry = group.file(fileId) ?: return fail("E_NO_FILE", fileId, 404)
+        // 本机移除过的条目按「不存在」处理：详情 / 评论 / 激活 / 限速 / 再移除一律 404。
+        val entry = daemon.visibleFile(group, fileId) ?: return fail("E_NO_FILE", fileId, 404)
         if (rest.size == 1) {
             if (request.method != "GET") return methodNotAllowed(request)
             return ok(jobj(
@@ -350,6 +358,7 @@ class Api(private val daemon: Daemon) {
             }
             "active" -> activeRoute(request, group, fileId)
             "upload-limit" -> uploadLimitRoute(request, group, fileId)
+            "remove" -> removeFile(request, group, fileId)
             else -> fail("E_NOT_FOUND", request.path, 404)
         }
     }
@@ -409,7 +418,7 @@ class Api(private val daemon: Daemon) {
         if (request.method != "POST") return methodNotAllowed(request)
         val body = request.json() ?: return fail("E_BAD_JSON", "body 必须是 JSON 对象", 400)
         val active = body.bool("active") ?: return fail("E_BAD_ACTIVE", "active 必填（true=激活 / false=休眠）", 400)
-        val entry = group.file(fileId) ?: return fail("E_NO_FILE", fileId, 404)
+        val entry = daemon.visibleFile(group, fileId) ?: return fail("E_NO_FILE", fileId, 404)
         val role = group.localRole(fileId)
         if (active) {
             if (role == GroupRuntime.LocalRole.NONE) {
@@ -445,8 +454,120 @@ class Api(private val daemon: Daemon) {
         group.setUploadLimitKbps(fileId, kbps)
         daemon.settings.setUploadLimit(fileId, kbps)
         daemon.bump("upload_limit_changed")
-        val entry = group.file(fileId)
+        val entry = daemon.visibleFile(group, fileId)
         return ok(jobj("file" to if (entry == null) jstr("") else daemon.fileJson(group, entry)))
+    }
+
+    /**
+     * 磁力导入（public-swarm §3）：把链接交给内核的公开会话，等元数据。
+     *
+     * 回包分两层看：
+     *   - 请求层（HTTP 状态 + 顶层 code）：非法链接 400 / 重复 409 / 公开会话没起来 503；
+     *   - 结果层（200 的 data）：内核对「条目已入库」的判定，字段与 core 的 PublicMagnetResult 同名。
+     *     data.ok=false 表示**条目已经建好、文件信息还没到手**（core 的 no_source / timeout /
+     *     bad_metadata），不是请求失败；条目照常出现在 state 里，内核继续找源并在到手后回填。
+     *
+     * timeoutMs 默认 0：daemon 不等元数据就回包（页面靠 WS 推送看后续变化）；要同步结果就显式给，
+     * 上限 120 s。name 只用于列表显示，超长截断到 120 字。
+     */
+    private fun importMagnet(request: HttpRequest, group: GroupRuntime): HttpResponse {
+        if (request.method != "POST") return methodNotAllowed(request)
+        val body = request.json() as? J.Obj
+            ?: return fail("E_BAD_JSON", "body 必须是 JSON 对象", 400)
+        val magnet = (body.str("magnet") ?: "").trim()
+        val name = body.str("name")?.trim()?.takeIf { it.isNotEmpty() }?.take(MAX_MAGNET_NAME)
+        val timeoutMs = (body.num("timeoutMs") ?: DEFAULT_MAGNET_TIMEOUT_MS)
+            .coerceIn(0L, MAX_MAGNET_TIMEOUT_MS)
+        val kernel = daemon.kernelOrNull() ?: return fail("E_NO_KERNEL", "daemon 还没起好", 503)
+
+        val started = System.currentTimeMillis()
+        val result = kernel.addPublicMagnet(group.groupId, magnet, name, timeoutMs)
+        val elapsed = System.currentTimeMillis() - started
+        daemon.log.event(
+            "api_magnet_import",
+            mapOf(
+                "gid" to group.groupId,
+                "file_id" to result.fileId,
+                "ok" to result.ok.toString(),
+                "reason" to result.reason,
+                "size" to result.size.toString(),
+                "timeout_ms" to timeoutMs.toString(),
+                "ms" to elapsed.toString(),
+            ),
+        )
+        return when (result.reason) {
+            PublicMagnetResult.INVALID_LINK ->
+                magnetFail(PublicMagnetResult.INVALID_LINK, result.message, 400, result.fileId)
+            PublicMagnetResult.DUPLICATE ->
+                magnetFail(PublicMagnetResult.DUPLICATE, result.message, 409, result.fileId)
+            // 路由已经先按 group 找过一次；这里只兜内核侧的竞态（群刚好被删）。
+            PublicMagnetResult.NO_GROUP -> fail("E_NO_GROUP", result.message, 404)
+            PublicMagnetResult.SESSION_ERROR ->
+                magnetFail(PublicMagnetResult.SESSION_ERROR, result.message, 503, result.fileId)
+            else -> {
+                val fields = LinkedHashMap<String, J>()
+                fields["ok"] = jbool(result.ok)
+                fields["fileId"] = jstr(result.fileId)
+                fields["code"] = jstr(result.reason)
+                fields["message"] = jstr(result.message)
+                // 条目一定在（core 的语义：除非法 / 重复外都入库）；file 是给页面省一次刷新用的。
+                result.entry?.let { fields["file"] = daemon.fileJson(group, it) }
+                ok(J.Obj(fields))
+            }
+        }
+    }
+
+    /**
+     * 磁力导入的请求级失败：沿用全站 {ok:false, code, error}，并带上内核同名的
+     * message / fileId（重复时 fileId 是撞上的那条 infohash）。见 docs/daemon-api.md。
+     */
+    private fun magnetFail(code: String, message: String, status: Int, fileId: String): HttpResponse =
+        HttpResponse.json(
+            jobj(
+                "ok" to jbool(false),
+                "code" to jstr(code),
+                "error" to jstr(message),
+                "message" to jstr(message),
+                "fileId" to jstr(fileId),
+            ),
+            status,
+        )
+
+    /**
+     * 本地移除（public-swarm §5.2）：只从本机列表消失，不广播、不删磁盘文件。
+     *
+     * 只对公开条目开放：P4 的「移除」菜单只长在公开条目上，私有条目的正确动作是「休眠」。
+     * 正在跑的任务先休眠，否则移除之后公开会话还在替它上传；已下载到盘上的文件不动。
+     * 隐藏标记落在 settings.json，重启后仍然隐藏（别的成员照旧能看到这个条目）。
+     */
+    private fun removeFile(request: HttpRequest, group: GroupRuntime, fileId: String): HttpResponse {
+        if (request.method != "POST") return methodNotAllowed(request)
+        val entry = daemon.visibleFile(group, fileId) ?: return fail("E_NO_FILE", fileId, 404)
+        if (entry.scope != FileScope.PUBLIC) {
+            return fail("E_NOT_PUBLIC", "私有条目不能移除，只能休眠", 409)
+        }
+        val wasActive = group.localRole(fileId) != GroupRuntime.LocalRole.NONE
+        // 无条件摘掉会话里的任务：磁力导入的 torrent 在「激活」之前就已经挂在公开会话里找源
+        // （不摘的话移除之后它还在后台拉元数据，公开会话也不会按需停）。
+        group.stopFile(fileId)
+        daemon.settings.hideFile(group.groupId, fileId)
+        daemon.bump("file_removed")
+        daemon.log.event(
+            "api_file_remove_local",
+            mapOf(
+                "gid" to group.groupId,
+                "file_id" to fileId,
+                "scope" to entry.scope.wire,
+                "was_active" to wasActive.toString(),
+                "file_kept" to (group.savedFile(fileId)?.isFile == true).toString(),
+            ),
+        )
+        return ok(jobj(
+            "fileId" to jstr(fileId),
+            "removed" to jbool(true),
+            // 明确告诉调用方：这是本机动作，群里其他人不会跟着删（M2 才有 file.del）。
+            "broadcast" to jbool(false),
+        ))
     }
 
     private fun methodNotAllowed(request: HttpRequest): HttpResponse =
@@ -463,5 +584,17 @@ class Api(private val daemon: Daemon) {
 
         /** 与 core 的 saneKbps 同一个上限（Int.MAX_VALUE / 1024），超出直接拒绝而不是悄悄截断。 */
         private const val MAX_LIMIT_KBPS = Int.MAX_VALUE / 1024
+
+        /**
+         * 磁力导入默认不等元数据：daemon 是异步状态模型，条目入库即回包，元数据到手后由内核
+         * 后台回填并推 WS。调用方要同步结果就显式给 timeoutMs（core 的默认是 60 s）。
+         */
+        private const val DEFAULT_MAGNET_TIMEOUT_MS = 0L
+
+        /** 同步等待的上限：比 core 的默认 60 s 宽，但别让一个 HTTP 请求挂到天亮。 */
+        private const val MAX_MAGNET_TIMEOUT_MS = 120_000L
+
+        /** 条目名只用于列表显示；帧上限 65533 B，留足余量。 */
+        private const val MAX_MAGNET_NAME = 120
     }
 }

@@ -90,6 +90,23 @@ const Api = (function () {
     addFile: function (gid, path) {
       return call('POST', '/api/groups/' + encodeURIComponent(gid) + '/files', { path: path });
     },
+    /**
+     * 磁力导入：data 里是内核的结果 { ok, fileId, code, message, file }。
+     * data.ok=false 不是请求失败 —— 条目已经建好，只是文件信息还没到手（no_source / timeout），
+     * 列表里会出现「等待来源」，内核继续找源。非法链接 / 重复导入会 reject，err.code 是
+     * invalid_link / duplicate（见 docs/daemon-api.md 3.3）。
+     */
+    importMagnet: function (gid, magnet, name, timeoutMs) {
+      const body = { magnet: String(magnet || '') };
+      const trimmed = name === undefined || name === null ? '' : String(name).trim();
+      if (trimmed) body.name = trimmed;
+      if (timeoutMs !== undefined && timeoutMs !== null) body.timeoutMs = Math.max(0, timeoutMs | 0);
+      return call('POST', '/api/groups/' + encodeURIComponent(gid) + '/files/import-magnet', body);
+    },
+    /** 本地移除（只从本机列表消失，不广播、不删文件）。公开条目专属。 */
+    removeFile: function (gid, fid) {
+      return call('POST', '/api/groups/' + encodeURIComponent(gid) + '/files/' + encodeURIComponent(fid) + '/remove', {});
+    },
     setActive: function (gid, fid, active) {
       return call('POST', '/api/groups/' + encodeURIComponent(gid) + '/files/' + encodeURIComponent(fid) + '/active', { active: !!active });
     },
@@ -512,6 +529,28 @@ const Store = (function () {
         const created = data.file;
         return refresh(true).then(function () {
           return created ? (Store.file(groupId, created.id) || created) : null;
+        });
+      });
+    },
+
+    /**
+     * 公开种子（磁力）导入。回包里的 ok 是内核判定：false = 条目已建好、文件信息还没到手
+     * （no_source / timeout / bad_metadata），条目仍在列表里等来源；非法链接 / 重复导入会
+     * reject，err.code 分别是 invalid_link / duplicate。
+     */
+    importMagnet: function (groupId, magnet, name, timeoutMs) {
+      return Api.importMagnet(groupId, magnet, name, timeoutMs).then(function (result) {
+        return refresh(true).then(function () {
+          return result;
+        });
+      });
+    },
+
+    /** 本地移除：只影响本机（不广播、不删文件），刷新后这个条目就不再出现在列表里。 */
+    removeFile: function (groupId, fileId) {
+      return Api.removeFile(groupId, fileId).then(function (data) {
+        return refresh(true).then(function () {
+          return data;
         });
       });
     },

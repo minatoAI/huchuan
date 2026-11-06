@@ -38,6 +38,14 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
     private val uploadLimits = ConcurrentHashMap<String, Int>()
     private val seedPaths = ConcurrentHashMap<String, String>()
 
+    /**
+     * P4「移除」的本地隐藏标记（public-swarm §5.2）：只从本机列表消失，不广播、不删磁盘文件。
+     *
+     * 内核没有「本地移除」这个动作（条目还在 core 的清单里，别的成员照旧能看到），
+     * 所以隐藏记在 daemon 侧；key 是 gid + "/" + fileId（两者都是定长字母数字，不会撞分隔符）。
+     */
+    private val hiddenFiles = ConcurrentHashMap<String, Boolean>()
+
     fun load() {
         if (!file.isFile) return
         try {
@@ -57,6 +65,9 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
             root.obj("seedPaths")?.fields?.forEach { (fileId, value) ->
                 (value as? J.Str)?.let { seedPaths[fileId] = it.value }
             }
+            root.obj("hiddenFiles")?.fields?.forEach { (key, value) ->
+                if ((value as? J.Bool)?.value == true) hiddenFiles[key] = true
+            }
         } catch (e: Throwable) {
             log.event("settings_load_error", mapOf("error" to e.toString()))
         }
@@ -74,6 +85,7 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
             "notifications" to J.Obj(notifications.entries.associate { it.key to jstr(it.value) }),
             "uploadLimits" to J.Obj(uploadLimits.entries.associate { it.key to jnum(it.value.toLong()) }),
             "seedPaths" to J.Obj(seedPaths.entries.associate { it.key to jstr(it.value) }),
+            "hiddenFiles" to J.Obj(hiddenFiles.keys.associate { it to app.huchuan.core.m1.jbool(true) }),
         )
         try {
             file.parentFile?.mkdirs()
@@ -160,6 +172,19 @@ class SettingsStore(private val file: File, private val log: DaemonLogger) {
         uploadLimits[fileId] = kbps.coerceAtLeast(0)
         save()
     }
+
+    /**
+     * 本地隐藏（P4「移除」）。只影响 daemon 的投影，core 的清单与别的成员都不受影响。
+     * 与 [hideFile] 成对：落盘之后重启仍然隐藏。
+     */
+    fun isFileHidden(groupId: String, fileId: String): Boolean = hiddenFiles.containsKey(hiddenKey(groupId, fileId))
+
+    fun hideFile(groupId: String, fileId: String) {
+        if (hiddenFiles.put(hiddenKey(groupId, fileId), true) != null) return
+        save()
+    }
+
+    private fun hiddenKey(groupId: String, fileId: String): String = groupId + "/" + fileId
 
     fun seedPathOf(fileId: String): String? = seedPaths[fileId]
 

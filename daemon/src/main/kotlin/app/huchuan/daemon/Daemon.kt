@@ -376,6 +376,20 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
     }
 
     /**
+     * 这个群在本机该显示的文件：core 的清单去掉「本机移除过」的条目（public-swarm §5.2）。
+     * 所有对外投影（/api/state、/api/groups*、/api/groups/{gid}/files）都从这里取，
+     * 保证「移除之后从列表消失」只有一处判定。
+     */
+    fun visibleFiles(g: GroupRuntime): List<FileEntry> =
+        g.files().filter { !settings.isFileHidden(g.groupId, it.fileId) }
+
+    /** 单条可见文件；隐藏后按「不存在」处理（详情 / 评论 / 激活 / 限速一律 404）。 */
+    fun visibleFile(g: GroupRuntime, fileId: String): FileEntry? {
+        val entry = g.file(fileId) ?: return null
+        return if (settings.isFileHidden(g.groupId, fileId)) null else entry
+    }
+
+    /**
      * 群的完整 JSON。
      *
      * [withComments] = true 时每个文件带上 comments（Web UI 每次刷新只发一个 /api/state 请求，
@@ -383,7 +397,7 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
      */
     fun groupJson(g: GroupRuntime, withComments: Boolean = false): J.Obj {
         val k = kernel
-        val files = g.files()
+        val files = visibleFiles(g)
         val members = g.members()
         val online = g.onlinePeers().toSet()
         val self = k?.deviceId ?: ""
@@ -449,35 +463,36 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         // 做种者不计入、本机到 100% 或没挂进会话时内核直接回 0，daemon 不自己推算。
         val teammates = g.teammates(f.fileId)
         val uploadLimit = settings.uploadLimitOf(f.fileId)
-        val base = jobj(
-            "id" to jstr(f.fileId),
-            "name" to jstr(f.name),
-            "sizeBytes" to jnum(f.size),
-            "pieceSize" to jnum(f.pieceSize.toLong()),
-            "addedAt" to jnum(f.addedAt),
-            "sourceMember" to jstr(source),
-            "sourceDev" to jstr(f.addedBy),
-            "mine" to jbool(f.addedBy == self),
-            "state" to jstr(state),
-            "role" to jstr(roleName),
-            "progressPercent" to jnum(percent.toLong()),
-            "complete" to jbool(complete),
-            "seeders" to jnum((if (live) g.peerCount(f.fileId) else 0).toLong()),
-            "teammates" to jnum(teammates.toLong()),
-            "uploadLimitKbps" to jnum(uploadLimit.toLong()),
-            // 这条单文件限速此刻是不是真在生效：文件挂在会话里、还没到 100%（到 100% 内核会把
-            // torrent 限速清零），而且确实设了值。core 没有按 torrent 读回限速的口子（缺口 G9）。
-            "uploadLimitInForce" to jbool(live && !complete && uploadLimit > 0),
-            "downloadRateBps" to jnum(if (live) g.downloadRateBps(f.fileId) else 0L),
-            "uploadRateBps" to jnum(if (live) g.uploadRateBps(f.fileId) else 0L),
-            "commentCount" to jnum(g.visibleOps(f.fileId).size.toLong()),
-            "savedPath" to jstr(g.savedFile(f.fileId)?.absolutePath ?: settings.seedPathOf(f.fileId) ?: ""),
-            "magnet" to jstr(f.magnet),
-        )
-        if (!withComments) return base
-        val fields = LinkedHashMap<String, J>(base.fields.size + 1)
-        fields.putAll(base.fields)
-        fields["comments"] = commentsJson(g, f.fileId)
+        val fields = LinkedHashMap<String, J>()
+        fields["id"] = jstr(f.fileId)
+        fields["name"] = jstr(f.name)
+        // 公开条目在元数据到手前 size / pieceSize 都是 0：0 不是「零字节」，是「还不知道」。
+        // 未知时 sizeBytes 整个字段不给（不给 0），调用方按 sizeKnown 判断。
+        if (f.size > 0) fields["sizeBytes"] = jnum(f.size)
+        fields["pieceSize"] = jnum(f.pieceSize.toLong())
+        fields["addedAt"] = jnum(f.addedAt)
+        fields["sourceMember"] = jstr(source)
+        fields["sourceDev"] = jstr(f.addedBy)
+        fields["mine"] = jbool(f.addedBy == self)
+        fields["state"] = jstr(state)
+        fields["role"] = jstr(roleName)
+        fields["progressPercent"] = jnum(percent.toLong())
+        fields["complete"] = jbool(complete)
+        fields["seeders"] = jnum((if (live) g.peerCount(f.fileId) else 0).toLong())
+        fields["teammates"] = jnum(teammates.toLong())
+        fields["uploadLimitKbps"] = jnum(uploadLimit.toLong())
+        // 这条单文件限速此刻是不是真在生效：文件挂在会话里、还没到 100%（到 100% 内核会把
+        // torrent 限速清零），而且确实设了值。core 没有按 torrent 读回限速的口子（缺口 G9）。
+        fields["uploadLimitInForce"] = jbool(live && !complete && uploadLimit > 0)
+        fields["downloadRateBps"] = jnum(if (live) g.downloadRateBps(f.fileId) else 0L)
+        fields["uploadRateBps"] = jnum(if (live) g.uploadRateBps(f.fileId) else 0L)
+        fields["commentCount"] = jnum(g.visibleOps(f.fileId).size.toLong())
+        fields["savedPath"] = jstr(g.savedFile(f.fileId)?.absolutePath ?: settings.seedPathOf(f.fileId) ?: "")
+        fields["magnet"] = jstr(f.magnet)
+        // 公开 / 私有（public-swarm §1.1）。私有条目也带，页面不用按缺字段猜。
+        fields["scope"] = jstr(f.scope.wire)
+        fields["sizeKnown"] = jbool(f.size > 0)
+        if (withComments) fields["comments"] = commentsJson(g, f.fileId)
         return J.Obj(fields)
     }
 

@@ -56,11 +56,20 @@ bash scripts/m1-device.sh --rounds 2 --mib 64
   HKDF-SHA256 派生，不额外落盘密钥材料。两者都只把密文写进 state.json。
 - 桌面 harness 仍用 `PlaintextSecretBox`（与旧 `state.json` 兼容），这是刻意的：桌面没有 Keystore。
 
-### 2.4 选文件：SAF → 私有目录
+### 2.4 选文件：添加文件弹层 → SAF → 私有目录
 
-libtorrent 只认文件系统路径，`content://` 给不了它。P3「添加文件」走
+P3 的「添加文件」是一个入口两项的弹层（`ui/AddFileSheet.kt`）：**本机文件**走原来的 SAF 流程，
+**磁力链接**在弹层里填、点「导入」（公开种子，见 `docs/public-ui.md`）。两项在同一个按钮后面，
+不点「本机文件」就不会有 SAF 选择器。
+
+libtorrent 只认文件系统路径，`content://` 给不了它。点「本机文件」后走
 `ActivityResultContracts.OpenDocument` → `FileImporter.copyTo()` 整份拷进 `files/m1/share/` →
 `GroupRuntime.addFile(File)` 建私有 v1 种子并广播 `file.add`。原文件删掉不影响做种。
+
+脚本里这条入口只有一个实现 `saf_pick()`（第 7 步、第 12 步共享素材都走它）：
+`tap 添加文件` → 等「磁力链接」进无障碍树（弹层开着的判据）→ 留一拍吃掉滑入动画 →
+`tap 本机文件` → 才等 SAF 的「显示根目录」。弹层已经开着时不再点按钮：那时按钮在遮罩底下，
+点了只会把弹层关掉。
 
 ### 2.5 界面接内核
 
@@ -196,9 +205,14 @@ quick 模式下对端没共享压力文件，所以这两条就是「0 → 1」�
 
 ```
 DesktopPeer host data=<dir> work=<dir> [name=..] [group_name=..] [msg_port=47100] [bt_port=51413]
-               [share=a,b,c] [echo=<正文>] [echo_delay_ms=..] [hold=秒] [control=<文件>]
+               [share=a,b,c] [echo=<正文>] [echo_delay_ms=..] [hold=秒] [control=<文件>] [expect_comment=<正文>]
 DesktopPeer join data=<dir> work=<dir> tail8=XXXXXXXX [manual=ip:port] [download=0|1]
 ```
+
+`expect_comment=` 必须由脚本显式给（第 8 步用 `expect_comment=from-mix-1`）：一旦对端拿到 `control=`，
+它默认把「等对端评论」的窗口收成 0（那种对端按脚本节奏干活，不该空等 5 分钟），于是既不打印
+`PEER op_received body=`，也不会按 `echo_delay_ms` 等到回评再补 `from-pc-2`。
+给了这个参数，对端才照下面的固定顺序走：等到那条评论 → 再延迟补一条。
 
 `control=<文件>` 是给限速验收用的「按需下载」通道：脚本往这个文件里追加一行 `download=<文件名>`，
 对端每 400 ms 读一次，把对端的同名文件拉一份，并打出
@@ -277,7 +291,7 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 
 ```
 artifacts/m1-device/
-  screenshots/     关键界面截图（P1、P5 输入、P3、SAF、P4 评论、P2 角标前后、每轮完成、
+  screenshots/     关键界面截图（P1、P5 输入、P3、添加文件弹层 p3-add-sheet、SAF、P4 评论、P2 角标前后、每轮完成、
                    成员页 final-members（做种计数）、 restart-p2 / restart-p3 / restart-p4 /
                    restart-members（force-stop 冷启动一路的证据）、
                    restart-reconnect / restart-p6-online（冷启动自动重连与 P6 实时在线）、

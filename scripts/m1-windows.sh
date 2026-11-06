@@ -10,7 +10,7 @@
 #   B（127.0.0.1:47201）只用邀请码后 8 位 + 手动地址 127.0.0.1:<A 的消息端口> 加入
 #   B 激活下载 → 等到 complete → 两端 SHA-256 比对 → B 发评论 → A 侧看到
 #
-# 断言分五组：
+# 断言分八组：
 #   1. flow    ：建群 / 加入 / 共享 / 下载 / 评论，每一步都要有本轮证据
 #   2. sha256  ：两端文件逐字节一致，脚本自己重算，不信 daemon 的自述
 #   3. push    ：WS 真的在推（state 推送 + 传输中的 tick 采样）
@@ -23,6 +23,8 @@
 #   7. tracker ：跨网发现默认开、地址是已部署的 Worker，建群后确实发起注册尝试
 #                （本机 DNS 被拦，失败可接受）；另起一个启动前就关掉 tracker 的 C 节点，
 #                要求 kernel_started tracker=off、建群后一条 tracker 请求都没有
+#   8. magnet  ：公开种子 / 磁力导入（最后一组）：非法链接 400 invalid_link、同一链接第二次
+#                duplicate、state 里 scope=public + magnet、本机移除后从 state 消失但同群 B 还在
 #
 # 端口用文档里写死的固定值 47200 / 47201 / 47202。占用就 FAIL，不静默换端口 ——
 # 换端口等于没验「默认端口能起」。
@@ -145,6 +147,10 @@ w() {
 # ------------------------------------------------------------------ HTTP 小工具
 get() { curl -s -m 15 "$1"; }
 post() { curl -s -m 90 -X POST -H 'Content-Type: application/json' --data-binary "$2" "$1"; }
+# POST 把响应体写进文件、stdout 给 HTTP 状态码：磁力导入要同时断言状态码与 body 里的 code。
+post_file() { # <url> <body> <响应文件>
+  curl -s -m 90 -o "$3" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "$2" "$1"
+}
 
 # 只取第一个匹配：本脚本的响应形状固定，不需要完整 JSON 解析器。
 sval() { printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed 's/^[^:]*:"//; s/"$//'; }
@@ -609,6 +615,103 @@ case "$PKG_JAVA_LINE" in
 esac
 chk "package.shell_runs_without_java (api=$PORT_PKG, PATH=C:\\Windows\\System32, JAVA_HOME 空)" \
   "$([ "$PKG_HEALTH_OK" = "1" ] && [ "$PKG_RUNTIME_OK" = "1" ] && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 11b. 公开种子（磁力）
+# 放在最后一组：磁力导入会拉起公开会话（DHT），与前面的私有传输无关；把潜在的公开会话异常
+# 隔离在收尾之前，前面的断言已经全部跑完。断言只走 daemon 的 REST 与 /api/state，不碰 core 内部。
+say ""
+say "--- 公开种子：非法磁力 / 重复 / state / 本地移除"
+PUB_HASH="0123456789abcdef0123456789abcdef01234567"
+PUB_MAGNET="magnet:?xt=urn:btih:$PUB_HASH&dn=m1-public.bin&xl=1048576"
+MAGNET_URL="http://127.0.0.1:$PORT_A/api/groups/$GID/files/import-magnet"
+
+BAD_STATUS=$(post_file "$MAGNET_URL" '{"magnet":"not-a-magnet-link"}' "$ART/import-bad.json")
+BAD_BODY=$(cat "$ART/import-bad.json")
+BAD_CODE=$(sval "$BAD_BODY" code)
+BAD_MSG=$(sval "$BAD_BODY" message)
+chk "magnet.invalid_link_400 (status=$BAD_STATUS code=$BAD_CODE)" \
+  "$([ "$BAD_STATUS" = "400" ] && [ "$BAD_CODE" = "invalid_link" ] && echo 1 || echo 0)"
+chk "magnet.invalid_link_message ($BAD_MSG)" \
+  "$([ "$BAD_MSG" = "链接无法识别" ] && echo 1 || echo 0)"
+
+IMP_STATUS=$(post_file "$MAGNET_URL" \
+  "{\"magnet\":\"$PUB_MAGNET\",\"name\":\"m1-public.bin\",\"timeoutMs\":0}" "$ART/import-1.json")
+IMP_BODY=$(cat "$ART/import-1.json")
+PUB_FID=$(sval "$IMP_BODY" fileId)
+IMP_CODE=$(sval "$IMP_BODY" code)
+MAGNET_PAYLOAD_OK=$(printf '%s' "$IMP_BODY" | grep -o '"ok":[a-z]*' | tail -1 | sed 's/.*://')
+chk "magnet.import_accepted (status=$IMP_STATUS fileId=$PUB_FID)" \
+  "$([ "$IMP_STATUS" = "200" ] && [ "$PUB_FID" = "$PUB_HASH" ] && echo 1 || echo 0)"
+case "$IMP_CODE" in
+  "") MAGNET_EXPECT_OK=true ;;
+  no_source|timeout|bad_metadata) MAGNET_EXPECT_OK=false ;;
+  *) MAGNET_EXPECT_OK=unknown ;;
+esac
+chk "magnet.import_payload (ok=$MAGNET_PAYLOAD_OK code=$IMP_CODE)" \
+  "$([ "$MAGNET_PAYLOAD_OK" = "$MAGNET_EXPECT_OK" ] && echo 1 || echo 0)"
+
+# state：条目以 scope=public 出现并带规范化后的 magnet；尺寸未知时 sizeBytes 整条不给。
+STATE_PUB=""
+i=0
+while [ "$i" -lt 40 ]; do
+  STATE_PUB=$(get "http://127.0.0.1:$PORT_A/api/state")
+  case "$STATE_PUB" in *"\"id\":\"$PUB_HASH\""*) break ;; esac
+  sleep 0.5
+  i=$((i + 1))
+done
+PUB_ENTRY=$(printf '%s' "$STATE_PUB" | grep -o "\"id\":\"$PUB_HASH\"[^}]*" | head -1)
+chk "magnet.entry_in_state (fileId=$PUB_FID)" "$([ -n "$PUB_ENTRY" ] && echo 1 || echo 0)"
+chk "magnet.entry_scope_public" \
+  "$(printf '%s' "$PUB_ENTRY" | grep -q '"scope":"public"' && echo 1 || echo 0)"
+chk "magnet.entry_has_magnet" \
+  "$(printf '%s' "$PUB_ENTRY" | grep -qF "\"magnet\":\"$PUB_MAGNET\"" && echo 1 || echo 0)"
+SIZE_KNOWN=$(bval "$PUB_ENTRY" sizeKnown)
+HAS_SIZE_BYTES=$(printf '%s' "$PUB_ENTRY" | grep -q '"sizeBytes"' && echo 1 || echo 0)
+if [ "$SIZE_KNOWN" = "false" ]; then
+  SIZE_CONTRACT=$([ "$HAS_SIZE_BYTES" = "0" ] && echo 1 || echo 0)
+else
+  SIZE_CONTRACT=$([ "$SIZE_KNOWN" = "true" ] && [ "$HAS_SIZE_BYTES" = "1" ] && echo 1 || echo 0)
+fi
+chk "magnet.size_known_contract (sizeKnown=$SIZE_KNOWN sizeBytes=$HAS_SIZE_BYTES)" "$SIZE_CONTRACT"
+
+# 同一合法磁力再导入一次：同群按 infohash 去重，第二次是 409 duplicate。
+DUP_STATUS=$(post_file "$MAGNET_URL" "{\"magnet\":\"$PUB_MAGNET\"}" "$ART/import-2.json")
+DUP_BODY=$(cat "$ART/import-2.json")
+DUP_CODE=$(sval "$DUP_BODY" code)
+chk "magnet.duplicate_409 (status=$DUP_STATUS code=$DUP_CODE)" \
+  "$([ "$DUP_STATUS" = "409" ] && [ "$DUP_CODE" = "duplicate" ] && echo 1 || echo 0)"
+chk "magnet.duplicate_message ($(sval "$DUP_BODY" message))" \
+  "$(printf '%s' "$DUP_BODY" | grep -q '这个种子已经在群里' && echo 1 || echo 0)"
+
+# 条目是广播出去的（同群 B 应该看得到），移除只影响本机 —— 这一对断言证明「不广播」。
+STATE_B_PUB=""
+i=0
+while [ "$i" -lt 40 ]; do
+  STATE_B_PUB=$(get "http://127.0.0.1:$PORT_B/api/state")
+  case "$STATE_B_PUB" in *"\"id\":\"$PUB_HASH\""*) break ;; esac
+  sleep 0.5
+  i=$((i + 1))
+done
+chk "magnet.broadcast_reaches_B" \
+  "$(printf '%s' "$STATE_B_PUB" | grep -qF "\"id\":\"$PUB_HASH\"" && echo 1 || echo 0)"
+
+REMOVED=$(post "http://127.0.0.1:$PORT_A/api/groups/$GID/files/$PUB_FID/remove" '{}')
+chk "magnet.remove_ok (removed=$(bval "$REMOVED" removed) broadcast=$(bval "$REMOVED" broadcast))" \
+  "$([ "$(bval "$REMOVED" removed)" = "true" ] && echo 1 || echo 0)"
+STATE_AFTER=$(get "http://127.0.0.1:$PORT_A/api/state")
+chk "magnet.removed_from_state" \
+  "$(printf '%s' "$STATE_AFTER" | grep -qF "\"id\":\"$PUB_HASH\"" && echo 0 || echo 1)"
+FILE_AFTER_STATUS=$(curl -s -m 15 -o /dev/null -w '%{http_code}' \
+  "http://127.0.0.1:$PORT_A/api/groups/$GID/files/$PUB_FID")
+chk "magnet.removed_file_404 (status=$FILE_AFTER_STATUS)" \
+  "$([ "$FILE_AFTER_STATUS" = "404" ] && echo 1 || echo 0)"
+chk "magnet.hidden_persisted (settings.json)" \
+  "$(grep -qF "$GID/$PUB_HASH" "$DATA_A/settings.json" 2>/dev/null && echo 1 || echo 0)"
+chk "magnet.remove_logged" \
+  "$(grep -q "event=api_file_remove_local .*file_id=$PUB_HASH" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+STATE_B_AFTER=$(get "http://127.0.0.1:$PORT_B/api/state")
+chk "magnet.remove_not_broadcast (B still has it)" \
+  "$(printf '%s' "$STATE_B_AFTER" | grep -qF "\"id\":\"$PUB_HASH\"" && echo 1 || echo 0)"
 
 # ------------------------------------------------------------------ 12. 停
 say ""

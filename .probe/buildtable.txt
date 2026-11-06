@@ -1,0 +1,428 @@
+  private static org.libtorrent4j.alerts.AlertType[] buildTable();
+    Code:
+       0: getstatic     #318                // Field org/libtorrent4j/alerts/Alerts.NUM_ALERT_TYPES:I
+       3: anewarray     #1                  // class org/libtorrent4j/alerts/AlertType
+       6: astore_0
+       7: aload_0
+       8: iconst_0
+       9: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+      12: aastore
+      13: aload_0
+      14: iconst_1
+      15: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+      18: aastore
+      19: aload_0
+      20: iconst_2
+      21: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+      24: aastore
+      25: aload_0
+      26: iconst_3
+      27: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+      30: aastore
+      31: aload_0
+      32: iconst_4
+      33: getstatic     #7                  // Field TORRENT_REMOVED:Lorg/libtorrent4j/alerts/AlertType;
+      36: aastore
+      37: aload_0
+      38: iconst_5
+      39: getstatic     #85                 // Field READ_PIECE:Lorg/libtorrent4j/alerts/AlertType;
+      42: aastore
+      43: aload_0
+      44: bipush        6
+      46: getstatic     #49                 // Field FILE_COMPLETED:Lorg/libtorrent4j/alerts/AlertType;
+      49: aastore
+      50: aload_0
+      51: bipush        7
+      53: getstatic     #52                 // Field FILE_RENAMED:Lorg/libtorrent4j/alerts/AlertType;
+      56: aastore
+      57: aload_0
+      58: bipush        8
+      60: getstatic     #55                 // Field FILE_RENAME_FAILED:Lorg/libtorrent4j/alerts/AlertType;
+      63: aastore
+      64: aload_0
+      65: bipush        9
+      67: getstatic     #124                // Field PERFORMANCE:Lorg/libtorrent4j/alerts/AlertType;
+      70: aastore
+      71: aload_0
+      72: bipush        10
+      74: getstatic     #88                 // Field STATE_CHANGED:Lorg/libtorrent4j/alerts/AlertType;
+      77: aastore
+      78: aload_0
+      79: bipush        11
+      81: getstatic     #82                 // Field TRACKER_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+      84: aastore
+      85: aload_0
+      86: bipush        12
+      88: getstatic     #79                 // Field TRACKER_WARNING:Lorg/libtorrent4j/alerts/AlertType;
+      91: aastore
+      92: aload_0
+      93: bipush        13
+      95: getstatic     #112                // Field SCRAPE_REPLY:Lorg/libtorrent4j/alerts/AlertType;
+      98: aastore
+      99: aload_0
+     100: bipush        14
+     102: getstatic     #115                // Field SCRAPE_FAILED:Lorg/libtorrent4j/alerts/AlertType;
+     105: aastore
+     106: aload_0
+     107: bipush        15
+     109: getstatic     #76                 // Field TRACKER_REPLY:Lorg/libtorrent4j/alerts/AlertType;
+     112: aastore
+     113: aload_0
+     114: bipush        16
+     116: getstatic     #91                 // Field DHT_REPLY:Lorg/libtorrent4j/alerts/AlertType;
+     119: aastore
+     120: aload_0
+     121: bipush        17
+     123: getstatic     #73                 // Field TRACKER_ANNOUNCE:Lorg/libtorrent4j/alerts/AlertType;
+     126: aastore
+     127: aload_0
+     128: bipush        18
+     130: getstatic     #61                 // Field HASH_FAILED:Lorg/libtorrent4j/alerts/AlertType;
+     133: aastore
+     134: aload_0
+     135: bipush        19
+     137: getstatic     #148                // Field PEER_BAN:Lorg/libtorrent4j/alerts/AlertType;
+     140: aastore
+     141: aload_0
+     142: bipush        20
+     144: getstatic     #163                // Field PEER_UNSNUBBED:Lorg/libtorrent4j/alerts/AlertType;
+     147: aastore
+     148: aload_0
+     149: bipush        21
+     151: getstatic     #160                // Field PEER_SNUBBED:Lorg/libtorrent4j/alerts/AlertType;
+     154: aastore
+     155: aload_0
+     156: bipush        22
+     158: getstatic     #157                // Field PEER_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+     161: aastore
+     162: aload_0
+     163: bipush        23
+     165: getstatic     #151                // Field PEER_CONNECT:Lorg/libtorrent4j/alerts/AlertType;
+     168: aastore
+     169: aload_0
+     170: bipush        24
+     172: getstatic     #154                // Field PEER_DISCONNECTED:Lorg/libtorrent4j/alerts/AlertType;
+     175: aastore
+     176: aload_0
+     177: bipush        25
+     179: getstatic     #142                // Field INVALID_REQUEST:Lorg/libtorrent4j/alerts/AlertType;
+     182: aastore
+     183: aload_0
+     184: bipush        26
+     186: getstatic     #3                  // Field TORRENT_FINISHED:Lorg/libtorrent4j/alerts/AlertType;
+     189: aastore
+     190: aload_0
+     191: bipush        27
+     193: getstatic     #127                // Field PIECE_FINISHED:Lorg/libtorrent4j/alerts/AlertType;
+     196: aastore
+     197: aload_0
+     198: bipush        28
+     200: getstatic     #166                // Field REQUEST_DROPPED:Lorg/libtorrent4j/alerts/AlertType;
+     203: aastore
+     204: aload_0
+     205: bipush        29
+     207: getstatic     #175                // Field BLOCK_TIMEOUT:Lorg/libtorrent4j/alerts/AlertType;
+     210: aastore
+     211: aload_0
+     212: bipush        30
+     214: getstatic     #40                 // Field BLOCK_FINISHED:Lorg/libtorrent4j/alerts/AlertType;
+     217: aastore
+     218: aload_0
+     219: bipush        31
+     221: getstatic     #172                // Field BLOCK_DOWNLOADING:Lorg/libtorrent4j/alerts/AlertType;
+     224: aastore
+     225: aload_0
+     226: bipush        32
+     228: getstatic     #190                // Field UNWANTED_BLOCK:Lorg/libtorrent4j/alerts/AlertType;
+     231: aastore
+     232: aload_0
+     233: bipush        33
+     235: getstatic     #133                // Field STORAGE_MOVED:Lorg/libtorrent4j/alerts/AlertType;
+     238: aastore
+     239: aload_0
+     240: bipush        34
+     242: getstatic     #184                // Field STORAGE_MOVED_FAILED:Lorg/libtorrent4j/alerts/AlertType;
+     245: aastore
+     246: aload_0
+     247: bipush        35
+     249: getstatic     #10                 // Field TORRENT_DELETED:Lorg/libtorrent4j/alerts/AlertType;
+     252: aastore
+     253: aload_0
+     254: bipush        36
+     256: getstatic     #136                // Field TORRENT_DELETE_FAILED:Lorg/libtorrent4j/alerts/AlertType;
+     259: aastore
+     260: aload_0
+     261: bipush        37
+     263: getstatic     #34                 // Field SAVE_RESUME_DATA:Lorg/libtorrent4j/alerts/AlertType;
+     266: aastore
+     267: aload_0
+     268: bipush        38
+     270: getstatic     #130                // Field SAVE_RESUME_DATA_FAILED:Lorg/libtorrent4j/alerts/AlertType;
+     273: aastore
+     274: aload_0
+     275: bipush        39
+     277: getstatic     #13                 // Field TORRENT_PAUSED:Lorg/libtorrent4j/alerts/AlertType;
+     280: aastore
+     281: aload_0
+     282: bipush        40
+     284: getstatic     #16                 // Field TORRENT_RESUMED:Lorg/libtorrent4j/alerts/AlertType;
+     287: aastore
+     288: aload_0
+     289: bipush        41
+     291: getstatic     #19                 // Field TORRENT_CHECKED:Lorg/libtorrent4j/alerts/AlertType;
+     294: aastore
+     295: aload_0
+     296: bipush        42
+     298: getstatic     #139                // Field URL_SEED:Lorg/libtorrent4j/alerts/AlertType;
+     301: aastore
+     302: aload_0
+     303: bipush        43
+     305: getstatic     #58                 // Field FILE_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+     308: aastore
+     309: aload_0
+     310: bipush        44
+     312: getstatic     #46                 // Field METADATA_FAILED:Lorg/libtorrent4j/alerts/AlertType;
+     315: aastore
+     316: aload_0
+     317: bipush        45
+     319: getstatic     #43                 // Field METADATA_RECEIVED:Lorg/libtorrent4j/alerts/AlertType;
+     322: aastore
+     323: aload_0
+     324: bipush        46
+     326: getstatic     #169                // Field UDP_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+     329: aastore
+     330: aload_0
+     331: bipush        47
+     333: getstatic     #100                // Field EXTERNAL_IP:Lorg/libtorrent4j/alerts/AlertType;
+     336: aastore
+     337: aload_0
+     338: bipush        48
+     340: getstatic     #145                // Field LISTEN_FAILED:Lorg/libtorrent4j/alerts/AlertType;
+     343: aastore
+     344: aload_0
+     345: bipush        49
+     347: getstatic     #103                // Field LISTEN_SUCCEEDED:Lorg/libtorrent4j/alerts/AlertType;
+     350: aastore
+     351: aload_0
+     352: bipush        50
+     354: getstatic     #67                 // Field PORTMAP_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+     357: aastore
+     358: aload_0
+     359: bipush        51
+     361: getstatic     #64                 // Field PORTMAP:Lorg/libtorrent4j/alerts/AlertType;
+     364: aastore
+     365: aload_0
+     366: bipush        52
+     368: getstatic     #70                 // Field PORTMAP_LOG:Lorg/libtorrent4j/alerts/AlertType;
+     371: aastore
+     372: aload_0
+     373: bipush        53
+     375: getstatic     #37                 // Field FASTRESUME_REJECTED:Lorg/libtorrent4j/alerts/AlertType;
+     378: aastore
+     379: aload_0
+     380: bipush        54
+     382: getstatic     #121                // Field PEER_BLOCKED:Lorg/libtorrent4j/alerts/AlertType;
+     385: aastore
+     386: aload_0
+     387: bipush        55
+     389: getstatic     #181                // Field DHT_ANNOUNCE:Lorg/libtorrent4j/alerts/AlertType;
+     392: aastore
+     393: aload_0
+     394: bipush        56
+     396: getstatic     #97                 // Field DHT_GET_PEERS:Lorg/libtorrent4j/alerts/AlertType;
+     399: aastore
+     400: aload_0
+     401: bipush        57
+     403: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+     406: aastore
+     407: aload_0
+     408: bipush        58
+     410: getstatic     #178                // Field CACHE_FLUSHED:Lorg/libtorrent4j/alerts/AlertType;
+     413: aastore
+     414: aload_0
+     415: bipush        59
+     417: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+     420: aastore
+     421: aload_0
+     422: bipush        60
+     424: getstatic     #118                // Field LSD_PEER:Lorg/libtorrent4j/alerts/AlertType;
+     427: aastore
+     428: aload_0
+     429: bipush        61
+     431: getstatic     #187                // Field TRACKERID:Lorg/libtorrent4j/alerts/AlertType;
+     434: aastore
+     435: aload_0
+     436: bipush        62
+     438: getstatic     #94                 // Field DHT_BOOTSTRAP:Lorg/libtorrent4j/alerts/AlertType;
+     441: aastore
+     442: aload_0
+     443: bipush        63
+     445: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+     448: aastore
+     449: aload_0
+     450: bipush        64
+     452: getstatic     #22                 // Field TORRENT_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+     455: aastore
+     456: aload_0
+     457: bipush        65
+     459: getstatic     #25                 // Field TORRENT_NEED_CERT:Lorg/libtorrent4j/alerts/AlertType;
+     462: aastore
+     463: aload_0
+     464: bipush        66
+     466: getstatic     #28                 // Field INCOMING_CONNECTION:Lorg/libtorrent4j/alerts/AlertType;
+     469: aastore
+     470: aload_0
+     471: bipush        67
+     473: getstatic     #31                 // Field ADD_TORRENT:Lorg/libtorrent4j/alerts/AlertType;
+     476: aastore
+     477: aload_0
+     478: bipush        68
+     480: getstatic     #106                // Field STATE_UPDATE:Lorg/libtorrent4j/alerts/AlertType;
+     483: aastore
+     484: aload_0
+     485: bipush        69
+     487: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+     490: aastore
+     491: aload_0
+     492: bipush        70
+     494: getstatic     #109                // Field SESSION_STATS:Lorg/libtorrent4j/alerts/AlertType;
+     497: aastore
+     498: aload_0
+     499: bipush        71
+     501: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+     504: aastore
+     505: aload_0
+     506: bipush        72
+     508: getstatic     #289                // Field UNKNOWN:Lorg/libtorrent4j/alerts/AlertType;
+     511: aastore
+     512: aload_0
+     513: bipush        73
+     515: getstatic     #193                // Field DHT_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+     518: aastore
+     519: aload_0
+     520: bipush        74
+     522: getstatic     #202                // Field DHT_IMMUTABLE_ITEM:Lorg/libtorrent4j/alerts/AlertType;
+     525: aastore
+     526: aload_0
+     527: bipush        75
+     529: getstatic     #199                // Field DHT_MUTABLE_ITEM:Lorg/libtorrent4j/alerts/AlertType;
+     532: aastore
+     533: aload_0
+     534: bipush        76
+     536: getstatic     #196                // Field DHT_PUT:Lorg/libtorrent4j/alerts/AlertType;
+     539: aastore
+     540: aload_0
+     541: bipush        77
+     543: getstatic     #205                // Field I2P:Lorg/libtorrent4j/alerts/AlertType;
+     546: aastore
+     547: aload_0
+     548: bipush        78
+     550: getstatic     #208                // Field DHT_OUTGOING_GET_PEERS:Lorg/libtorrent4j/alerts/AlertType;
+     553: aastore
+     554: aload_0
+     555: bipush        79
+     557: getstatic     #211                // Field LOG:Lorg/libtorrent4j/alerts/AlertType;
+     560: aastore
+     561: aload_0
+     562: bipush        80
+     564: getstatic     #214                // Field TORRENT_LOG:Lorg/libtorrent4j/alerts/AlertType;
+     567: aastore
+     568: aload_0
+     569: bipush        81
+     571: getstatic     #217                // Field PEER_LOG:Lorg/libtorrent4j/alerts/AlertType;
+     574: aastore
+     575: aload_0
+     576: bipush        82
+     578: getstatic     #220                // Field LSD_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+     581: aastore
+     582: aload_0
+     583: bipush        83
+     585: getstatic     #223                // Field DHT_STATS:Lorg/libtorrent4j/alerts/AlertType;
+     588: aastore
+     589: aload_0
+     590: bipush        84
+     592: getstatic     #226                // Field INCOMING_REQUEST:Lorg/libtorrent4j/alerts/AlertType;
+     595: aastore
+     596: aload_0
+     597: bipush        85
+     599: getstatic     #229                // Field DHT_LOG:Lorg/libtorrent4j/alerts/AlertType;
+     602: aastore
+     603: aload_0
+     604: bipush        86
+     606: getstatic     #232                // Field DHT_PKT:Lorg/libtorrent4j/alerts/AlertType;
+     609: aastore
+     610: aload_0
+     611: bipush        87
+     613: getstatic     #235                // Field DHT_GET_PEERS_REPLY:Lorg/libtorrent4j/alerts/AlertType;
+     616: aastore
+     617: aload_0
+     618: bipush        88
+     620: getstatic     #238                // Field DHT_DIRECT_RESPONSE:Lorg/libtorrent4j/alerts/AlertType;
+     623: aastore
+     624: aload_0
+     625: bipush        89
+     627: getstatic     #241                // Field PICKER_LOG:Lorg/libtorrent4j/alerts/AlertType;
+     630: aastore
+     631: aload_0
+     632: bipush        90
+     634: getstatic     #244                // Field SESSION_ERROR:Lorg/libtorrent4j/alerts/AlertType;
+     637: aastore
+     638: aload_0
+     639: bipush        91
+     641: getstatic     #247                // Field DHT_LIVE_NODES:Lorg/libtorrent4j/alerts/AlertType;
+     644: aastore
+     645: aload_0
+     646: bipush        92
+     648: getstatic     #250                // Field SESSION_STATS_HEADER:Lorg/libtorrent4j/alerts/AlertType;
+     651: aastore
+     652: aload_0
+     653: bipush        93
+     655: getstatic     #253                // Field DHT_SAMPLE_INFOHASHES:Lorg/libtorrent4j/alerts/AlertType;
+     658: aastore
+     659: aload_0
+     660: bipush        94
+     662: getstatic     #256                // Field BLOCK_UPLOADED:Lorg/libtorrent4j/alerts/AlertType;
+     665: aastore
+     666: aload_0
+     667: bipush        95
+     669: getstatic     #259                // Field ALERTS_DROPPED:Lorg/libtorrent4j/alerts/AlertType;
+     672: aastore
+     673: aload_0
+     674: bipush        96
+     676: getstatic     #262                // Field SOCKS5:Lorg/libtorrent4j/alerts/AlertType;
+     679: aastore
+     680: aload_0
+     681: bipush        97
+     683: getstatic     #265                // Field FILE_PRIO:Lorg/libtorrent4j/alerts/AlertType;
+     686: aastore
+     687: aload_0
+     688: bipush        98
+     690: getstatic     #268                // Field OVERSIZED_FILE:Lorg/libtorrent4j/alerts/AlertType;
+     693: aastore
+     694: aload_0
+     695: bipush        99
+     697: getstatic     #271                // Field TORRENT_CONFLICT:Lorg/libtorrent4j/alerts/AlertType;
+     700: aastore
+     701: aload_0
+     702: bipush        100
+     704: getstatic     #274                // Field PEER_INFO:Lorg/libtorrent4j/alerts/AlertType;
+     707: aastore
+     708: aload_0
+     709: bipush        101
+     711: getstatic     #277                // Field FILE_PROGRESS:Lorg/libtorrent4j/alerts/AlertType;
+     714: aastore
+     715: aload_0
+     716: bipush        102
+     718: getstatic     #280                // Field PIECE_INFO:Lorg/libtorrent4j/alerts/AlertType;
+     721: aastore
+     722: aload_0
+     723: bipush        103
+     725: getstatic     #283                // Field PIECE_AVAILABILITY:Lorg/libtorrent4j/alerts/AlertType;
+     728: aastore
+     729: aload_0
+     730: bipush        104
+     732: getstatic     #286                // Field TRACKER_LIST:Lorg/libtorrent4j/alerts/AlertType;
+     735: aastore
+     736: aload_0
+     737: areturn
+

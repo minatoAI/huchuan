@@ -11,7 +11,7 @@
 #   第二台安卓在线时只提示、不切换：android-android 需要第二个 UI 驱动，M2 再做。
 #
 # 手机侧（app.huchuan）：
-#   P0 自检 → P1 用户名 → P5 只输后 8 位加入 → P3 SAF 选文件做种 → P4 评论/激活/休眠
+#   P0 自检 → P1 用户名 → P5 只输后 8 位加入 → P3 添加文件→本机文件→SAF 选文件做种 → P4 评论/激活/休眠
 #   → 退回 P2 看未读角标 → 进群进文件后角标消失 → P6 成员平台
 # 桌面侧（app/tools/peer/DesktopPeer.java）：
 #   建群 → 等手机加入 → 下载手机共享的文件并比对 SHA-256 → 评论 → 等手机回评论
@@ -616,10 +616,14 @@ if [ "${#STRESS_FILES[@]}" -gt 1 ]; then
   PEER_THROTTLE="throttle=1:${M1_THROTTLE_KBPS:-2048}"
 fi
 
+# expect_comment=from-mix-1 是第 8 步的证据开关，不能省：对端一旦拿到 control=（它平时按脚本节奏干活），
+# 就会把「等对端评论」的窗口收成 0，直接打 reply_seen ok=false 走过去 —— 那样它永远不打
+# PEER op_received body=from-mix-1，第 8 步的 comment.android_to_pc 只能等到超时。
+# 显式声明「我在等这条评论」，对端就照文档 §3 的顺序走：等到回评 → 再按 echo_delay_ms 补 from-pc-2。
 java -Dlibtorrent4j.jni.path="$PEER_NATIVE" -Dfile.encoding=UTF-8 -cp "$PEER_CP" DesktopPeer host \
   data="$(w "$PEER_DATA")" work="$(w "$ART/desktop")" name="$PEER_NAME" msg_port=47100 bt_port=51413 \
   group_name="$GROUP_NAME" share="$PEER_SHARE" "$PEER_THROTTLE" hold=2400 \
-  control="$(w "$PEER_CONTROL")" \
+  control="$(w "$PEER_CONTROL")" expect_comment="from-mix-1" \
   echo="from-pc-2" echo_delay_ms="$ECHO_DELAY_MS" \
   > "$PEER_LOG" 2>&1 &
 PEER_PID=$!
@@ -722,8 +726,29 @@ screenshot "p3-group"
 
 # ------------------------------------------------------------------ 7. SAF 共享文件
 
-step "7/12 P3 SAF 选文件 → 做种"
+step "7/12 P3 添加文件 → 本机文件 → SAF 选文件 → 做种"
 PAYLOAD_NAME="$(basename "$PAYLOAD")"
+
+# P3 的「添加文件」现在是一个入口两项的弹层：本机文件 / 磁力链接（public-swarm §6.1）。
+# 老流程点完按钮直接等 SAF，弹层挡在上面，SAF 永远等不到 —— 必须先点「本机文件」。
+#
+# 弹层是 ModalBottomSheet，两行有滑入动画：等「磁力链接」进了无障碍树之后再留一拍，点才落得准。
+# 「磁力链接」只在弹层里出现，所以它同时也是「弹层开着」的判据；开着就别再点按钮 ——
+# 那时按钮在遮罩底下，点了只会把弹层关掉。
+# 点完「本机文件」弹层立刻收起、DocumentsUI 接在前台，下一步照旧等 SAF 自己的标志。
+open_local_picker() {
+  if ! see_text "磁力链接" 1500; then
+    tap "添加文件" || return 1
+    if ! see_text "磁力链接" 20000; then
+      screenshot "p3-add-sheet-missing"
+      uidump "p3-add-sheet-missing"
+      return 1
+    fi
+  fi
+  sleep 1
+  screenshot "p3-add-sheet"
+  tap "本机文件" exact
+}
 
 # SAF 抽屉有动画：点完「显示根目录」要等抽屉真的展开再点「下载」，
 # 中途点到遮罩只会把抽屉关掉。整段最多重来 3 次。
@@ -731,7 +756,12 @@ saf_pick() {
   local name="$1" attempt
   for attempt in 1 2 3; do
     if ! see_text "添加文件" 20000; then return 1; fi
-    tap "添加文件"
+    if ! open_local_picker; then
+      warn "SAF 第 $attempt 次没打开选择器（添加文件弹层没走通）"
+      sh_ input keyevent KEYCODE_BACK >/dev/null 2>&1
+      sleep 1
+      continue
+    fi
     if ! see_text "显示根目录" 25000; then
       sh_ input keyevent KEYCODE_BACK >/dev/null 2>&1
       sleep 1

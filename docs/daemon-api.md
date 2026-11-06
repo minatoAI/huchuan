@@ -93,6 +93,8 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
 | `E_ACTIVATE_FAILED` | 内核里没有这个文件的种子信息 |
 | `E_BAD_LIMIT` / `E_BAD_LEVEL` | 限速 / 通知档取值非法 |
 | `E_BAD_TRACKER` | 跨网发现取值非法：`enabled` 不是布尔、`baseUrl` 不是 http(s)、或一项都没给 |
+| `E_NOT_PUBLIC` | 想移除一个私有条目：私有条目只能休眠（`active=false`），「移除」只对公开条目开放 |
+| `invalid_link` / `duplicate` / `session_error` | 磁力导入的请求级失败（400 / 409 / 503）：链接非法 / 同群已有这个种子 / 公开会话没起来。回包另带内核同名的 `message` 与 `fileId`，见 3.3 |
 
 ---
 
@@ -292,10 +294,18 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
   "downloadRateBps": 0, "uploadRateBps": 0,
   "commentCount": 1, "savedPath": "E:\\...\\travel-photos.zip",
   "magnet": "magnet:?xt=urn:btih:...&dn=...&xl=...",
+  "scope": "private", "sizeKnown": true,
   "comments": [ /* 只有 /api/state 和文件详情里有 */ ]
 }
 ```
 
+- `scope`：`private` / `public`（public-swarm §1.1）。公开条目走公网 swarm，磁力必填、
+  不内联 .torrent；缺字段的旧对端一律按 `private` 处理。
+- `magnet`：规范化后的磁力（`xt=urn:btih:<40 位小写 hex>` 打头，保留发布者自己的 dn / xl / tr）。
+  私有条目也带（来自本机建种），公开条目就是群内广播的那一条。
+- `sizeKnown`：尺寸是不是已知。公开条目在元数据到手前是 `false`，这时**整个 `sizeBytes` 字段
+  不出现**（0 会被误读成「零字节文件」）；`pieceSize` 同样用 0 表示未知。元数据到手后内核本地
+  回填 size / pieceSize（不改签名、不重新广播），下一次 `/api/state` 就能看到 `sizeKnown=true`。
 - `state`：`seeding` / `downloading` / `sleeping`，是「画面上该显示什么」。
 - `role`：`seeding` / `downloading` / `none`，是「内核里挂没挂这个文件」。两者在下载刚完成的那几百毫秒里
   可能不同步，daemon 统一按 `complete` 归一。
@@ -354,6 +364,69 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
 `GroupRuntime.setUploadLimitKbps` → `torrent_handle::set_upload_limit`，单位 KB/s，0 = 不限）。
 回包里的文件对象带 `uploadLimitKbps`（设的值）与 `uploadLimitInForce`（此刻是否真挂在会话里）；
 core 没有按 torrent 读回限速的口子（缺口 G9），所以不给「内核读数」这种说法。
+
+#### `POST /api/groups/{gid}/files/import-magnet`
+
+磁力导入（public-swarm §3）：把链接交给内核的公开会话，建 `scope=public` 的条目并广播给同群成员。
+
+```json
+{ "magnet": "magnet:?xt=urn:btih:0123…&dn=…&xl=…",
+  "name": "可选显示名", "timeoutMs": 0 }
+→ 200 { "ok": true,
+        "data": { "ok": false, "fileId": "0123…", "code": "no_source",
+                  "message": "找不到来源，先挂着等别人上线",
+                  "file": 文件对象 } }
+```
+
+- `data` 的四个字段与 core 的 `PublicMagnetResult` 同名：
+  - `ok`：元数据是否已到手。`false` **不是请求失败** —— 条目已经建好，列表里显示「等待来源」，
+    内核继续在公开会话里找源，元数据到手后后台回填 `sizeBytes` / `pieceSize` 并推 WS。
+  - `fileId`：40 位 hex 的 infohash，就是群里的文件 id。
+  - `code`：`""` 表示成功；否则是下面五种之一。
+  - `message`：内核给的一句中文，成功时为 `""`。
+- `timeoutMs`：等元数据的上限，0–120000，**默认 0 = 不等**。daemon 是异步状态模型，导入立即回包；
+  要拿同步结果就显式给（内核默认 60 s）。给 0 时通常回 `no_source`，条目照样在。
+- `name`：可选，只用于列表显示（最多 120 字）；不给时依次用元数据里的名字、磁力的 `dn`、
+  「未命名种子」。
+
+五种失败码（与 core 的 `PublicMagnetResult.failureReasons()` 一致，中文文案原样透传）：
+
+| code | message | HTTP | 条目 |
+| --- | --- | --- | --- |
+| `invalid_link` | 链接无法识别 | 400 | 不建 |
+| `duplicate` | 这个种子已经在群里 | 409 | 已有一条 |
+| `no_source` | 找不到来源，先挂着等别人上线 | 200 | 建好，等来源 |
+| `timeout` | 等文件信息超时，会继续重试 | 200 | 建好，等来源 |
+| `bad_metadata` | 文件信息无效 | 200 | 建好（内核摘掉无效 torrent，条目按等待来源留着） |
+
+请求级失败（400 / 409 / 503）沿用全站错误包络 `{ok:false, code, error}`，并额外带 `message`
+（与 `error` 同义）与 `fileId`（重复时是撞上的那条 infohash）；群不存在是 404 `E_NO_GROUP`，
+公开会话没起来是 503 `session_error`。
+
+去重口径（§1.1 / 裁决 5）：**同群按 infohash 只留一条**。第二次导入同一个磁力回 409 `duplicate`；
+同一个 infohash 已经有私有条目时，内核丢弃公开条目（日志 `file_scope_dedup action=drop`），
+`fileId` 仍然指向那条私有条目。
+
+日志：daemon 一行 `api_magnet_import gid=… file_id=… ok=… reason=… timeout_ms=… ms=…`；
+内核另有 `public_magnet` / `public_magnet_rejected` / `magnet_added` / `public_session_started`。
+
+#### `POST /api/groups/{gid}/files/{fid}/remove`
+
+本地移除（public-swarm §5.2）：**只从本机列表消失**，不广播、不删磁盘文件。
+
+```json
+→ 200 { "fileId": "0123…", "removed": true, "broadcast": false }
+```
+
+- 不广播 `file.del`（协议 M2 才有）：同群其他成员照旧看得到这个条目；`broadcast` 恒为 `false`，
+  把这件事写进回包里，别让调用方猜。
+- 只对**公开条目**开放：私有条目 409 `E_NOT_PUBLIC`，正确动作是 `active=false`（休眠）。
+- 正在下载 / 做种 / 找源的任务先摘掉；公开会话没有别的非休眠公开条目时会一起停
+  （日志 `public_session_stopped`）。已经下到盘上的文件不动。
+- 隐藏标记落在 `settings.json` 的 `hiddenFiles`（key 是 `<gid>/<fid>`），重启后仍然隐藏。
+  隐藏之后这个 fid 的详情 / 评论 / 激活 / 限速 / 再移除一律 404 `E_NO_FILE`；
+  `/api/groups/{gid}/files` 与 `/api/state` 的列表、`fileCount` 里都不再出现。
+- 日志：`event=api_file_remove_local gid=… file_id=… scope=public was_active=… file_kept=…`。
 
 #### `GET|POST /api/groups/{gid}/files/{fid}/comments`
 
@@ -471,7 +544,11 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 2. **`/api/state` 是 UI 的唯一读口**，带评论；其余接口不带，避免列表被放大。
 3. **写操作一律回包后再推 WS**：页面拿到响应 → 立刻重拉快照，不靠响应体拼状态。
 4. **daemon 不缓存 core 的业务状态**：所有读都走 core 的公开读口，daemon 只额外记
-   「用户设置」和「种子来自哪个本地路径」这两件 core 不关心的事。
+   「用户设置」「种子来自哪个本地路径」「本机隐藏了哪些条目」这三件 core 不关心的事。
+5. **本地移除是 daemon 侧状态**：core 没有「移除条目」这个动作（条目仍在 core 清单里，同群成员
+   照旧看得到）。daemon 在 `settings.json` 的 `hiddenFiles` 里记 `<gid>/<fid>`，投影时统一
+   过滤（`Daemon.visibleFiles` / `visibleFile`）；公开条目的元数据回填、公开会话按需启停
+   都归 core，daemon 只负责停掉任务、落隐藏标记、不再对外显示。
 
 ---
 
@@ -556,8 +633,8 @@ bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 
 脚本自己起 A/B 两个 daemon（47200 / 47201，另有一个只验跨网关闭的 C 节点 47202），走完建群 →
 后 8 位加入 → 共享 32 MiB → 下载 → SHA-256 比对 → 评论回流 → WS 推送 → Web UI 数据通路，
-最后打印 `PASS` / `FAIL`。
-共 65 条断言。
+最后是公开种子的磁力导入 / 本地移除，最后打印 `PASS` / `FAIL`。
+共 82 条断言。
 
 限速与组队这一组（5 条）：B 侧 `POST /api/settings/limits {"uploadKbps":512,"downloadKbps":512}`
 后 `sessionUploadLimitKbps` / `sessionDownloadLimitKbps` 必须读回 512，改成 0 必须读回 0，
@@ -573,6 +650,12 @@ bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 `tracker_disabled`，建群后没有任何 `tracker_service_started` / `tracker_register` /
 `tracker_announce`；运行期 POST `{"enabled":true}` 只落盘，回包 `restartRequired=true` 且
 `active=false`。P7 关闭态的界面取证见 `docs/windows-ui.md` §6.2。
+
+公开种子 17 条（最后一组，跑在收尾前）：非法磁力 `POST …/files/import-magnet` 必须 400 +
+`invalid_link`（中文文案与 core 一致）；同一合法磁力导入两次，第二次 409 + `duplicate`；导入后
+`/api/state` 里该条目 `scope=public`、带规范化后的 `magnet`，且 `sizeKnown=false` 时
+`sizeBytes` 整个不出现；`POST …/files/{fid}/remove` 之后 A 的 state 里没有这个 id、详情 404、
+`settings.json` 的 `hiddenFiles` 有记录，而同群 B 的 state 里仍然有 —— 证明移除没有广播。
 
 最后一条验绿色版：用 `cmd` 把 `JAVA_HOME` 清空、`PATH` 只留 `C:\Windows\System32`（复现
 「目标机没装 Java」），再启动 `dist/Huchuan/Huchuan.exe`，要求 47290 上的 `/api/health` 通，
