@@ -2,6 +2,7 @@ package app.huchuan
 
 import android.net.Uri
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -40,6 +41,7 @@ import app.huchuan.kernel.MagnetImport
 import app.huchuan.kernel.PublicPublish
 import app.huchuan.notify.NotifyPermission
 import app.huchuan.notify.NotifyRoute
+import app.huchuan.share.ShareInRoute
 import app.huchuan.ui.FileScreen
 import app.huchuan.ui.GroupScreen
 import app.huchuan.ui.HomeScreen
@@ -52,6 +54,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /** 仅 adb 可用的调试入口，界面上不出现任何开关。 */
 object DebugIntent {
@@ -249,6 +252,29 @@ class HuchuanState(
     /** P3「添加文件」：SAF URI → 私有目录副本 → 做种 → 广播 file.add。 */
     suspend fun shareDocument(groupId: String, uri: Uri): GroupFile? = withContext(Dispatchers.IO) {
         runtime?.importAndShare(groupId, uri)
+    }
+
+    /**
+     * 系统分享进来的副本直接进群：share/ShareInActivity 已经把 content:// 读完并落盘
+     * （授权只在那个 Activity 活着时有效，见 link-share §2.4），这里只按路径做种，
+     * 与 P3「添加文件」走同一个 [M1Runtime.shareFile]。
+     *
+     * 返回按分享顺序落地的 fileId；空 = 一个都没进（群没了 / 文件不见了）。
+     */
+    suspend fun shareFiles(groupId: String, files: List<File>): List<String> = withContext(Dispatchers.IO) {
+        val rt = runtime ?: return@withContext emptyList()
+        val group = rt.kernel.group(groupId) ?: return@withContext emptyList()
+        files.mapNotNull { file ->
+            val shared = rt.shareFile(group, file)
+            Log.i(
+                M1Runtime.TAG,
+                "event=share_in_import group_id=" + groupId +
+                    " name=" + file.name.replace(' ', '_') +
+                    " bytes=" + file.length() +
+                    " file_id=" + (shared?.id ?: "-"),
+            )
+            shared?.id
+        }
     }
 
     /**
@@ -506,6 +532,77 @@ fun HuchuanApp(
                 " file_id=" + (target.fileId ?: "-") +
                 " waited_ms=" + waitedMs,
         )
+    }
+
+    // 系统分享进来（link-share §2.3）：落点只选群，不选「链接还是群」，也没有确认页。
+    //   0 个群 → P5 建群（还没用户名就先 P1）；1 个群 → 直接进 P3；多个群 → P2 点一个。
+    // P0 自检照常跑，自检放行与这里是并行的两件事：谁先到都不会把对方顶掉（P0 一旦离开
+    // 组合，它自己的 onEnter 就不会再触发）。
+    val shareTarget = ShareInRoute.pending
+    val shareAt = state.current
+    var shareRouted by remember { mutableStateOf<ShareInRoute.Target?>(null) }
+    var shareGroup by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(shareTarget, shareAt, runtime) {
+        val target = shareTarget ?: return@LaunchedEffect
+        if (shareRouted === target) return@LaunchedEffect
+        // 冷启动时内核还没读完 state.json：等它启动完（start() 返回后 group 列表才是定论），
+        // 没有内核（静态壳）就跳过。最多等 15 s，与通知入口同口径。
+        var waitedMs = 0
+        while (runtime != null && !runtime.started && waitedMs < 15_000) {
+            delay(200)
+            waitedMs += 200
+        }
+        val groups = state.groupList
+        shareRouted = target
+        when {
+            groups.isEmpty() -> {
+                if (state.deviceState.userNameUnset) {
+                    state.push(Destination.UserName)
+                } else {
+                    // P5 建群；创建成功 → onJoined → P3，导入由下面那段接手。
+                    state.enterNewGroupFirstLaunch()
+                }
+            }
+
+            groups.size == 1 -> {
+                shareGroup = groups.first().id
+                state.openGroup(groups.first().id)
+            }
+
+            else -> {
+                state.enterHome()
+                Toast.makeText(context, R.string.share_in_pick_group, Toast.LENGTH_SHORT).show()
+            }
+        }
+        Log.i(
+            M1Runtime.TAG,
+            "event=share_in_route groups=" + groups.size + " waited_ms=" + waitedMs,
+        )
+    }
+
+    // 到了该落的那个群页面，就把待处理的分享导入进去。
+    // 先 take() 再 launch：take 会让上面的 key 变空，但导入跑在 composition scope 里，
+    // 不会因为这次重组被取消。
+    LaunchedEffect(shareTarget, shareAt, runtime) {
+        val target = shareTarget ?: return@LaunchedEffect
+        if (shareRouted !== target) return@LaunchedEffect
+        // 读实时位置而不是本帧的 shareAt：上面那段可能刚刚把页面改成 P2（多个群时不进门）。
+        val destination = state.current as? Destination.GroupPage ?: return@LaunchedEffect
+        val fixed = shareGroup
+        if (fixed != null && fixed != destination.groupId) return@LaunchedEffect
+        val taken = ShareInRoute.take() ?: return@LaunchedEffect
+        scope.launch {
+            val ids = state.shareFiles(destination.groupId, taken.files)
+            Log.i(
+                M1Runtime.TAG,
+                "event=share_in_import_done group_id=" + destination.groupId +
+                    " ok=" + ids.size + "/" + taken.files.size,
+            )
+            if (ids.isEmpty()) {
+                Toast.makeText(context, R.string.share_in_failed, Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     fun goBack() {

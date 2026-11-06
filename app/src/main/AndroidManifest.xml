@@ -47,6 +47,27 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- 系统分享入口（link-share §2.1）。只声明 SEND / SEND_MULTIPLE：不声明 VIEW（§2.2），
+                 也不申请任何存储权限 —— 发送方带 FLAG_GRANT_READ_URI_PERMISSION，我们只需要
+                 contentResolver.openInputStream（§2.4）。
+                 mimeType="*/*" 让人能分享任意类型；text/plain 显式写出来是因为分享面板按精确类型
+                 过滤时更稳。两种 action 各一套，缺一个就收不到。
+                 挂在 MainActivity 而不是另起一个透明空壳：真机实测（Mi MIX 2S / API 33）App 进程
+                 还活着时系统把 SEND 直接递给栈顶实例，新 Activity 根本不会被创建，分享会静默丢失
+                 （证据与取舍见 docs/action-send.md）。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
     </application>
 

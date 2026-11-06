@@ -600,6 +600,101 @@ group.connectSeeders(fileId)             // 私有 → btPort；公开 → pubBt
 `updatePublicAllowlist` 只加不删 → 替换 / 清空撤销那几条红；把 `connectSeeders` 的公开早退加回来 →
 `crossnet.public_dial_uses_pub_bt_port` 红；去掉 `pubBtPort` 解析 → pubBtPort 那组（4 条）红。
 
+### 3.7.1 跨网分享窗口：UPnP / NAT-PMP 按需开（本轮 M2）
+
+设计依据：`docs/design/nat-traversal.md` §7（隐私代价与压缩手段）/ §8（第 4 档）与 AGENTS §9 的端口映射基线。
+模块：`core/.../m1/CrossNetWindow.kt`；会话侧原语在 `BtSession.setListenPort / setPortMapping / upnpEnabled / natpmpEnabled`。
+
+**四条不变量**（改实现时必须保持）：
+
+1. **默认关**：私有会话建会话时仍是 `enable_upnp=false` / `enable_natpmp=false`（`BtSession.hardenedSettings`）。
+2. **只在窗口内开**：`kernel.crossNetWindowOpen(ms)` 才把两个 setting 打开；手动关 / 到点关都立刻关掉。
+3. **端口随机**：窗口内私有会话的监听端口换成 **49152–65535** 的随机空闲端口，避开 51413（私有 BT 默认口）
+   与 47100（消息层口）；关窗恢复窗口前的监听端口。
+4. **结束即撤销**：关掉两个 setting 就是撤销映射 —— libtorrent 的 `stop_upnp()` / `stop_natpmp()` 对当前
+   监听端口调 `upnp::close()` / `natpmp::close_impl()`，把每条映射标成 del 并发出 DeletePortMapping /
+   NAT-PMP 删除包（`session_impl.cpp`；见 `BtSession.setPortMapping` 的注释）。不另写映射客户端。
+
+**顺序不能反（两条）**：
+
+- 开窗：**先换随机监听端口，再开映射**。开 UPnP/NAT-PMP 后 libtorrent 会映射"当前监听端口"，
+  先开映射等于把默认的 51413 暴露给公网 —— 正是设计里要避免的固定指纹。
+- 关窗：**先关 setting（撤映射），再恢复监听端口**，否则恢复出来的 51413 会被重新映射出去。
+
+换端口走 `apply_settings(listen_interfaces)`，**运行期生效、不重启会话**；已建立的 BT 连接是独立 socket，
+不受影响，新入向连接走新端口。实测（2.1.0-39，Windows）：换端口 3–5 ms 生效；目标端口被占时
+`listen_port()` 会变成 0（旧 socket 已关、新 socket 没绑上），把 listen_interfaces 改成另一个端口即可恢复 ——
+所以打开窗口的端口尝试有 3 次上限（见下），失败必须恢复原端口。
+
+**API**（宿主 / 诊断读口）：
+
+```kotlin
+val r = kernel.crossNetWindowOpen(10 * 60 * 1000L) // OpenResult(ok, code, message, port, expiresAt)
+kernel.crossNetWindowClose()                       // true = 真关掉了一个开着的窗口；reason 只有 manual / expired
+kernel.crossNetWindowStatus()                      // Status(open, port, remainingMs, mappings)
+kernel.btUpnpEnabled() / kernel.btNatpmpEnabled()  // 会话 live 真值（读 session.get_settings，不是缓存）
+```
+
+失败码（open **不抛异常**，返回一句中文）：
+
+| code | 触发 |
+|---|---|
+| `invalid_duration` | `durationMs <= 0`（上限 24 h，超过按 24 h 算） |
+| `session_down` | 内核没起来，或私有会话没在监听（`listen_port <= 0`） |
+| `port_unavailable` | 连续 3 个随机端口都绑不上（每次失败先恢复原端口） |
+| `mapping_unsupported` | 两个 setting 写进去后 1.5 s 内读不回 true |
+| `already_open` | 窗口已经开着：只续期，ok=true，不重换端口、不重开映射 |
+
+**重试上限**：换端口最多 3 次（`CrossNetWindow.MAX_OPEN_ATTEMPTS`），每次失败记 `window_open_retry`
+并恢复原端口，第 4 次不存在。映射本身交给 libtorrent 自己的退避重试，我们不在窗口内叠加循环 ——
+"窗口内失败最多重试 3 次"指的是我们自己的动作，不是路由器。
+
+**到期**：一次性 `ScheduledExecutorService` 任务（线程 `huchuan-crossnet`，daemon，窗口一关就 shutdown），
+**不是轮询线程**；`M1Kernel.startCompletionWatcher()` 的 200 ms 节拍每拍调一次 `tick()` 兜底，
+`status()` 也会就地判到期。最坏时延是调度线程的唤醒时间（毫秒级），不是 2 s 巡查节拍；窗口关掉后不留线程。
+
+**会话 feel**：窗口开 / 关后调 `M1Kernel.refreshBtReachability()`，一次推齐三处：
+
+1. `refreshBtAllowlist()` —— ip_filter 动态白名单（窗口不放宽白名单，只保证窗口期间的 filter 是最新的）；
+2. mDNS 重新注册 —— TXT/SRV 里的 `bt=` 端口变了，同网段成员靠它拨入；
+3. `peer.announce` 重播 —— 跨网成员靠 `btPort` 拨映射端点。
+
+**日志（可 grep）**：
+
+| 事件 | 字段 |
+|---|---|
+| `window_open` | `port` / `expires`（epoch ms）/ `prev_port` / `attempts` |
+| `window_close` | `reason=manual\|expired` / `port` / `revoked` / `restored_port` / `was_open` |
+| `window_extend` | `port` / `expires` |
+| `window_open_retry` | `attempt` / `port` / `actual` |
+| `window_open_failed` | `code` / `detail` / `attempts` |
+| `window_mapping` | `transport=upnp\|natpmp` / `protocol=tcp\|udp\|*` / `external_port` / `state=requested\|mapped\|failed` |
+| `window_refresh` | `port` / `open=true\|false`（"刷新真的跑了"的证伪点） |
+
+**mappings 口径**：窗口一开先按"申请中"记条目（upnp/natpmp × tcp，uTP 开着再加 udp），`portmap_alert`
+到达后改 `mapped` 并填 `externalPort`；`portmap_error_alert` 只把该传输下**仍 requested** 的条目标 `failed`
+（TCP 被拒、UDP 通过是常见组合，反过来也一样）。关窗清空。没有路由器时条目停在 `requested`，不是 open 失败 ——
+局域网照常，跨网那一路由调用方按有无 mapped 决定是否上报"可用"。
+本机实跑（Windows + 有 NAT-PMP 网关）时 `natpmp/tcp,udp` 与 `upnp/tcp,udp` 都走到 `mapped`，
+external_port = 窗口端口；证据见 `artifacts/spike-window/window-probe.log`（随机端口 61121 / 49376，
+关窗与到期后各自撤销）。
+
+**验收（harness `CrossNetWindowSelfTest`，挂在 `SelfTest` 里；正向证据 `selftest.checks=420 failures=0`，
+其中窗口 44 条）**：
+
+| 组 | 钉住什么 |
+|---|---|
+| 冷内核 | 没 `start()` 时 open 返回 `session_down`、不抛异常；status 全零；close 返回 false |
+| 开窗 | 端口在 49152–65535、≠51413/47100、≠原监听端口、**且从外部 TCP 连得上**；两个 setting 的 live 值都是 true；status open / remainingMs ∈ (0, duration]；mappings ≥2 且 internalPort = 窗口端口；日志 `window_open port=… expires=… prev_port=…` 与 `window_refresh open=true`；续期不换端口 |
+| 关窗 | 两个 setting 读回 false；status closed（port=0 / remaining=0 / mappings 空）；监听端口回到窗口前；日志 `window_close reason=manual` 与 `window_refresh open=false`；重复 close 返回 false |
+| 到期 | 500 ms 窗口睡 1 s 后自动 closed；两个 setting false；监听端口回原值；日志 `window_close reason=expired` |
+
+**反向变异（本轮实跑）**：把 `CrossNetWindow.close()` 里的 `bt.setPortMapping(false)` 注释掉
+（换成 `val revoked = true`），重编译跑 `SelfTest` → `selftest.checks=420 failures=3`，红的正是
+`window.close_settings_upnp_off` / `window.close_settings_natpmp_off` / `window.expired_settings_off`；
+恢复后 PASS。证明断言读的是**会话 live setting**，不是 CrossNetWindow 自己的记账。
+原始输出：`artifacts/spike-window/window-mutant-no-revoke.log`（红）与 `artifacts/spike-window/window-final-check-1.log`（绿）。
+
 ### 3.8 公开会话「2 分钟崩溃」的根因与规避（本轮）
 
 **现象。** 公开会话开 DHT、导入磁力后约 2 分钟，进程死在 `SessionManager-alertsLoop`
@@ -813,6 +908,7 @@ magnet 的 `btih` 与新 infohash 一致；public 条目出现（scope=public、
 | `huchuan-reconnect` | 冷启动重连的调度（250 ms 一拍）：按退避与并发上限（每群 3）派拨号 | 只对 `start()` 时恢复出来的群工作；有在线链路时立刻把退避归零 |
 | `huchuan-reconnect-lan` | 每 10 s 刷新一次 mDNS 候选（按 gid 归群） | 浏览要 2–3 s，不能挂在拨号节拍上 |
 | `huchuan-reconnect-dial` | 一条候选一个线程：TLS + hello 绑定，等 `isBound` 最多 6 s | 失败只影响这一条候选，退避由调度器统一记 |
+| `huchuan-crossnet` | 跨网分享窗口的**一次性**到期任务（调度器，不是轮询） | 只在窗口开着时存在，窗口一关就 shutdown；窗口没开时没有这条线程 |
 | `huchuan-tracker-<gid 前 4>` | 每个群一条：注册（小时轮换）→ announce → 券商候选；睡到「服务端 interval」与「本小时结束」里更早的那个 | 睡得分段（500 ms 一步），内核一关 ≈0.5 s 内退出；只在 `trackerBaseUrl` 非空时存在 |
 | 调用方线程 | `createGroup`/`addFile`/`comment` 同步执行 | `joinByTail8` 阻塞；`kernel.close()` 里会等最多 2 s 把 `event=stopped` 发出去 |
 

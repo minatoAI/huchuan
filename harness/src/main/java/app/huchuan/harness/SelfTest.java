@@ -70,6 +70,7 @@ public final class SelfTest {
             publicSwarm();
             tracker();
             crossNet();
+            crossNetWindow();
             signBytes();
             json();
             framing();
@@ -115,6 +116,14 @@ public final class SelfTest {
      */
     private static void crossNet() {
         CrossNetSelfTest.run(SelfTest::check);
+    }
+
+    /**
+     * 跨网分享窗口（AGENTS §9）：开窗换随机端口 + 开 UPnP/NAT-PMP、关窗撤映射并恢复原端口、
+     * 500 ms 窗口到点自动关。断言全在 [CrossNetWindowSelfTest] 里。
+     */
+    private static void crossNetWindow() {
+        CrossNetWindowSelfTest.run(SelfTest::check);
     }
 
     private static void check(String name, boolean ok) {

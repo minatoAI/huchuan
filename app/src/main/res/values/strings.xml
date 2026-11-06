@@ -141,6 +141,14 @@
     <string name="notify_comment">%1$s：%2$s</string>
     <string name="p7_notify_in_app">仅应用内</string>
     <string name="p7_notify_muted">静音</string>
+    <!-- 系统分享入口（link-share §2.1 / §2.3 / §2.4）：失败只说一句，不弹窗 -->
+    <string name="share_in_no_file">没有可分享的文件</string>
+    <string name="share_in_too_many">一次最多 10 个文件</string>
+    <string name="share_in_empty">文件是空的</string>
+    <string name="share_in_too_large">单个文件超过 1 GiB</string>
+    <string name="share_in_read_failed">读不到这个文件</string>
+    <string name="share_in_failed">发送失败</string>
+    <string name="share_in_pick_group">选一个群组</string>
     <string name="p7_reading">读取中</string>
     <string name="p7_read_failed">读取失败，重试</string>
     <string name="p7_offline_editable">离线可改，联网后生效</string>

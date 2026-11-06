@@ -62,6 +62,14 @@ class M1Kernel @JvmOverloads constructor(
     internal lateinit var publicBt: PublicBtSession
         private set
 
+    /**
+     * 跨网分享窗口（AGENTS §9）：默认关、只在窗口内开映射、随机端口、到点撤销。
+     * [start] 里跟着私有会话一起建；对外读口是 [crossNetWindowOpen] / [crossNetWindowClose] /
+     * [crossNetWindowStatus]。
+     */
+    internal lateinit var crossNetWindow: CrossNetWindow
+        private set
+
     val downloadsDir: File get() = File(dataDir, "downloads")
 
     private val stateLock = Any()
@@ -146,6 +154,9 @@ class M1Kernel @JvmOverloads constructor(
         // 完成判定不再等 2 s 巡查（缺口二）：libtorrent 判完当场塞队列，由完成线程立刻推事件。
         bt.onTorrentFinished = { fileId -> onTorrentFinishedAlert(fileId) }
         bt.start()
+        // 跨网分享窗口（AGENTS §9）：默认不开映射，窗口内才换随机端口 + 开 UPnP / NAT-PMP。
+        // 刷新出口走 refreshBtReachability：ip_filter、mDNS 里的 BT 端口、peer.announce 一次推齐。
+        crossNetWindow = CrossNetWindow(bt, events, onSessionRefresh = { refreshBtReachability() })
         // ip_filter 动态白名单（AGENTS §9）：state.json 恢复出来的手动地址 / 上次建链端点先带进去，
         // 之后 peer.announce / tracker / 手动地址每次变化再重建（见 refreshBtAllowlist）。
         refreshBtAllowlist()
@@ -209,6 +220,12 @@ class M1Kernel @JvmOverloads constructor(
 
     fun stop() {
         if (!closed.compareAndSet(false, true)) return
+        // 窗口还开着就先撤销映射再停会话（顺序：撤映射 → 恢复监听口 → 停会话）。
+        try {
+            if (this::crossNetWindow.isInitialized) crossNetWindow.close(CrossNetWindow.REASON_MANUAL)
+        } catch (_: Throwable) {
+            // 停机路径不允许因为撤映射失败而中断；libtorrent 的会话 stop 会带走剩余映射
+        }
         reconnecter?.close()
         reconnecter = null
         completionWatcher?.interrupt()
@@ -269,6 +286,63 @@ class M1Kernel @JvmOverloads constructor(
             )
         }
     }
+
+    /**
+     * 跨网窗口开 / 关之后刷新私有会话的「可达性状态」。
+     *
+     * 换监听端口不重启会话，所以三处都得主动推一次，否则成员还按旧端口拨：
+     *  1. ip_filter 动态白名单（复用 [refreshBtAllowlist]，窗口本身不放宽白名单）；
+     *  2. mDNS 通告里的 BT 端口（同网段成员靠它拨入）；
+     *  3. peer.announce 的 btPort（跨网成员靠它拨入映射端点）。
+     * 内核已经停了就什么都不做（[stop] 会先关窗口，此时 mDNS 与链路正在拆）。
+     */
+    internal fun refreshBtReachability() {
+        if (closed.get() || !this::bt.isInitialized) return
+        refreshBtAllowlist()
+        for (g in allGroups()) {
+            lanDiscovery.unregister(g.groupId)
+            lanDiscovery.register(g.meta, messagePortValue, localBtPort())
+        }
+        broadcastPeerAnnounceAll()
+    }
+
+    // ------------------------------------------------------------------ 跨网分享窗口（AGENTS §9）
+
+    /**
+     * 打开跨网分享窗口：[durationMs] 毫秒后自动撤销。窗口内私有会话监听随机高位端口并开
+     * UPnP / NAT-PMP（含 PCP），结束后立刻撤销映射、恢复原监听端口。
+     *
+     * 失败不抛异常：返回 [CrossNetWindow.OpenResult]（ok=false + 稳定 code + 一句中文）。
+     */
+    @JvmOverloads
+    fun crossNetWindowOpen(durationMs: Long = CrossNetWindow.DEFAULT_DURATION_MS): CrossNetWindow.OpenResult =
+        if (this::crossNetWindow.isInitialized) {
+            crossNetWindow.open(durationMs)
+        } else {
+            CrossNetWindow.OpenResult(false, "session_down", "内核没启动，跨网分享窗口打不开")
+        }
+
+    /** 立刻撤销映射并关掉 UPnP / NAT-PMP。返回是否真的关掉了一个开着的窗口。 */
+    @JvmOverloads
+    fun crossNetWindowClose(reason: String = CrossNetWindow.REASON_MANUAL): Boolean =
+        if (this::crossNetWindow.isInitialized) crossNetWindow.close(reason) else false
+
+    /**
+     * 跨网窗口状态：`{open, port, remainingMs, mappings}`。
+     * 内核没起来 / 窗口没开时是 `open=false, port=0, remainingMs=0, mappings=[]`。
+     */
+    fun crossNetWindowStatus(): CrossNetWindow.Status =
+        if (this::crossNetWindow.isInitialized) {
+            crossNetWindow.status()
+        } else {
+            CrossNetWindow.Status(false, 0, 0, emptyList())
+        }
+
+    /** 私有会话 UPnP 的 live 真值（诊断页 / 验收断言；会话没起来 = false）。 */
+    fun btUpnpEnabled(): Boolean = if (this::bt.isInitialized) bt.upnpEnabled() else false
+
+    /** 私有会话 NAT-PMP / PCP 的 live 真值。 */
+    fun btNatpmpEnabled(): Boolean = if (this::bt.isInitialized) bt.natpmpEnabled() else false
 
     /** 当前动态白名单快照（诊断 / 验收读口；不含基础私网段）。 */
     fun btAllowlistHosts(): Set<String> =
@@ -1628,6 +1702,9 @@ class M1Kernel @JvmOverloads constructor(
                 }
                 if (closed.get()) break
                 try {
+                    // 跨网窗口到期兜底：正常由一次性的调度任务关，这里只是调度线程被卡住时的保险。
+                    // 200 ms 一拍，不是新起的轮询线程（复用完成判定线程）。
+                    if (this::crossNetWindow.isInitialized) crossNetWindow.tick()
                     if (fileId != null) completeByFileId(fileId, "alert")
                     sweepDownloads("sweep")
                 } catch (e: Throwable) {

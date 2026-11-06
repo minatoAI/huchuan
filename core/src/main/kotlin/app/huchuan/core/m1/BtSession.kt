@@ -220,6 +220,155 @@ class BtSession(
 
     fun isDhtRunning(): Boolean = manager?.isDhtRunning ?: false
 
+    // ---------------------------------------------------------------- 跨网分享窗口（端口 / 映射）
+
+    /**
+     * 跨网窗口用：把会话的监听端口换到 [port]，**运行期生效**（不重启会话、不断已建立的连接）。
+     *
+     * 返回读回的 `session::listen_port()`：
+     *  - 等于 [port] = 成功；
+     *  - 其它值（含 0）= 目标端口没绑上（多半被别的进程占了），会话此刻可能没有监听 socket。
+     *    这不是「可以忽略的失败」：apply_settings 换 `listen_interfaces` 时 libtorrent 会先关旧 socket
+     *    再绑新端口，绑不上就停在 0（实测 2.1.0-39：随后把 listen_interfaces 改成另一个端口即可恢复）。
+     *    调用方必须换端口重试，或恢复原端口。
+     *
+     * BT 连接是独立 socket，换监听口不会断开已经在传的连接；只是新入向连接要到新端口。
+     */
+    fun setListenPort(port: Int): Int {
+        if (port !in 1..65535) return -1
+        val mgr = manager ?: return -1
+        return try {
+            val pack = SettingsPack()
+            pack.listenInterfaces("0.0.0.0:$port")
+            mgr.applySettings(pack)
+            val actual = awaitListenPort(mgr, port)
+            listenPort = actual
+            actual
+        } catch (e: Throwable) {
+            sessionSettingsError = e.toString()
+            -1
+        }
+    }
+
+    /**
+     * 跨网窗口用：开 / 关 UPnP 与 NAT-PMP。libtorrent 2.1 的 **PCP 藏在 natpmp 模块里**
+     * （先 PCP 后回落 NAT-PMP，`natpmp.cpp`），所以这里没有第三个开关。
+     *
+     * 关掉就是**撤销映射**：libtorrent 的 `stop_upnp()` / `stop_natpmp()` 在对当前监听端口
+     * 调 `upnp::close()` / `natpmp::close_impl()` 时会把每条映射标成 del 并发出
+     * DeletePortMapping / NAT-PMP 删除包（见源码 session_impl.cpp:stop_upnp/stop_natpmp）。
+     * 因此「关 setting」与「撤映射」是同一个动作，不需要自己实现映射客户端。
+     *
+     * 返回**读回**的两个 setting 都等于 [on]；超时仍未生效返回 false。
+     */
+    fun setPortMapping(on: Boolean): Boolean {
+        val mgr = manager ?: return false
+        return try {
+            val pack = SettingsPack()
+            pack.setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), on)
+            pack.setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), on)
+            mgr.applySettings(pack)
+            awaitPortMappingSettings(mgr, on)
+        } catch (e: Throwable) {
+            sessionSettingsError = e.toString()
+            false
+        }
+    }
+
+    /** UPnP 的 live 真值（读会话当下的 settings，不是本类缓存）。 */
+    fun upnpEnabled(): Boolean = liveBoolean(settings_pack.bool_types.enable_upnp)
+
+    /** NAT-PMP / PCP 的 live 真值。 */
+    fun natpmpEnabled(): Boolean = liveBoolean(settings_pack.bool_types.enable_natpmp)
+
+    /** uTP 是否开着：窗口据此决定要不要报告 UDP 映射（uTP 关掉时没有 UDP 监听口）。 */
+    fun utpEnabled(): Boolean =
+        liveBoolean(settings_pack.bool_types.enable_incoming_utp) ||
+            liveBoolean(settings_pack.bool_types.enable_outgoing_utp)
+
+    /** 跨网窗口换端口 / 改 setting 时的失败原文（"" = 正常）。诊断用。 */
+    @Volatile
+    var sessionSettingsError: String = ""
+        private set
+
+    private fun liveBoolean(type: settings_pack.bool_types): Boolean {
+        val mgr = manager ?: return false
+        return try {
+            mgr.settings().getBoolean(type.swigValue())
+        } catch (e: Throwable) {
+            sessionSettingsError = e.toString()
+            false
+        }
+    }
+
+    /**
+     * 等 `listen_interfaces` 生效：apply_settings 是投递到会话线程的异步调用，
+     * 返回后立刻读 `listen_port()` 还可能看到旧值（实测换端口 3 ms 内生效，但接口不保证）。
+     * 最多等 [SETTINGS_WAIT_MS]，返回最后一次读到的端口（未生效时可能是 0 或旧端口）。
+     */
+    private fun awaitListenPort(mgr: SessionManager, want: Int): Int {
+        val deadline = System.currentTimeMillis() + SETTINGS_WAIT_MS
+        var actual = -1
+        while (true) {
+            actual = try {
+                mgr.swig().listen_port()
+            } catch (e: Throwable) {
+                sessionSettingsError = e.toString()
+                -1
+            }
+            if (actual == want) return actual
+            if (System.currentTimeMillis() >= deadline) return actual
+            try {
+                Thread.sleep(SETTINGS_POLL_MS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return actual
+            }
+        }
+    }
+
+    /** 等两个映射 setting 都变成 [on]（口径同上：读会话 live 值，不是本类缓存）。 */
+    private fun awaitPortMappingSettings(mgr: SessionManager, on: Boolean): Boolean {
+        val deadline = System.currentTimeMillis() + SETTINGS_WAIT_MS
+        while (true) {
+            val ok = try {
+                val pack = mgr.settings()
+                pack.getBoolean(settings_pack.bool_types.enable_upnp.swigValue()) == on &&
+                    pack.getBoolean(settings_pack.bool_types.enable_natpmp.swigValue()) == on
+            } catch (e: Throwable) {
+                sessionSettingsError = e.toString()
+                false
+            }
+            if (ok) return true
+            if (System.currentTimeMillis() >= deadline) return false
+            try {
+                Thread.sleep(SETTINGS_POLL_MS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+    }
+
+    /** 跨网窗口用的告警订阅（端口映射结果）。会话没起来时返回 false。 */
+    internal fun addAlertListener(listener: AlertListener): Boolean = try {
+        val mgr = manager ?: return false
+        mgr.addListener(listener)
+        true
+    } catch (e: Throwable) {
+        sessionSettingsError = e.toString()
+        false
+    }
+
+    /** 摘掉 [addAlertListener] 挂的监听；会话已经停了也算成功。 */
+    internal fun removeAlertListener(listener: AlertListener) {
+        try {
+            manager?.removeListener(listener)
+        } catch (_: Throwable) {
+            // 会话已经停了：监听随 SessionManager 一起没了
+        }
+    }
+
     /**
      * 建 v1 私有种子（协议 §4）：private=true、无 trackers/nodes/url-list。
      * 建完重新解析一遍再断言，不信任「我设置了」。
@@ -693,6 +842,12 @@ class BtSession(
 
         /** 「端口全被占」时向系统要空闲端口的次数。 */
         private const val FALLBACK_PORT_TRIES = 5
+
+        /** 运行期改 settings（换监听端口 / 开关映射）后等它生效的上限；实测 3–5 ms 生效。 */
+        private const val SETTINGS_WAIT_MS = 1500L
+
+        /** 等 settings 生效的轮询间隔（只在调用方线程上做有界等待，不起后台线程）。 */
+        private const val SETTINGS_POLL_MS = 10L
 
         /** peer class filter 的两个探针地址：非私网（global 类）、回环（local 类）。 */
         private const val PROBE_NON_LOCAL = "8.8.8.8"
