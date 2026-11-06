@@ -2,7 +2,9 @@
 
 - 版本：2026-11-06 · 内核 agent · 对应协议 v0（docs/design/protocol.md，唯一事实源）
 - 状态：**M1 全流程在桌面 JVM 上用两个独立进程跑通**（建群 → 后 8 位加入 → 32 MiB 共享/下载/SHA 一致 → 评论 3 s 内入库 → 全程 dht_nodes=0）
+- M1.3（本轮）：做种集合与完成判定合成一份来源（`SeedingLedger`），下载完成即进入做种集合，休眠、文件被移走删掉、数据不完整都移出；重启续种（原 G2）按 `state.json` 里的做种集合恢复做种，文件不在或大小不对就降级为休眠并记日志。修掉真机上「下完转做种自报 seeds=0」的缺陷（docs/m1-device.md §6-6）
 - 不在本文件范围：UI 实现细节（app/ 已通过 `M1Runtime` + `M1GroupStore` 接内核，没有 runtime 时回退 `InMemoryGroupStore`）、tracker 跨网（M2）、Android .so
+- M1.2 收敛（上一轮）：建群/入群时创建者登记自己的公钥（修掉 `file_list_rejected reason=no_pub`）、成员平台与做种数（G3，协议 §10 的 0x30 补两个可选字段）、每群每文件的未读游标（G4）、幂等的退群 `removeGroup`（G1）；接口签名见 §3.1
 - M1.1 收敛（对应 protocol.md §13 的第 2/3/4 条）：join.ok 用独立签名 domain 且验不过即断开、file.list 每条 entry 原样带 file.add 的原 sig 并按 addedBy 验签、公钥随 join.ok.members 与 member.name 分发；评论时延改本机时钟口径、单帧发送失败不再断整条连接
 
 ## 1. 怎么跑
@@ -15,12 +17,16 @@ bash scripts/m1-headless.sh
 
 1. `./gradlew :core:jar :core:m1Deps :core:m1Native`（构建内核 + 拉依赖 + 解出 `libtorrent4j.dll`）
 2. `javac` 编译 harness（`harness/src/main/java`）
-3. 跑字节层自检 `SelfTest`（60 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧）
+3. 跑字节层自检 `SelfTest`（110 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；另有三组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」、未读游标的全序与落盘往返；本轮加一组做种集合与重启续种：下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）
 4. 起 A、B 两个 JVM 进程跑 M1 全流程，然后只用 grep 复核日志
 
 产物：`artifacts/m1/log-A.log`、`log-B.log`、`selftest.log`、`a-data/`、`b-data/`（含 `state.json`、`identity.txt`、`downloads/`）。`artifacts/` 不进版本库。
 
-一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **22 秒**；25 条 CHECK 全 PASS（自检 60 条另计）。
+一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **55 秒**（B 角色多出两次内核重启，见 §3.2）；35 条 CHECK 全 PASS（自检 110 条另计）。
+
+G1/G3/G4 的运行时验证不在这条脚本里（脚本本轮不动），用一次性探针跑的：`artifacts/gaps-probe/`（`GapsProbe.java` + `probe.log`，38 条断言，不进版本库），覆盖两内核互联后的未读计数与清零、游标跨重启、成员平台/做种数跨线、以及退群时 `torrents_stopped=1 links_closed=1 key_wiped=true` 与重复调用返回 false。
+
+本轮（M1.2）回归后的关键差异，都能在 `artifacts/m1/` 里直接 grep：`reason=no_pub` 从上一轮的 232 条降到 **0 条**（创建者公钥已登记）；`peer_announce` 多了 `plat=windows seeds=0|1`（「B 下载完成后自报的 seeds 从 0 变 1」这一句在 M1.3 才真的成立，之前是 0 一直不变，见 §3.2）；`op_ingested` 多了 `unread=1`；`state.json` 的 `keys` 里有本机自己的公钥、每个群多一个 `read` 数组。
 
 真机链路另跑：`bash scripts/m1-device.sh --quick`（手机 + 桌面 JVM 对端，把 `:app` 也编一遍），本轮 19 条 CHECK 全 PASS。harness 故意写成纯 Java、由 `javac` 直接编译（不进 `settings.gradle.kts`，避免动到 app 的构建图）。
 
@@ -49,9 +55,11 @@ bash scripts/m1-headless.sh
 | `Tls.kt` | TLS 上下文（信任全开、双向证书）、套件白名单、ALPN `huchuan/1`、chanId | §5 §1.2 |
 | `Json.kt` | 严格 JSON（禁浮点、未知字段忽略） | §5 |
 | `Protocol.kt` | 帧编解码（u32len‖u8ver‖u8type‖JSON，≤65536）+ 15 个 M1 消息的记录类型 | §5 §9 §10 |
-| `OpLog.kt` | 评论日志：验签、opId 去重、prev 链、Lamport、乱序 pending、作者游标 | §6 |
+| `OpLog.kt` | 评论日志：验签、opId 去重、prev 链、Lamport、乱序 pending、作者游标、读游标 `ReadCursor` / 未读计数 `Unread`（G4） | §6 |
+| `PubRegistry.kt` | 设备公钥库（dev → pub64）与 file.list 条目验签口径 `EntryCheck`（no_sig / no_pub / bad_sig） | §7 §10 |
 | `GroupRuntime.kt` | 一个群的运行时：成员表、文件清单、评论、连接、BT 任务、持久化快照；对外就是 GroupRuntime API | §7 §11 |
-| `BtSession.kt` | libtorrent4j 私有会话：建 v1 私有种、加种/做种、swig `connect_peer`、单文件限速、dht_nodes | §4 §8 |
+| `BtSession.kt` | libtorrent4j 私有会话：建 v1 私有种、加种/做种、swig `connect_peer`、单文件限速、dht_nodes、做种健康状态 `seedState` | §4 §8 |
+| `Seeding.kt` | 「本机在做种的文件」唯一来源 `SeedingLedger`（下载完成进、休眠与文件缺失出、只数清单里还有的）+ 重启续种判定 `SeedRestore` | §7 |
 | `Discovery.kt` | JmDNS `_huchuan._tcp` 注册/浏览；手动 `IP:port` 解析 | §3.1 §3.3 §3.4 |
 | `PeerLink.kt` | 一条消息层连接的全部语义：hello 绑定 → join → sync → 广播 → ping/bye/err | §2.3 §5 §7 §8 |
 | `PeerServer.kt` | 消息层监听（端口顺延）、TLS 握手、每条连接一个线程 | §5 |
@@ -86,6 +94,21 @@ val group = kernel.createGroup("老板的群")
 // P5 加入：只输后 8 位；manualCandidates 是「手动 IP:port」兜底，可为空
 val joined = kernel.joinByTail8("GNMNTCPA", emptyList(), 60_000)
 
+// G1 退群 / 解散：停掉该群全部 torrent、关闭该群消息链路、删群密钥、移出本地库；幂等，删过了返回 false
+val removed = kernel.removeGroup(groupid)
+
+// G4 未读数：整群 / 单文件两种粒度；打开 P2、P4 时清零（返回清掉的条数），游标落在 state.json 里
+val unread = kernel.unreadCount(groupid)               // 整群
+val unreadOfFile = kernel.unreadCount(groupid, fileId) // 单个文件
+kernel.markGroupRead(groupid)                          // P2 打开
+kernel.markFileRead(groupid, fileId)                   // P4 打开
+group.unreadCount(); group.unreadCount(fileId); group.markAllRead(); group.markRead(fileId) // 同一套，群对象上
+
+// G3 成员做种数与平台：members() 返回的每条记录都带，来自 peer.announce 的 plat / seeds
+for (m in group.members()) { m.dev; m.name; m.platform /* android|windows|unknown */; m.seedingCount }
+group.seedingFileCount()      // 本机在该群真实做种数（SeedingLedger ∩ files，含「下完转做种」）
+group.seedingCountOf(dev)     // 某个成员自报的做种数（本机取真值）
+
 // P3/P4
 val entry = group.addFile(File(...))        // 建 v1 私有种 → 做种 → 广播 file.add
 group.startDownload(entry.fileId)            // 加种 + connect_peer
@@ -108,6 +131,109 @@ kernel.close()
 - `connectSeeders` 的去重键是 **`fileId@dev:port`**，不是 `dev:port`：`connect_peer` 是「每个 torrent 一份」的连接，只按 `dev:port` 去重会让第二个文件永远接不上做种者（一文件一 torrent）。该文件已有活 peer 时不重连；没有活连接时按 `CONNECT_RETRY_MS`（5 s）重试；`stopFile` 会清掉这个文件的计时，否则休眠完再激活会被重试间隔卡住。
 - `latencyMillis` 只给展示用：评论顺序固定按 `(lamport, author, seq)`（协议 §6），`ts` 和时延都不参与排序。
 
+### 3.1 缺口收敛（本轮）：创建者公钥 / G3 / G4 / G1
+
+这一节是给宿主（daemon、Android UI）看的**接口签名**。core 这边已经全部实现并落盘，daemon/ 与 app/ 本轮未改，下一轮照这里接线即可。
+
+**① 缺陷：创建者从不登记自己的公钥**
+
+- 症状：建群后本机收到别人回传的 `file.list` 时，自己发布的条目一律 `file_list_rejected reason=no_pub`（证据 `artifacts/m1/log-catchup-a.log`，232 条）。
+- 修法：`createGroup` 与 `installJoinedGroup` 都调 `registerPub(deviceId, identity.pub64)`；验签口径抽到 `EntryCheck.reason(pub, entry)`（`PubRegistry.kt`），SelfTest 用生产代码钉住「登记后能验自己的条目、没登记必须是 no_pub」。
+- 宿主可见的变化：无（只是不再丢自己的条目）。诊断用 `kernel.pubHexOf(dev)`（未登记返回 `""`）。
+
+**② G3 成员做种数 + 平台（协议只补字段，见 protocol.md §10 的 0x30）**
+
+| 项 | 值 |
+|---|---|
+| 消息 | `0x30 peer.announce` 追加两个可选字段：`plat`（`android` / `windows` / `unknown`）、`seeds`（u32，自报本群做种文件数） |
+| 签名 | 沿用 `peer1` 域 `[dev, gid, btPort, ts]`，两个新字段**不进签名**（口径与 `btHost` 相同）；老实现的 sig 仍然验得过 |
+| 发送时机 | 建连绑定后首帧、共享新文件后、下载完成转做种后、休眠摘掉做种后 |
+| 收端处理 | 写进成员运行期属性，认不出的 plat 归 `unknown`，负 seeds 夹到 0 |
+
+```kotlin
+group.members(): List<MemberRecord>   // MemberRecord(dev, name, nameSeq, pub, platform, seedingCount)
+group.seedingFileCount(): Int          // 本机在该群真实做种数（SeedingLedger ∩ files）
+group.seedingCountOf(dev: String): Int // 别人取最近一条 announce 的自报值，从未自报为 0；本机取真值
+kernel.platform: String                // 构造参数，默认 Proto.detectPlatform()；宿主可覆盖
+```
+
+`platform` / `seedingCount` 是**运行期属性**：不写 `state.json`，也不进 `join.ok.members`。对端重连时会立刻补一条 `peer.announce`，所以重启后它们自己会回来；离线成员在重启后、重新握手前显示 `unknown` / 0。
+
+**③ G4 未读数（每群每文件一条读游标）**
+
+游标记「上次读到哪条 op」，键就是协议 §6 的全序 `(lamport, author, seq)`。未读数 = 该文件可见 op（墓碑与被墓碑指向的不出现）里键**严格大于**游标的条数 —— 不存计数器，所以重连补齐、乱序到达、重复广播都不会算错。自己写的评论会把游标一起推进，刚发的评论不会变未读。
+
+```kotlin
+// 群对象上（细粒度）
+group.unreadCount(): Int              // 整群 = 各文件之和
+group.unreadCount(fileId: String): Int
+group.markRead(fileId: String): Int   // 打开 P4：清零并返回清掉的条数
+group.markAllRead(): Int              // 打开 P2：整群清零
+// 内核门面上（宿主只拿得到 groupId 时用，群不存在一律返回 0，不抛）
+kernel.unreadCount(groupId: String): Int
+kernel.unreadCount(groupId: String, fileId: String): Int
+kernel.markGroupRead(groupId: String): Int
+kernel.markFileRead(groupId: String, fileId: String): Int
+```
+
+持久化：`state.json` 每个群多一个 `read` 数组，元素是 `{fileId, lamport, author, seq}`。旧 `state.json` 没有这个字段，读回来等于「一条都没读过」，不做兼容补算。
+
+**④ G1 退群 / 解散**
+
+```kotlin
+kernel.removeGroup(groupId: String): Boolean   // true = 这次真的删了；群不存在/已删过 → false（幂等）
+// 事件：KernelEvents.groupRemoved(group)  —— 链接已关、密钥已抹、库已重写之后回调
+// 日志：group_removed（gid, name, torrents_stopped, links_closed, files, key_wiped）/ group_remove_noop
+```
+
+一次做完五件事：① 该群全部 torrent 从 BT 会话摘掉（磁盘文件**不动**，不删用户数据）；② 关闭该群全部消息链路（`peer_link_closed reason=group_removed`）；③ mDNS 注销；④ `keySeed` 与派生的 `kGrp` 就地清零；⑤ `groupsById` 移除后 `saveState()`，`state.json` 里不再有这个群。
+
+**daemon 下一轮要接的三处**（本轮不动 daemon/）：`groupJson` 的 `unreadCount` 改成 `kernel.unreadCount(g.groupId)`、加一个「打开即清零」的入口（`POST /api/groups/{gid}/read` 或 P4 打开时调 `markFileRead`）；`memberJson` 的 `seedingCount` / `platform` 直接透传 `MemberRecord` 的两个字段（不再写死 0 与「未知」）；新增 `DELETE /api/groups/{gid}` → `kernel.removeGroup`。
+
+### 3.2 做种集合与重启续种（本轮）
+
+**缺陷（真机发现）**：`seedingFileCount()` 只数 `addFile` 加进去的那一份，下载完成（`markCompleted`）不进集合。一台设备下载完并且正在做种，自报 `seeds=0`，P6 上显示「做种 0」（证据 docs/m1-device.md §6-6、artifacts/m1-device/screenshots 里的 `final-members` 截图：桌面电脑、在线、做种 0、Windows）。
+
+根因是「谁在做种」有两套口径：完成判定写 `completed`，做种集合写 `localSeeds`，两边各写各的。现在收成一份：
+
+| 项 | 值 |
+|---|---|
+| 唯一来源 | `GroupRuntime.seeding`（类型 `SeedingLedger`） |
+| 进 | `addFile` 挂进会话之后；巡查判定 `isComplete()` 为真（`markCompleted`）；重启续种成功 |
+| 出 | `stopFile`（休眠/暂停）；巡查发现文件被移走删掉、或片上校验后数据不完整；退群 |
+| 读数 | `SeedingLedger.count(files.keys)`：只数清单里还有的。`seedingFileCount()`、`peer.announce.seeds`、`seedingCountOf(自己)`、P3 的「做种中」全部读它 |
+
+巡查每 2 s 对账一次（`GroupRuntime.reconcileSeeding`）：文件不在就降级为休眠（`seed_stopped reason=file_missing`），libtorrent 校验后发现缺片也降级（`reason=incomplete`），torrent 不在会话里同样降级（`reason=torrent_missing`）。状态是 checking/pending 时不下判断，连续两拍异常才降，避开挂种瞬间的抖动。降级后界面按「休眠」显示，用户想继续再点激活。
+
+**重启续种（原 G2）**：`state.json` 每个群多一个 `seeding` 数组，元素是 `{fileId, path}`。`M1Kernel.start()` 在 BT 会话起来之后、PeerServer 与 mDNS 之前调 `resumeSeeds()`，逐条判定：
+
+| 判定 | 条件 | 结果 |
+|---|---|---|
+| `RESUME` | 条目还在清单里、条目带 inline torrent、本地文件在、文件大小与条目一致 | 按原始 torrent 字节挂种，进做种集合，日志 `seed_resumed` |
+| `NO_ENTRY` / `NO_TORRENT` | 清单里没有，或条目没有 inline torrent | 降级为休眠，日志 `seed_resume_failed reason=...` |
+| `FILE_MISSING` | 记录的路径上没有文件 | 降级为休眠，不崩、不动磁盘 |
+| `SIZE_MISMATCH` | 文件在但大小与条目不一致 | 降级为休眠 |
+| `activate_failed` | 判定通过但 `add_torrent` 抛异常 | 降级为休眠，日志 `seed_resume_error` |
+
+一轮结束打一条 `seed_resume_done resumed=<n> skipped=<m>`，0 条也打：重启后没有要续种的东西同样是证据。
+
+**为什么是「直接加种」而不是「重新建种」**（二选一，选前者）：`FileEntry.torrent` 是这条 file.add 原始的 info 字典，按它挂种得到的 infohash 与群里其他人看到的完全一致。重新建种（`TorrentBuilder` 再扫一遍文件）是按当前盘上的内容重算，文件被截断或换掉时会得到别人的清单里不存在的新 infohash，等于悄悄发布一个没人认的文件，还会覆盖本地条目。数据完整性不在这一步判，交给 libtorrent 的片上校验，校验不通过由上面那条巡查降级。
+
+**口径与边界**
+
+- 只续「上次在做种」的条目。未完成的下载不自动续传（重启后仍是休眠），避免用户没点激活就偷偷跑流量。想续传就再点激活，已完成的片会保留。
+- 路径存在 `state.json` 里，因为共享文件的目录是用户选的，内核不猜。真机上共享副本在应用私有目录、下载在 `downloads/`，两条都在。
+- 续种成功时先按「文件在且大小对」乐观进集合，片上校验随后判定；校验发现缺片的由巡查降级，这段时间里本机不会给对端发坏片（libtorrent 校验没过的片不对外提供）。
+- 没有链接时不自报 `peer.announce`，对端在握手时（`PeerLink.onBound`）会拿到最新的 `seeds`。
+
+**本轮回归证据**（`bash scripts/m1-headless.sh`，脚本未改，35 条 CHECK 全 PASS，自检 110 条另计）：B 角色的日志里有一整条状态机读数
+
+```
+M1 B seeding_transitions result=pass before_download=0 after_download=1 after_hibernate=0 after_reactivate=1 after_add=2 after_restart=2 after_restart_file_missing=1 missing_role=NONE after_torrent_detached=0
+```
+
+对应四个阶段：下载完成 0→1（原缺陷）、`stopFile` 休眠回到 0、再激活回到 1；关掉内核再按同一份 `state.json` 起来，两条在做种的条目都续上（`seed_resumed` 两行、`seed_resume_done resumed=2`）；删掉其中一条小文件的本地副本再重启，它 `reason=file_missing` 降级为休眠、`localRole` 回到 `NONE`，另一条照常续种，进程不崩。最后把下载来的那条 torrent 从会话里摘掉（Windows 上做种中的文件被句柄占着删不掉，只能走这条同源路径），巡查两拍内降级（`seed_stopped reason=torrent_missing`），做种数回到 0。
+
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。
@@ -122,7 +248,7 @@ kernel.close()
 |---|---|---|
 | `huchuan-accept` | accept 消息层连接 | 每条连接再起一条 `huchuan-link-in` |
 | `huchuan-link-in/out` | 读帧、分发、写帧（写有锁） | 30 s ping、120 s 无帧断 |
-| `huchuan-monitor` | 每 2 s：dht 心跳、补连做种者、完成判定；每 30 s ping | 所有群的轻量巡查 |
+| `huchuan-monitor` | 每 2 s：dht 心跳、做种集合对账、完成判定转做种、补连做种者；每 30 s ping | 所有群的轻量巡查；对账只碰本机的集合，不改群清单 |
 | 调用方线程 | `createGroup`/`addFile`/`comment` 同步执行 | `joinByTail8` 阻塞 |
 
 群内状态用 `GroupRuntime` 内部的锁保护；跨群/公钥/持久化用 kernel 的 `stateLock`。
@@ -142,7 +268,7 @@ kernel.close()
 
 ## 6. 协议实现对照（M1 15 个消息）
 
-0x01 hello ✓ · 0x02 join.req ✓ · 0x03 join.ok ✓ · 0x10 sync.req ✓ · 0x11 file.list ✓ · 0x12 file.add ✓ · 0x20 log.sync ✓ · 0x21 log.ops ✓ · 0x22 log.op ✓ · 0x23 member.name ✓ · 0x30 peer.announce ✓ · 0x40/0x41 ping·pong ✓ · 0x42 bye ✓ · 0x7F err ✓
+0x01 hello ✓ · 0x02 join.req ✓ · 0x03 join.ok ✓ · 0x10 sync.req ✓ · 0x11 file.list ✓ · 0x12 file.add ✓ · 0x20 log.sync ✓ · 0x21 log.ops ✓ · 0x22 log.op ✓ · 0x23 member.name ✓ · 0x30 peer.announce ✓（本轮补可选字段 plat / seeds，见 §7-10）· 0x40/0x41 ping·pong ✓ · 0x42 bye ✓ · 0x7F err ✓
 
 M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hint）未实现，收到静默忽略（协议 §5「未知 type 静默忽略」）。
 
@@ -162,6 +288,12 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 | 帧限速 | 60 帧/s/连接，每秒重置；超了回 `E_RATE` 并断开 | `PeerLink.MAX_FRAMES_PER_SECOND` |
 | connect_peer 去重键 | `fileId@dev:port`；有活 peer 不重连，否则每 `CONNECT_RETRY_MS = 5 s` 重试 | `GroupRuntime.connectSeeders` |
 | keySeed 落盘 | `secretBox.seal(keySeed)` + `keySeedProt`；方案认不出或打不开就跳过该群，不回退明文 | `SecretBox.kt`、`M1Kernel.unsealKeySeed` |
+| 创建者公钥 | 建群与入群都 `registerPub(自己)`；条目验签的 reason 口径 `no_sig` / `no_pub` / `bad_sig` 只写在 `EntryCheck` 一处 | `PubRegistry.kt`、`M1Kernel.createGroup` |
+| 成员平台 / 做种数（G3） | `peer.announce` 的可选字段 `plat`（android/windows/unknown）与 `seeds`（≥0）；**不进 peer1 签名域**，认不出/缺省按 unknown / 0 | `Proto`、`GroupRuntime.onPeerAnnounce` |
+| 未读游标（G4） | 每群每文件一条 `ReadCursor(lamport, author, seq)`；未读 = 键严格大于游标的**可见** op 数；自己写评论也推进游标；落盘 `state.json` 的 `read` | `ReadCursor` / `Unread`、`GroupRuntime.unreadCount` |
+| 退群（G1） | `removeGroup` 幂等：停该群全部 torrent、关全部链路、mDNS 注销、抹 `keySeed`+`kGrp`、`saveState` 后库里不再有该群；磁盘文件不删 | `M1Kernel.removeGroup`、`GroupRuntime.purgeForRemoval` |
+| 做种集合（M1.3） | 「本机在做种」只有一份：`addFile` 挂进会话、下载完成（`markCompleted`）、重启续种成功三处进；`stopFile`、文件被移走删掉、校验后缺片、退群四处出。做种数、`peer.announce.seeds`、P3 状态同一个读数 | `SeedingLedger`、`GroupRuntime.seedingFileCount` |
+| 重启续种（原 G2） | `state.json` 的 `seeding` 数组（`{fileId, path}`）。逐条判定「条目在、inline torrent 在、文件在、大小对」才挂种；其余降级为休眠，日志 `seed_resumed` / `seed_resume_failed reason=entry_missing\|no_torrent\|file_missing\|size_mismatch\|activate_failed`。只续做种，未完成的下载不续传 | `SeedRestore`、`GroupRuntime.resumeSeeds`、`M1Kernel.start` |
 
 ## 7. 协议缺口与实现取舍（请协议 owner 裁决）
 
@@ -176,6 +308,7 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 7. **ip_filter 走 swig 的 session_params 注入**（best-effort）：libtorrent4j 2.1.0-39 的高层 `SessionManager` 没有直接入口，实现里用 `session_params.setIp_filter` 在启动前塞进去；失败就退回「私有种子 + DHT/PEX/LSD 全关」。
 8. **kind（u8）在 signBytes 里按 8 字节整数编码**，遵循 §1.2「整数固定 8 字节」；如果将来要严格 u8，需要协议明确。
 9. **magnet 加种未实现。** M1 只用 file.add 的内联 .torrent（32 MiB / 64 KiB 片 ≈ 15 KB base64，远低于 47 KiB 上限）。§11-14 要求两条路径都支持，M2 补 magnet（需要 ut_metadata 先拿到元数据才能 `connect_peer`）。
+10. **成员平台与做种数走 0x30 的两个可选字段，且不进签名域。** 协议 §10 的 peer1 域固定在 `[dev, gid, btPort, ts]`，同一条消息里的 `btHost` 本来就不进签名；本轮把 `plat`（android/windows/unknown）与 `seeds`（自报本群做种数）按同一口径补在 0x30，已写进 protocol.md §10。代价是这两个值自报、不防篡改（能被改的只是 P6 上显示的数字）；收益是不动既有签名域，老实现的 sig 仍然验得过，不需要动帧版本位。成员表里另有「谁是成员」这条判定，始终由 join.ok / 消息层链路决定，不看这两个字段。
 
 ## 8. 退化点（实现里真实存在，不是设想）
 
@@ -188,7 +321,7 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 
 - **UI 是薄壳。** app/ 的 P0–P7 已通过 `M1Runtime` + `M1GroupStore` 读内核，但页面上还没有 M2 的开关（限速、通知档、tracker）；内核侧只提供 API 与事件。
 - **真机只跑了 android-desktop 一条链路。** `m1-device.sh --quick` 用手机 + 桌面 JVM 对端验过（含 `:app` 编译）；android-android、跨网、Wi-Fi 抖动仍未验（K1/K2 的结论是 loopback/Native 层面的）。
-- **单文件、无断点续传。** 重启后 BT 任务不恢复（群数据与评论会从 `state.json` 恢复）。
+- **重启只恢复做种，不续传下载。** 上次在做种的条目（已完成、数据在盘上）重启后自动续种；下到一半的条目重启后是休眠，要用户再点激活，从已完成的片继续。没有断点续传的续传数据（`resume_data`），激活时靠片上校验重算。
 - **无 tracker、无跨网。** M1 只有 mDNS + 手动。
 - **评论的 seq 空洞只标记不补齐**：`pending` 池按 prev 链挂起（512 条/作者、10 min），没有做「按游标回补」的端到端用例。
 - **限速只做到接口**：`setUploadLimitKbps` 已接到 `TorrentHandle`，单位是 KB/s（见 §6 口径表），但验收脚本没压测限速数值；真机脚本用 `throttle=1:2048` 间接验过一次。
@@ -196,10 +329,14 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 - **`app/tools/peer/DesktopPeer.java` 的时延还是旧口径**（本机墙钟 − 对端 `ts`），跨设备会出负值；内核已给 `M1Kernel.latencyMillis`，桌面工具接上即可（`app/` 不在本轮改动范围）。
 - **群规模 32 人未做硬校验**（协议 §12 的风险）。
 - **JmDNS 在 Android 需要 MulticastLock + CHANGE_WIFI_MULTICAST_STATE**，本轮未接。
+- **成员平台 / 做种数是自报值。** `peer.announce` 的 `plat` / `seeds` 不进签名域、收端不验、不参与任何准入或传输判定，只用于 P6 显示。离线成员在被删除前一直显示重启前那一刻的值，重启后、重新握手前显示 `unknown` / 0。
+- **未读数按「可见 op」算。** 游标只记「上次读到哪条 op」，不存每条 op 的已读标记：墓碑到达后该条（及被墓碑指向的那条）从可见集合消失，未读数会跟着变小，这是刻意的口径。同一台设备上的两个群各自维护游标，没有全局未读。
+- **退群不删用户数据。** `removeGroup` 只从会话与本地库里摘掉群，磁盘上已下载的文件保持原样；群不在本地库里，重启时也就没有它的做种集合可恢复，所以退群不会去动 `downloads/`。
+- **`app/` 与 `daemon/` 还没接 G1/G3/G4。** core 侧接口与落盘都已就绪（§3.1 有签名），UI 上这三块空白要等下一轮接线。
 
 ## 10. 下一步
 
-1. 接 UI：P2/P3/P4/P5 换成 `M1Kernel` + `GroupRuntime`，把 `InMemoryGroupStore` 降级成空实现。
+1. 接 UI：P2/P3/P4/P5 换成 `M1Kernel` + `GroupRuntime`，把 `InMemoryGroupStore` 降级成空实现；顺便按 §3.1 接上 G1（退群入口）、G3（成员平台/做种数）、G4（P2 未读角标 + P4 打开即清零）。
 2. Android 侧：自编 arm64 .so 换掉 `compileOnly` 的桌面制品，加 MulticastLock，`keySeed` 进 Keystore。
 3. M2：tracker（groupHash20 + passkey）、换码换钥 group.rotate、删除（log.del/file.del）、magnet 路径。
 4. 协议修订：把 §7 剩下没写死的地方（第 1 条的 hello 两阶段、第 5 条的多群 hello）写进协议，否则第三方实现没法互通；§7 的 2/3/4 已按 §10 实现完，protocol.md §13 的第 2/3/4 行可以结案（该表归设计 agent 维护，本轮未改）。

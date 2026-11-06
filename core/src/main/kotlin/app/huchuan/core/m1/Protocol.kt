@@ -57,9 +57,37 @@ object Proto {
     const val CAP_PEER = "peer"
     val CAPS: List<String> = listOf(CAP_FILES, CAP_LOG, CAP_PEER)
 
+    /** peer.announce.plat 的取值只有这三个（协议 §10）。 */
+    const val PLATFORM_ANDROID = "android"
+    const val PLATFORM_WINDOWS = "windows"
+    const val PLATFORM_UNKNOWN = "unknown"
+
     /** M1 magnet（协议 §4）：magnet:?xt=urn:btih:<fileId>&dn=<name>&xl=<size>。 */
     fun magnet(fileId: String, name: String, size: Long): String =
         "magnet:?xt=urn:btih:" + fileId + "&dn=" + URLEncoder.encode(name, "UTF-8") + "&xl=" + size
+
+    /**
+     * 本机平台（协议 §10 的 peer.announce.plat）：android / windows / unknown。
+     * 只做粗粒度判定，用于 P6 成员表显示，不参与任何协议判定。
+     */
+    fun detectPlatform(): String {
+        val vendor = System.getProperty("java.vendor") ?: ""
+        val vmName = System.getProperty("java.vm.name") ?: ""
+        val os = System.getProperty("os.name") ?: ""
+        return when {
+            vendor.contains("Android", ignoreCase = true) || vmName.contains("Dalvik", ignoreCase = true) ->
+                PLATFORM_ANDROID
+            os.contains("Windows", ignoreCase = true) -> PLATFORM_WINDOWS
+            else -> PLATFORM_UNKNOWN
+        }
+    }
+
+    /** 收端归一：认不出的值一律当 unknown（协议 §5「未知字段忽略」，这里不拒绝整帧）。 */
+    fun normalizePlatform(raw: String): String = when (raw.trim().lowercase()) {
+        PLATFORM_ANDROID -> PLATFORM_ANDROID
+        PLATFORM_WINDOWS -> PLATFORM_WINDOWS
+        else -> PLATFORM_UNKNOWN
+    }
 }
 
 data class Frame(val ver: Int, val type: Int, val body: J.Obj) {
@@ -239,11 +267,22 @@ data class OpRecord(
     }
 }
 
+/**
+ * 成员记录。
+ *
+ * [platform] 与 [seedingCount] 是**运行期属性**，来自该成员最近一条 peer.announce（协议 §10 的
+ * plat / seeds 字段）：它们不进 state.json、也不进 join.ok.members（那里的成员记录只带
+ * dev/name/nameSeq/pub）。重连时对端会立刻补一条 peer.announce，所以重启后这两个值自己会回来。
+ */
 data class MemberRecord(
     val dev: String,
     val name: String,
     val nameSeq: Long,
     val pub: String = "",
+    /** android / windows / unknown（协议 §10 的 peer.announce.plat）。 */
+    val platform: String = Proto.PLATFORM_UNKNOWN,
+    /** 该成员自报的「本群当前做种文件数」；从未自报时为 0。 */
+    val seedingCount: Int = 0,
 )
 
 data class Cursor(val author: String, val up: Long) {
@@ -343,6 +382,13 @@ data class JoinOkMsg(
     }
 }
 
+/**
+ * 协议 §10 的 0x30 peer.announce：本机的 BT 端点，顺带自报平台与做种数。
+ *
+ * [platform]（JSON 的 plat）与 [seeds]（JSON 的 seeds）不参与签名，口径与 [btHost] 相同：
+ * 它们是可选的辅助字段，缺省/认不出时按 unknown / 0 处理，不影响端点交换本身。
+ * seeds = 该设备在本群当前做种的文件数；M1 只自报，收端不验也不据此改任何判定。
+ */
 data class PeerAnnounceMsg(
     val gid: String,
     val dev: String,
@@ -350,6 +396,8 @@ data class PeerAnnounceMsg(
     val btHost: String,
     val ts: Long,
     val sig: String,
+    val platform: String = Proto.PLATFORM_UNKNOWN,
+    val seeds: Int = 0,
 ) {
     fun signFields(): List<ByteArray> = listOf(
         SignBytes.str(dev),
@@ -366,6 +414,8 @@ data class PeerAnnounceMsg(
             btHost = o.str("btHost") ?: "",
             ts = o.num("ts") ?: 0L,
             sig = o.str("sig") ?: "",
+            platform = Proto.normalizePlatform(o.str("plat") ?: ""),
+            seeds = (o.num("seeds") ?: 0L).toInt().coerceAtLeast(0),
         )
     }
 }

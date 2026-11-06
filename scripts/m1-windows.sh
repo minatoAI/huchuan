@@ -10,11 +10,13 @@
 #   B（127.0.0.1:47201）只用邀请码后 8 位 + 手动地址 127.0.0.1:<A 的消息端口> 加入
 #   B 激活下载 → 等到 complete → 两端 SHA-256 比对 → B 发评论 → A 侧看到
 #
-# 断言分四组：
-#   1. flow   ：建群 / 加入 / 共享 / 下载 / 评论，每一步都要有本轮证据
-#   2. sha256 ：两端文件逐字节一致，脚本自己重算，不信 daemon 的自述
-#   3. push   ：WS 真的在推（state 推送 + 传输中的 tick 采样）
-#   4. web    ：A 的 Web UI 数据通路返回的是真数据（页面、data.js、/api/state）
+# 断言分五组：
+#   1. flow    ：建群 / 加入 / 共享 / 下载 / 评论，每一步都要有本轮证据
+#   2. sha256  ：两端文件逐字节一致，脚本自己重算，不信 daemon 的自述
+#   3. push    ：WS 真的在推（state 推送 + 传输中的 tick 采样）
+#   4. web     ：A 的 Web UI 数据通路返回的是真数据（页面、data.js、/api/state）
+#   5. package ：绿色版 dist/Huchuan/Huchuan.exe 在「PATH 里没有 java、JAVA_HOME 为空」
+#                的环境里也能把 daemon 拉起来（复现没装 Java 的机器）
 #
 # 端口用文档里写死的固定值 47200 / 47201。占用就 FAIL，不静默换端口 ——
 # 换端口等于没验「默认端口能起」。
@@ -39,6 +41,8 @@ LOG_B="$ART/daemon-B.log"
 
 PORT_A=47200
 PORT_B=47201
+# 绿色版断言单独占一个端口：它要独占「没人监听」这个前提，才能证明 daemon 是自己拉起来的。
+PORT_PKG=47290
 MSG_A=47300
 MSG_B=47310
 BT_A=51500
@@ -90,6 +94,13 @@ kill_port() {
   taskkill //PID "$pid" //F >/dev/null 2>&1 || true
 }
 
+# 壳进程（Huchuan.exe）的 pid 列表。绿色版断言用它认出本轮启动的那个窗口，
+# 收尾时只关自己开的，不碰用户手动开着的壳。
+huchuan_pids() {
+  powershell.exe -NoProfile -Command "(Get-Process -Name Huchuan -ErrorAction SilentlyContinue).Id" 2>/dev/null \
+    | tr -d '\r' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u
+}
+
 cleanup() {
   for pid in "$WS_PID" "$PID_A" "$PID_B"; do
     [ -n "$pid" ] || continue
@@ -100,6 +111,7 @@ cleanup() {
   PID_B=""
   kill_port "$PORT_A"
   kill_port "$PORT_B"
+  kill_port "$PORT_PKG"
   # 给 bash 一点时间把「Killed」这类作业消息吐出来，别让它落在 PASS 后面
   sleep 0.5
 }
@@ -395,7 +407,67 @@ SET_SAVED=$(post "http://127.0.0.1:$PORT_A/api/settings" '{"userName":"A-Node-Us
 chk "settings.user_name_saved" \
   "$(printf '%s' "$SET_SAVED" | grep -q '"userName":"A-Node-User"' && echo 1 || echo 0)"
 
-# ------------------------------------------------------------------ 11. 停
+# ------------------------------------------------------------------ 11. 绿色版：没有 Java 的机器
+# 复现「目标机没装 Java」：用 cmd 把 JAVA_HOME 清空、PATH 只留 System32，再双击同一个 exe。
+# 判定三条同时成立才算过：
+#   1) 这个端口本来没人监听（上面清场时查过），/api/health 能通 = daemon 是本轮拉起来的；
+#   2) 壳日志里「拉起 daemon」那一行的 java 路径是 exe 同级的 runtime\bin\javaw.exe；
+#   3) 那条命令行里没有出现 PATH 上的 javaw.exe（第 2 条已经蕴含，留着给日志看）。
+say ""
+say "--- 绿色版：PATH 里没有 java、JAVA_HOME 为空"
+PKG_DIR="$ROOT/dist/Huchuan"
+PKG_DATA="$ART/package-data"
+PKG_SHELL_LOG="$(cygpath -u "${LOCALAPPDATA:-$HOME}")/Huchuan/logs/shell.log"
+
+if [ ! -f "$PKG_DIR/Huchuan.exe" ]; then
+  note "dist/Huchuan 不存在，先打包（scripts/package-windows.sh）"
+  bash "$SCRIPT_DIR/package-windows.sh" > "$ART/package.log" 2>&1 \
+    || { tail -n 15 "$ART/package.log" >&2; note "打包失败，完整日志：artifacts/m1-windows/package.log"; }
+fi
+
+PKG_HEALTH=""
+PKG_JAVA_LINE=""
+PKG_PID=""
+if [ -f "$PKG_DIR/Huchuan.exe" ] && [ -x "$PKG_DIR/runtime/bin/javaw.exe" ]; then
+  rm -rf "$PKG_DATA"
+  mkdir -p "$PKG_DATA"
+  BEFORE_PIDS=$(huchuan_pids)
+  rm -f "$PKG_SHELL_LOG"
+  # 环境变量只在这条 cmd 里生效：JAVA_HOME 清空、PATH 只留 System32 —— 就是「没装 Java 的机器」。
+  # start /b 让 cmd 立刻返回（cmd 自己会等 GUI 进程退出，不能直接写 Huchuan.exe）。
+  cmd.exe //c "set JAVA_HOME=&&set PATH=C:\\Windows\\System32&&cd /d $(w "$PKG_DIR")&&start /b Huchuan.exe --daemon-port=$PORT_PKG --daemon-data-dir=$(w "$PKG_DATA")" \
+    > "$ART/package-shell.out" 2>&1
+  PKG_HEALTH=$(wait_health "$PORT_PKG" 90) || PKG_HEALTH=""
+  AFTER_PIDS=$(huchuan_pids)
+  PKG_PID=$(comm -13 <(printf '%s\n' "$BEFORE_PIDS") <(printf '%s\n' "$AFTER_PIDS") 2>/dev/null | head -1)
+  PKG_JAVA_LINE=$(tr -d '\r' < "$PKG_SHELL_LOG" 2>/dev/null | grep -m1 '拉起 daemon' || true)
+  [ -n "$PKG_JAVA_LINE" ] || PKG_JAVA_LINE=$(tr -d '\r' < "$PKG_SHELL_LOG" 2>/dev/null | grep -m1 'Java：' || true)
+  case "$PKG_HEALTH" in
+    *'"status":"ok"'*) note "绿色版 daemon 就绪：$PKG_HEALTH" ;;
+    *) note "绿色版 daemon 没起来（壳日志 $PKG_SHELL_LOG）" ;;
+  esac
+  [ -n "$PKG_JAVA_LINE" ] && note "壳用的 java：$PKG_JAVA_LINE"
+fi
+
+# 收尾：先请 daemon 自己停，再关壳窗口（壳退出时会再试一次，不会留孤儿）
+if [ -n "$PKG_HEALTH" ]; then
+  post "http://127.0.0.1:$PORT_PKG/api/shutdown" '{}' > /dev/null 2>&1 || true
+fi
+if [ -n "$PKG_PID" ]; then
+  powershell.exe -NoProfile -Command "try { (Get-Process -Id $PKG_PID -ErrorAction Stop).CloseMainWindow() | Out-Null } catch {}" > /dev/null 2>&1
+  sleep 2
+  kill_port "$PORT_PKG"
+fi
+
+case "$PKG_HEALTH" in *'"status":"ok"'*) PKG_HEALTH_OK=1 ;; *) PKG_HEALTH_OK=0 ;; esac
+case "$PKG_JAVA_LINE" in
+  *'runtime\bin\javaw.exe'*) PKG_RUNTIME_OK=1 ;;
+  *) PKG_RUNTIME_OK=0 ;;
+esac
+chk "package.shell_runs_without_java (api=$PORT_PKG, PATH=C:\\Windows\\System32, JAVA_HOME 空)" \
+  "$([ "$PKG_HEALTH_OK" = "1" ] && [ "$PKG_RUNTIME_OK" = "1" ] && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 12. 停
 say ""
 say "--- 停 daemon"
 post "http://127.0.0.1:$PORT_A/api/shutdown" '{}' > /dev/null
@@ -409,7 +481,7 @@ done
 chk "shutdown.A_stopped" "$(port_busy $PORT_A && echo 0 || echo 1)"
 chk "shutdown.B_stopped" "$(port_busy $PORT_B && echo 0 || echo 1)"
 
-# ------------------------------------------------------------------ 12. 汇总
+# ------------------------------------------------------------------ 13. 汇总
 # 先彻底收尾再打分：PASS / FAIL 必须是脚本的最后一行。
 cleanup
 trap - EXIT

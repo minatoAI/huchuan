@@ -89,21 +89,13 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
         val selfId = rt.kernel.deviceId
         val online = group.onlinePeers().toHashSet()
         val entries = group.files()
+        // 做种数与平台直接取 MemberRecord（G3）：本机是真值，别人是自己 peer.announce 的自报值。
         val members = group.members().map { record ->
-            val seeding = entries.count { entry ->
-                entry.addedBy == record.dev &&
-                    if (record.dev == selfId) {
-                        group.localRole(entry.fileId) == GroupRuntime.LocalRole.SEEDING
-                    } else {
-                        true
-                    }
-            }
             Member(
                 name = record.name.ifBlank { shortId(record.dev) },
                 online = record.dev == selfId || online.contains(record.dev),
-                seedingCount = seeding,
-                // M1 协议不带平台字段（协议 §10 的 member 记录只有 dev/name/seq/pub）。
-                platform = "",
+                seedingCount = record.seedingCount,
+                platform = record.platform,
             )
         }
         val files = entries.map { toGroupFile(group, it) }
@@ -114,19 +106,29 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
             members = members,
             files = files,
             notificationLevel = rt.prefs.notificationLevel(group.groupId),
-            unreadCount = rt.prefs.unreadOf(group.groupId),
+            // 未读数（G4）：内核按读游标与可见 op 现算，P3/P4 打开时由 M1Runtime 清零。
+            unreadCount = group.unreadCount(),
         )
     }
 
+    /**
+     * 一条文件的内核投影。
+     *
+     * 状态只有 [GroupRuntime.localRole] 一个来源：内核的 SeedingLedger 决定「在做种」，
+     * 进集合的入口只有共享成功 / 下载完成 / 重启续种三处，界面不再按「文件在盘上」二次推测。
+     * 以前那句 `DOWNLOADING && onDisk -> SEEDING` 是 SeedingLedger 覆盖下载完成之前的临时兜底，
+     * 留着只会让「下完但内核还没对账」的文件提前显示成做种中，属于两套口径，故删除。
+     */
     fun toGroupFile(group: GroupRuntime, entry: FileEntry): GroupFile {
         val role = group.localRole(entry.fileId)
         val saved = group.savedFile(entry.fileId)
+        // 休眠的文件不挂在 BT 会话里，percent() 恒为 0：盘上有完整数据就按 100% 显示。
         val onDisk = rt.isCompleted(entry.fileId) ||
             (saved != null && saved.isFile && saved.length() == entry.size)
-        val state = when {
-            role == GroupRuntime.LocalRole.SEEDING -> FileState.SEEDING
-            role == GroupRuntime.LocalRole.DOWNLOADING -> if (onDisk) FileState.SEEDING else FileState.DOWNLOADING
-            else -> FileState.SLEEPING
+        val state = when (role) {
+            GroupRuntime.LocalRole.SEEDING -> FileState.SEEDING
+            GroupRuntime.LocalRole.DOWNLOADING -> FileState.DOWNLOADING
+            GroupRuntime.LocalRole.NONE -> FileState.SLEEPING
         }
         val percent = when (state) {
             FileState.SEEDING -> 100

@@ -6,12 +6,17 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <shobjidl.h>   // IFileOpenDialog：页面点「添加文件」时由壳弹系统选择器
+#include <wincodec.h>   // 离屏截图的 PNG 解码（量颜色数与亮度），纯 CPU，不碰 GDI 也不碰屏幕
 #include <wrl.h>
 #include <WebView2.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 // 资源表由 CMake 生成：一条资源 = {请求路径, 资源 ID, Content-Type}。
 // 往 resources/web/ 加文件不需要动这个头文件，也不用改 main.cpp。
@@ -34,13 +39,24 @@ const wchar_t kStartUrl[] = L"https://huchuan.invalid/index.html";
 //   --theme=dark|light    强制主题（默认跟随系统）
 //   --network=limited|fail  自检降级 / 自检失败（默认通过）
 //   --hold=boot|checking|result  把 P0 停在某个阶段，供逐帧截图
+//   --shot=<png 全路径>    离屏渲染一张 PNG 写盘后退出（WebView2 CapturePreview，不抓屏）
+//   --shot-page=p3         等到 document.body.dataset.page == p3 再截（冷启动用 p1）；
+//                          只决定「等到哪一页」，落到哪一页仍由 --route= 负责
+//   --shot-delay=<ms>      导航完成后最少等这么久再截（默认 1200，留出首帧与接口回来）
+//   --shot-timeout=<ms>    等 --shot-page 的上限，超时就按当前页截（默认 12000）
 struct LaunchOptions {
   std::wstring route;
   std::wstring theme;
   std::wstring network;
   std::wstring hold;
+  std::wstring pick;         // --pick=1：进 P3 后自动弹一次系统选择器（验证壳桥用）
   std::wstring daemon_jar;   // --daemon-jar=D:\path\daemon.jar（完整路径，不做字符白名单）
+  std::wstring daemon_data_dir;   // --daemon-data-dir=D:\path（测试用独立数据目录）
   int daemon_port = 47200;   // --daemon-port=47200
+  std::wstring shot;         // --shot=D:\path\out.png：离屏截图模式，写盘后退出
+  std::wstring shot_page;    // --shot-page=p3
+  int shot_delay_ms = 1200;  // --shot-delay=
+  int shot_timeout_ms = 12000;   // --shot-timeout=
 };
 
 const int kWindowWidthDip = 1100;
@@ -53,6 +69,27 @@ const UINT_PTR kLateProbeTimerId = 2;
 const UINT kDomProbeDelayMs = 1500;
 const UINT kLateProbeDelayMs = 4000;
 
+// 离屏截图（--shot=）用的定时器与阈值。阈值与 windows/scripts/capture-ui.ps1 同一口径：
+// 颜色数 ≥ 32 才算画出了页面，浅色平均亮度 ≥ 140、深色 ≤ 120 才算主题对。
+const UINT_PTR kShotPollTimerId = 3;
+const UINT_PTR kShotCaptureTimerId = 4;
+// 收尾不能在 WebView2 的回调里直接 DestroyWindow：那会在它自己的栈上关控制器，
+// 表现为退出时崩一次（日志看着都正常，进程却挂）。统一发消息回消息循环再拆窗口。
+const UINT kShotDoneMessage = WM_APP + 2;
+const UINT kShotPollIntervalMs = 250;
+const UINT kShotProbeLeadMs = 350;     // 探针先落日志，再截图，两边对得上同一帧
+const UINT kShotRetryIntervalMs = 400;
+const int kShotMaxAttempts = 6;
+// 「画出来了没有」的判据。不能定高：P0 开屏、P1 用户名这种页面大半是底色，抽样只有 30 上下
+// 种颜色、主色占到 99.6%，门槛定高会把好图判成空白（历史门槛是 32 种颜色，就是卡在这里）。
+// 没渲染出来的那一帧是「整幅只有 1 种颜色」，所以门槛放在「颜色数 ≥ 8」上：
+// 一边是 1，一边是 29+，留足了余量。
+const int kShotMinColors = 8;
+const double kShotLightMinLuma = 140.0;
+const double kShotDarkMaxLuma = 120.0;
+const double kShotSampleCols = 220.0;   // 与取证脚本一样按抽样统计，不逐像素数
+const double kShotSampleRows = 160.0;
+
 HWND g_hwnd = nullptr;
 std::wstring g_start_url;
 // 页面主题决定窗口自己的深色外观：标题栏、WebView2 首帧底色、窗口背景刷。
@@ -62,6 +99,23 @@ ComPtr<ICoreWebView2Controller> g_controller;
 ComPtr<ICoreWebView2> g_webview;
 std::wstring g_log_path;
 int g_exit_code = 0;
+
+// --shot= 的会话状态。enabled 一旦为真，进程就是「渲染一张图就退」的一次性取证进程：
+// 不弹错误框、不抢前台，成功失败都靠退出码和日志说话。
+struct ShotSession {
+  bool enabled = false;
+  std::wstring png_path;
+  std::wstring want_page;
+  int min_delay_ms = 1200;
+  int timeout_ms = 12000;
+  bool forced = false;    // 等目标页超时，按当前页截（断言大概率不过，但图仍留证）
+  bool ready = false;     // 已经决定要截了，轮询停手
+  bool polling = false;   // 有一次 ExecuteScript 在飞
+  int attempts = 0;
+  DWORD start_tick = 0;
+  ComPtr<IStream> stream;
+};
+ShotSession g_shot;
 
 // ---------------------------------------------------------------- 日志
 // 每次启动截断，一次运行一个文件：%LOCALAPPDATA%\Huchuan\logs\shell.log
@@ -164,12 +218,23 @@ bool FileExists(const std::wstring& path) {
   return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
-/** daemon.jar 查找顺序：命令行 → HUCHUAN_DAEMON_JAR → %LOCALAPPDATA%\Huchuan → exe 同级 → 源码树。 */
+/**
+ * daemon.jar 查找顺序：--daemon-jar= → HUCHUAN_DAEMON_JAR → exe 同级（绿色版：daemon.jar
+ * 或 daemon\daemon.jar）→ %LOCALAPPDATA%\Huchuan → 源码树。
+ * exe 同级排在 %LOCALAPPDATA% 前面：绿色版目录里那份就是跟这个 exe 一起发出去的版本，
+ * 不该被机器上残留的旧拷贝顶掉。
+ */
 std::wstring ResolveDaemonJar(const std::wstring& explicit_path) {
   if (FileExists(explicit_path)) return explicit_path;
 
   const std::wstring from_env = EnvVar(L"HUCHUAN_DAEMON_JAR");
   if (FileExists(from_env)) return from_env;
+
+  const std::wstring exe_dir = ExeDirectory();
+  if (!exe_dir.empty()) {
+    if (FileExists(exe_dir + L"\\daemon.jar")) return exe_dir + L"\\daemon.jar";
+    if (FileExists(exe_dir + L"\\daemon\\daemon.jar")) return exe_dir + L"\\daemon\\daemon.jar";
+  }
 
   const std::wstring base = LocalAppDataDir();
   if (!base.empty()) {
@@ -177,9 +242,7 @@ std::wstring ResolveDaemonJar(const std::wstring& explicit_path) {
     if (FileExists(packaged)) return packaged;
   }
 
-  const std::wstring exe_dir = ExeDirectory();
   if (!exe_dir.empty()) {
-    if (FileExists(exe_dir + L"\\daemon.jar")) return exe_dir + L"\\daemon.jar";
     // 直接在构建目录里跑 exe 时（windows/build/Huchuan.exe），往上找源码树里的产物。
     std::wstring probe = exe_dir;
     for (int i = 0; i < 4; ++i) {
@@ -193,13 +256,32 @@ std::wstring ResolveDaemonJar(const std::wstring& explicit_path) {
   return std::wstring();
 }
 
+/** 在 PATH 里按顺序找一个可执行文件；找不到返回空串。 */
+std::wstring FindOnPath(const wchar_t* exe_name) {
+  wchar_t found[MAX_PATH * 4];
+  const DWORD len = SearchPathW(nullptr, exe_name, nullptr, ARRAYSIZE(found), found, nullptr);
+  return len > 0 ? std::wstring(found, len) : std::wstring();
+}
+
+/**
+ * Java 查找顺序：exe 同级 runtime（绿色版自带）→ JAVA_HOME → PATH。
+ * 优先级这样排，是为了让绿色版在自己带了 JRE 时不去用机器上那套（版本可能不对）。
+ * 三处都没有就返回空串：中途放弃比让 CreateProcess 去猜一个不存在的 javaw.exe 更诚实，
+ * 页面会退回内嵌那份并显示「网络不可用」+「重试」。
+ */
 std::wstring FindJava() {
+  const std::wstring exe_dir = ExeDirectory();
+  if (!exe_dir.empty()) {
+    const std::wstring bundled = exe_dir + L"\\runtime\\bin\\javaw.exe";
+    if (FileExists(bundled)) return bundled;
+  }
   const std::wstring home = EnvVar(L"JAVA_HOME");
   if (!home.empty()) {
     if (FileExists(home + L"\\bin\\javaw.exe")) return home + L"\\bin\\javaw.exe";
     if (FileExists(home + L"\\bin\\java.exe")) return home + L"\\bin\\java.exe";
   }
-  return L"javaw.exe";   // 交给 PATH
+  if (const std::wstring on_path = FindOnPath(L"javaw.exe"); !on_path.empty()) return on_path;
+  return FindOnPath(L"java.exe");
 }
 
 /** 只是探一下 127.0.0.1 的端口有没有人在听。 */
@@ -274,13 +356,22 @@ bool StartDaemon(const LaunchOptions& options, int wait_ms) {
 
   const std::wstring jar = ResolveDaemonJar(options.daemon_jar);
   if (jar.empty()) {
-    Log(L"找不到 daemon.jar：--daemon-jar= / HUCHUAN_DAEMON_JAR / %%LOCALAPPDATA%%\\Huchuan\\daemon.jar 都没有");
+    Log(L"找不到 daemon.jar：--daemon-jar= / HUCHUAN_DAEMON_JAR / exe 同级 / %%LOCALAPPDATA%%\\Huchuan 都没有");
     return false;
   }
 
   const std::wstring java = FindJava();
+  if (java.empty()) {
+    Log(L"找不到 Java：exe 同级 runtime\\bin\\javaw.exe、JAVA_HOME、PATH 都没有");
+    return false;
+  }
+  Log(L"Java：%s", java.c_str());
+
   std::wstring cmd = L"\"" + java + L"\" -jar \"" + jar + L"\" --port=" +
                      std::to_wstring(options.daemon_port);
+  if (!options.daemon_data_dir.empty()) {
+    cmd += L" --data-dir=\"" + options.daemon_data_dir + L"\"";
+  }
   Log(L"拉起 daemon：%s", cmd.c_str());
 
   STARTUPINFOW si{};
@@ -382,7 +473,8 @@ void ApplyDarkTitleBar(HWND hwnd, bool dark) {
 void Fail(const std::wstring& message) {
   Log(L"失败：%s", message.c_str());
   g_exit_code = 1;
-  MessageBoxW(nullptr, message.c_str(), L"互传", MB_ICONERROR | MB_OK);
+  // 离屏截图模式下调用方是脚本：弹框会把整条取证链卡在无人应答的模态框上。
+  if (!g_shot.enabled) MessageBoxW(nullptr, message.c_str(), L"互传", MB_ICONERROR | MB_OK);
   if (g_hwnd) {
     DestroyWindow(g_hwnd);
   } else {
@@ -425,8 +517,22 @@ LaunchOptions ParseLaunchOptions() {
       options.network = network;
     } else if (const std::wstring hold = value_after(L"--hold="); !hold.empty()) {
       options.hold = hold;
+    } else if (const std::wstring pick = value_after(L"--pick="); !pick.empty()) {
+      options.pick = pick;
     } else if (arg.compare(0, 13, L"--daemon-jar=") == 0) {
       options.daemon_jar = arg.substr(13);   // 路径里有 : 和 \，不能过 SafeToken
+    } else if (arg.compare(0, 18, L"--daemon-data-dir=") == 0) {
+      options.daemon_data_dir = arg.substr(18);
+    } else if (arg.compare(0, 7, L"--shot=") == 0) {
+      options.shot = arg.substr(7);   // 路径里有 : 和 \，不能过 SafeToken
+    } else if (const std::wstring page = value_after(L"--shot-page="); !page.empty()) {
+      options.shot_page = page;
+    } else if (const std::wstring delay = value_after(L"--shot-delay="); !delay.empty()) {
+      const int parsed = _wtoi(delay.c_str());
+      if (parsed >= 0 && parsed <= 60000) options.shot_delay_ms = parsed;
+    } else if (const std::wstring limit = value_after(L"--shot-timeout="); !limit.empty()) {
+      const int parsed = _wtoi(limit.c_str());
+      if (parsed > 0 && parsed <= 120000) options.shot_timeout_ms = parsed;
     } else if (const std::wstring port = value_after(L"--daemon-port="); !port.empty()) {
       const int parsed = _wtoi(port.c_str());
       if (parsed > 0 && parsed < 65536) options.daemon_port = parsed;
@@ -451,6 +557,7 @@ std::wstring BuildStartUrl(const std::wstring& base_url, const LaunchOptions& op
   append(L"theme", options.theme);
   append(L"network", options.network);
   append(L"hold", options.hold);
+  append(L"pick", options.pick);
 
   std::wstring url = base_url;
   if (!query.empty()) url += L"?" + query;
@@ -581,6 +688,372 @@ void ProbeDom(const std::wstring& tag) {
           .Get());
 }
 
+// ------------------------------------------------- 离屏截图（--shot=<png>）
+//
+// 逐页取证不能押在「桌面正在渲染」上：远程会话断开、显示器关闭、显示模式变化时，
+// GDI 的 CopyFromScreen 只会得到一整屏纯色，而页面本身是好的（DOM 探针照样命中）。
+// ICoreWebView2CapturePreview 拿的是渲染进程自己合成的那一帧，跟屏幕内容、窗口层级、
+// 窗口在不在前台都无关 —— 所以取证改用它出图，一次性进程，写盘后自己退出。
+//
+// 时序：导航完成 → 轮询 document.body.dataset.page 等目标页 → 打一条 shot 探针 → 截图。
+// 截出来的 PNG 当场用 WIC 解一遍（颜色数 + 平均亮度），和取证脚本同一个口径；
+// 不合格就隔一会儿重来（首帧有时是空的），最多 kShotMaxAttempts 次。
+// 最后仍不合格也照样写盘再失败退出：留一张现场，比什么都留不下强。
+
+struct ShotStats {
+  bool decoded = false;
+  unsigned width = 0;
+  unsigned height = 0;
+  int colors = 0;
+  double luma = 0.0;
+  double dominant = 0.0;   // 采样里最常见的那一种颜色占多大比例（空白帧 = 1.0）
+};
+
+/** 把流里的字节读出来。CapturePreview 只会往流里追加，读完顺手把流重置到开头。 */
+std::vector<BYTE> ReadStreamBytes(IStream* stream) {
+  std::vector<BYTE> out;
+  if (!stream) return out;
+  STATSTG stat{};
+  if (FAILED(stream->Stat(&stat, STATFLAG_NONAME))) return out;
+  const ULONGLONG size = stat.cbSize.QuadPart;
+  if (size == 0 || size > (64ull << 20)) return out;   // 一张 1100x760 的 PNG 最多几十 KB
+  LARGE_INTEGER begin{};
+  if (FAILED(stream->Seek(begin, STREAM_SEEK_SET, nullptr))) return out;
+  out.resize(static_cast<size_t>(size));
+  ULONG got = 0;
+  if (FAILED(stream->Read(out.data(), static_cast<ULONG>(size), &got)) ||
+      got != static_cast<ULONG>(size)) {
+    out.clear();
+  }
+  return out;
+}
+
+bool WriteFileBytes(const std::wstring& path, const std::vector<BYTE>& bytes) {
+  if (path.empty() || bytes.empty()) return false;
+  const size_t slash = path.find_last_of(L"\\/");
+  if (slash != std::wstring::npos && slash > 3) EnsureDir(path.substr(0, slash));
+  FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"wb") != 0 || !file) return false;
+  const size_t written = fwrite(bytes.data(), 1, bytes.size(), file);
+  fclose(file);
+  return written == bytes.size();
+}
+
+/** PNG → 像素统计。WIC 是纯 CPU 解码，不碰屏幕，也不需要窗口可见。 */
+ShotStats MeasurePng(const std::vector<BYTE>& bytes) {
+  ShotStats stats;
+  if (bytes.empty()) return stats;
+
+  ComPtr<IWICImagingFactory> factory;
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&factory));
+  if (FAILED(hr) || !factory) {
+    Log(L"离屏截图：WIC 工厂创建失败 hr=0x%08X", static_cast<unsigned>(hr));
+    return stats;
+  }
+
+  ComPtr<IStream> stream;
+  stream.Attach(SHCreateMemStream(bytes.data(), static_cast<UINT>(bytes.size())));
+  ComPtr<IWICBitmapDecoder> decoder;
+  hr = factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand,
+                                        &decoder);
+  if (FAILED(hr) || !decoder) {
+    Log(L"离屏截图：PNG 解码失败 hr=0x%08X", static_cast<unsigned>(hr));
+    return stats;
+  }
+  ComPtr<IWICBitmapFrameDecode> frame;
+  if (FAILED(decoder->GetFrame(0, &frame)) || !frame) return stats;
+  UINT width = 0;
+  UINT height = 0;
+  if (FAILED(frame->GetSize(&width, &height)) || width == 0 || height == 0) return stats;
+
+  ComPtr<IWICFormatConverter> converter;
+  if (FAILED(factory->CreateFormatConverter(&converter)) || !converter) return stats;
+  if (FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom))) {
+    return stats;
+  }
+  std::vector<BYTE> pixels(static_cast<size_t>(width) * height * 4);
+  if (FAILED(converter->CopyPixels(nullptr, width * 4, static_cast<UINT>(pixels.size()),
+                                   pixels.data()))) {
+    return stats;
+  }
+
+  // 抽样起见（与取证脚本同一套网格），不逐像素数：1100x760 的整幅样本够判断"画没画出来"了。
+  // 括号是必须的：windows.h 里 max/min 是宏，写成 std::max(…) 会被它拆坏。
+  const unsigned step_x = (std::max)(1u, static_cast<unsigned>(width / kShotSampleCols));
+  const unsigned step_y = (std::max)(1u, static_cast<unsigned>(height / kShotSampleRows));
+  // 直方图同时给出「有几种颜色」和「最常见的一种占多大比例」。判据只认颜色数（空白帧 = 1 种），
+  // 主色占比记进日志当参考 —— P0 开屏这类页面主色本来就占 99.6%，不能拿来当门槛。
+  std::unordered_map<unsigned, unsigned long long> histogram;
+  double luma = 0.0;
+  unsigned long long samples = 0;
+  for (unsigned y = 0; y < height; y += step_y) {
+    const BYTE* row = pixels.data() + static_cast<size_t>(y) * width * 4;
+    for (unsigned x = 0; x < width; x += step_x) {
+      const BYTE blue = row[x * 4 + 0];
+      const BYTE green = row[x * 4 + 1];
+      const BYTE red = row[x * 4 + 2];
+      ++histogram[(static_cast<unsigned>(red) << 16) | (static_cast<unsigned>(green) << 8) | blue];
+      luma += 0.299 * red + 0.587 * green + 0.114 * blue;
+      ++samples;
+    }
+  }
+  unsigned long long top = 0;
+  for (const auto& entry : histogram) {
+    if (entry.second > top) top = entry.second;
+  }
+  stats.decoded = true;
+  stats.width = width;
+  stats.height = height;
+  stats.colors = static_cast<int>(histogram.size());
+  stats.luma = samples ? luma / static_cast<double>(samples) : 0.0;
+  stats.dominant = samples ? static_cast<double>(top) / static_cast<double>(samples) : 0.0;
+  return stats;
+}
+
+/** 与 capture-ui.ps1 同一判据：颜色数够多（不是一块纯色）、平均亮度和主题对得上。 */
+bool ShotLooksDrawn(const ShotStats& stats) {
+  if (!stats.decoded) return false;
+  if (stats.colors < kShotMinColors) return false;
+  return g_dark_chrome ? stats.luma <= kShotDarkMaxLuma : stats.luma >= kShotLightMinLuma;
+}
+
+void ShotGiveUp(const std::wstring& reason) {
+  Log(L"离屏截图失败：%s", reason.c_str());
+  g_exit_code = 1;
+  if (g_hwnd) {
+    PostMessageW(g_hwnd, kShotDoneMessage, 0, 0);
+  } else {
+    PostQuitMessage(1);
+  }
+}
+
+void OnShotCaptured(HRESULT result) {
+  const std::vector<BYTE> bytes =
+      SUCCEEDED(result) ? ReadStreamBytes(g_shot.stream.Get()) : std::vector<BYTE>();
+  g_shot.stream.Reset();
+  const ShotStats stats = MeasurePng(bytes);
+  Log(L"离屏截图：第 %d 次尝试 hr=0x%08X 字节=%zu 解码=%d %ux%u 颜色=%d 主色占比=%.1f%% 亮度=%.1f",
+      g_shot.attempts, static_cast<unsigned>(result), bytes.size(), stats.decoded ? 1 : 0,
+      stats.width, stats.height, stats.colors, stats.dominant * 100.0, stats.luma);
+
+  const bool drawn = ShotLooksDrawn(stats);
+  if (!drawn && g_shot.attempts < kShotMaxAttempts) {
+    SetTimer(g_hwnd, kShotCaptureTimerId, kShotRetryIntervalMs, nullptr);
+    return;
+  }
+  if (bytes.empty()) {
+    ShotGiveUp(L"CapturePreview 没有产出任何字节");
+    return;
+  }
+  if (!WriteFileBytes(g_shot.png_path, bytes)) {
+    ShotGiveUp(L"写盘失败：" + g_shot.png_path);
+    return;
+  }
+  if (!drawn) {
+    ShotGiveUp(L"截出来的图没通过自检（颜色 " + std::to_wstring(stats.colors) + L" 主色占比 " +
+               std::to_wstring(static_cast<int>(stats.dominant * 1000) / 10.0) + L"% 亮度 " +
+               std::to_wstring(static_cast<int>(stats.luma * 10) / 10) + L"），PNG 已留在 " +
+               g_shot.png_path);
+    return;
+  }
+  Log(L"离屏截图完成：%s（%zu 字节，%ux%u，颜色 %d，亮度 %.1f）", g_shot.png_path.c_str(),
+      bytes.size(), stats.width, stats.height, stats.colors, stats.luma);
+  PostMessageW(g_hwnd, kShotDoneMessage, 0, 0);
+}
+
+void ShotCapture() {
+  if (!g_webview) {
+    ShotGiveUp(L"没有 WebView2 实例");
+    return;
+  }
+  g_shot.attempts++;
+  ComPtr<IStream> stream;
+  if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream) {
+    ShotGiveUp(L"CreateStreamOnHGlobal 失败");
+    return;
+  }
+  g_shot.stream = stream;
+  Log(L"离屏截图：开始第 %d 次 CapturePreview（目标 %s）", g_shot.attempts,
+      g_shot.png_path.c_str());
+  const HRESULT hr = g_webview->CapturePreview(
+      COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, g_shot.stream.Get(),
+      Callback<ICoreWebView2CapturePreviewCompletedHandler>(
+          [](HRESULT result) -> HRESULT {
+            OnShotCaptured(result);
+            return S_OK;
+          })
+          .Get());
+  if (SUCCEEDED(hr)) return;
+  g_shot.stream.Reset();
+  Log(L"离屏截图：CapturePreview 调用失败 hr=0x%08X", static_cast<unsigned>(hr));
+  if (g_shot.attempts < kShotMaxAttempts) {
+    SetTimer(g_hwnd, kShotCaptureTimerId, kShotRetryIntervalMs, nullptr);
+    return;
+  }
+  ShotGiveUp(L"CapturePreview 调用失败 hr=0x" + std::to_wstring(static_cast<unsigned>(hr)));
+}
+
+/** 决定要截了：先打一条 shot 探针（取证靠它断言页名与文案），再给渲染留一口气就截。 */
+void ShotProbeThenCapture() {
+  if (g_shot.ready) return;
+  g_shot.ready = true;
+  KillTimer(g_hwnd, kShotPollTimerId);
+  ProbeDom(L"shot");
+  SetTimer(g_hwnd, kShotCaptureTimerId, kShotProbeLeadMs, nullptr);
+}
+
+/** 每 250ms 问页面一次「你现在是哪一页」，等到目标页（且过了最小等待）就截。 */
+void ShotPollPage() {
+  if (!g_shot.enabled || g_shot.ready || g_shot.polling || !g_webview) return;
+  const DWORD elapsed = GetTickCount() - g_shot.start_tick;
+  if (elapsed >= static_cast<DWORD>(g_shot.timeout_ms)) {
+    g_shot.forced = true;
+    Log(L"离屏截图：等 %s 超过 %d ms，按当前页面截（DOM 断言不会过）",
+        g_shot.want_page.empty() ? L"任意页" : g_shot.want_page.c_str(), g_shot.timeout_ms);
+    ShotProbeThenCapture();
+    return;
+  }
+
+  g_shot.polling = true;
+  const wchar_t* script =
+      L"(function(){var b=document.body;return (b&&b.dataset&&b.dataset.page)||'';})()";
+  const HRESULT hr = g_webview->ExecuteScript(
+      script,
+      Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+          [](HRESULT result, LPCWSTR json) -> HRESULT {
+            g_shot.polling = false;
+            if (g_shot.ready) return S_OK;
+            std::wstring page;
+            if (SUCCEEDED(result) && json) page.assign(json);
+            const bool matched =
+                g_shot.want_page.empty() || page.find(g_shot.want_page) != std::wstring::npos;
+            const DWORD elapsed = GetTickCount() - g_shot.start_tick;
+            if (matched && elapsed >= static_cast<DWORD>(g_shot.min_delay_ms)) {
+              Log(L"离屏截图：页面就位（%s，导航后 %lu ms）",
+                  g_shot.want_page.empty() ? L"任意页" : g_shot.want_page.c_str(), elapsed);
+              ShotProbeThenCapture();
+            }
+            return S_OK;
+          })
+          .Get());
+  if (FAILED(hr)) {
+    g_shot.polling = false;
+    Log(L"离屏截图：页面轮询脚本失败 hr=0x%08X", static_cast<unsigned>(hr));
+  }
+}
+
+// ------------------------------------------------------- 系统文件选择器
+//
+// daemon 的 POST /api/groups/{gid}/files 收的是「本机绝对路径」，浏览器拿不到这个值 ——
+// 所以路径不放给页面去猜，而是由壳来问系统：
+//   页面点「添加文件」→ chrome.webview.postMessage({type:'pick-file'})
+//   → 壳弹 IFileOpenDialog（IFileOpenDialog 走 STA，主线程就是 STA）
+//   → 选中后回 {type:'file-picked', path:'…'}，取消回 {type:'pick-file-cancelled'}
+//   → 页面拿路径去调 daemon。浏览器里没有这条通道，页面会提示只能在互传窗口里选。
+const UINT kPickFileMessage = WM_APP + 1;   // 对话框是模态的，别在 WebView2 的回调里直接开
+bool g_picking = false;
+
+/** 路径里的 \ 和 " 必须转义，否则 chrome.webview 那边不是合法 JSON。 */
+std::wstring JsonEscape(const std::wstring& text) {
+  std::wstring out;
+  out.reserve(text.size() + 8);
+  for (const wchar_t ch : text) {
+    switch (ch) {
+      case L'\\': out += L"\\\\"; break;
+      case L'"': out += L"\\\""; break;
+      case L'\n': out += L"\\n"; break;
+      case L'\r': out += L"\\r"; break;
+      case L'\t': out += L"\\t"; break;
+      default:
+        if (ch < 0x20) {
+          wchar_t escape[8];
+          _snwprintf_s(escape, _TRUNCATE, L"\\u%04X", static_cast<unsigned>(ch));
+          out += escape;
+        } else {
+          out.push_back(ch);
+        }
+    }
+  }
+  return out;
+}
+
+void PostJsonToPage(const std::wstring& json) {
+  if (!g_webview) return;
+  const HRESULT hr = g_webview->PostWebMessageAsJson(json.c_str());
+  if (FAILED(hr)) {
+    Log(L"回页面失败 hr=0x%08X：%s", static_cast<unsigned>(hr), json.c_str());
+  } else {
+    Log(L"回页面：%s", json.c_str());   // 与上行那条「页面消息：」对称，取证脚本按子串断言
+  }
+}
+
+void PickFileAndReply() {
+  if (g_picking) return;   // 模态对话框，重复进入没有意义
+  g_picking = true;
+
+  ComPtr<IFileOpenDialog> dialog;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dialog));
+  if (FAILED(hr) || !dialog) {
+    Log(L"打不开文件选择器 hr=0x%08X", static_cast<unsigned>(hr));
+    g_picking = false;
+    PostJsonToPage(L"{\"type\":\"pick-file-cancelled\"}");
+    return;
+  }
+  dialog->SetTitle(L"选择要共享的文件");
+  FILEOPENDIALOGOPTIONS flags = 0;
+  if (SUCCEEDED(dialog->GetOptions(&flags))) {
+    // 只要真实文件：daemon 那头同样要求存在、非空、是普通文件。
+    dialog->SetOptions(flags | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+  }
+
+  const HRESULT shown = dialog->Show(g_hwnd);
+  g_picking = false;
+  // 对话框关掉后把焦点还给页面，否则键盘会停在窗口本身上。
+  if (g_controller) g_controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+
+  if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+    Log(L"文件选择器：用户取消");
+    PostJsonToPage(L"{\"type\":\"pick-file-cancelled\"}");
+    return;
+  }
+  if (FAILED(shown)) {
+    Log(L"文件选择器失败 hr=0x%08X", static_cast<unsigned>(shown));
+    PostJsonToPage(L"{\"type\":\"pick-file-cancelled\"}");
+    return;
+  }
+
+  ComPtr<IShellItem> item;
+  LPWSTR raw = nullptr;
+  if (SUCCEEDED(dialog->GetResult(&item)) && item &&
+      SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &raw)) && raw) {
+    const std::wstring path(raw);
+    CoTaskMemFree(raw);
+    Log(L"文件选择器：%s", path.c_str());
+    PostJsonToPage(L"{\"type\":\"file-picked\",\"path\":\"" + JsonEscape(path) + L"\"}");
+    return;
+  }
+  Log(L"文件选择器：拿不到本机路径");
+  PostJsonToPage(L"{\"type\":\"pick-file-cancelled\"}");
+}
+
+HRESULT OnWebMessageReceived(ICoreWebView2* /*sender*/,
+                             ICoreWebView2WebMessageReceivedEventArgs* args) {
+  LPWSTR raw = nullptr;
+  if (FAILED(args->get_WebMessageAsJson(&raw)) || !raw) return S_OK;
+  const std::wstring message(raw);
+  CoTaskMemFree(raw);
+  Log(L"页面消息：%s", message.c_str());
+  // 上行消息只有这一种形状，按子串判断即可，不值得为此引一个 JSON 解析器。
+  if (message.find(L"pick-file") != std::wstring::npos) {
+    PostMessageW(g_hwnd, kPickFileMessage, 0, 0);
+  }
+  return S_OK;
+}
+
 void UpdateWebViewBounds() {
   if (!g_controller || !g_hwnd) return;
   RECT client{};
@@ -644,6 +1117,7 @@ void AttachWebView() {
                         settings->put_IsStatusBarEnabled(FALSE);
                         settings->put_AreDefaultContextMenusEnabled(FALSE);
                         settings->put_AreDevToolsEnabled(TRUE);  // 开发期保留 F12
+                        settings->put_IsWebMessageEnabled(TRUE);  // 「添加文件」走壳的选择器
                       }
 
                       UpdateWebViewBounds();
@@ -657,6 +1131,16 @@ void AttachWebView() {
                               [](ICoreWebView2* sender,
                                  ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
                                 return OnWebResourceRequested(sender, args);
+                              })
+                              .Get(),
+                          &token);
+
+                      // 页面 → 壳的唯一上行通道（点「添加文件」时请求弹选择器）。
+                      g_webview->add_WebMessageReceived(
+                          Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                              [](ICoreWebView2* sender,
+                                 ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                                return OnWebMessageReceived(sender, args);
                               })
                               .Get(),
                           &token);
@@ -680,6 +1164,11 @@ void AttachWebView() {
                                 ProbeDom(L"nav");
                                 SetTimer(g_hwnd, kDomProbeTimerId, kDomProbeDelayMs, nullptr);
                                 SetTimer(g_hwnd, kLateProbeTimerId, kLateProbeDelayMs, nullptr);
+                                if (g_shot.enabled) {
+                                  // 离屏模式：从现在开始等目标页，等到就打探针 + 截图，然后自己退。
+                                  g_shot.start_tick = GetTickCount();
+                                  SetTimer(g_hwnd, kShotPollTimerId, kShotPollIntervalMs, nullptr);
+                                }
                                 return S_OK;
                               })
                               .Get(),
@@ -704,6 +1193,16 @@ void AttachWebView() {
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
   switch (message) {
+    case kShotDoneMessage:
+      // 一句活干完了（成或败），回到消息循环这一层再拆窗口，退出码在 g_exit_code 里。
+      DestroyWindow(hwnd);
+      return 0;
+    case kPickFileMessage: {
+      // 从 WebView2 的回调里退出来再开模态对话框：对话框自己会跑消息循环，
+      // 留在回调里开容易和自己的重入掐住。
+      PickFileAndReply();
+      return 0;
+    }
     case WM_SIZE:
       UpdateWebViewBounds();
       return 0;
@@ -716,6 +1215,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) 
       if (wparam == kLateProbeTimerId) {
         KillTimer(hwnd, kLateProbeTimerId);
         ProbeDom(L"late");
+        return 0;
+      }
+      if (wparam == kShotPollTimerId) {
+        ShotPollPage();
+        return 0;
+      }
+      if (wparam == kShotCaptureTimerId) {
+        KillTimer(hwnd, kShotCaptureTimerId);
+        ShotCapture();
         return 0;
       }
       break;
@@ -791,8 +1299,23 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE /*prev*/, LPWSTR /*cmd_line*
 
   InitLog();
 
+  // IFileOpenDialog 要求调用线程先初始化 COM；WebView2 也跑在同一个 STA 上，一次就够。
+  // 已经被初始化过（别的模式）时忽略结果，只在成功初始化时才负责 CoUninitialize。
+  const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  Log(L"CoInitializeEx hr=0x%08X", static_cast<unsigned>(com_hr));
+
   const LaunchOptions options = ParseLaunchOptions();
   g_daemon_port = options.daemon_port;
+  g_shot.enabled = !options.shot.empty();
+  if (g_shot.enabled) {
+    g_shot.png_path = options.shot;
+    g_shot.want_page = options.shot_page;
+    g_shot.min_delay_ms = options.shot_delay_ms;
+    g_shot.timeout_ms = options.shot_timeout_ms;
+    Log(L"离屏截图模式：目标 %s，等到 %s 再截（最少 %d ms，上限 %d ms）", g_shot.png_path.c_str(),
+        g_shot.want_page.empty() ? L"任意页" : g_shot.want_page.c_str(), g_shot.min_delay_ms,
+        g_shot.timeout_ms);
+  }
   if (!options.route.empty() || !options.theme.empty() || !options.network.empty() ||
       !options.hold.empty()) {
     Log(L"调试参数：route=%s theme=%s network=%s hold=%s", options.route.c_str(),
@@ -826,7 +1349,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE /*prev*/, LPWSTR /*cmd_line*
   ApplyDarkTitleBar(g_hwnd, g_dark_chrome);
   Log(L"窗口已创建 %dx%d，标题栏深色=%d", kWindowWidthDip, kWindowHeightDip,
       g_dark_chrome ? 1 : 0);
-  ShowWindow(g_hwnd, SW_SHOW);
+  // 离屏截图模式不抢前台：图不是从屏幕上抓的，窗口在前台与否跟结果无关。
+  ShowWindow(g_hwnd, g_shot.enabled ? SW_SHOWNOACTIVATE : SW_SHOW);
   UpdateWindow(g_hwnd);
 
   // 页面由 daemon 同源提供（http://127.0.0.1:47200/）：既没有跨源问题，也不用把业务塞进壳。
@@ -844,5 +1368,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE /*prev*/, LPWSTR /*cmd_line*
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
+  if (SUCCEEDED(com_hr)) CoUninitialize();
   return static_cast<int>(msg.wParam);
 }

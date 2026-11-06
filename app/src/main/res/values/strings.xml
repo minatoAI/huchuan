@@ -90,6 +90,9 @@
     <string name="p6_title">成员</string>
     <string name="p6_online">在线</string>
     <string name="p6_seeding">做种 %1$d</string>
+    <string name="p6_platform_android">Android</string>
+    <string name="p6_platform_windows">Windows</string>
+    <string name="p6_platform_unknown">未知</string>
     <string name="p6_invite_code">邀请码</string>
     <string name="p6_copied">已复制</string>
     <string name="p6_empty">暂无成员</string>

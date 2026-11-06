@@ -8,6 +8,10 @@
 # 产物：windows/build/Huchuan.exe（绿色版：旁边不需要 dll、不写注册表）
 # 证据：artifacts/windows/ui/（冷启动 + P0 三态 + P1–P7 + 深色，共 16 张）、index.json、build-report.md
 #
+# 截图走 Huchuan.exe --shot=<png> 的离屏渲染（WebView2 CapturePreview），不抓屏：
+# 桌面会话不渲染（远程断开、显示器关闭、显示模式变化）时整屏 GDI 抓图只有一种颜色，
+# 而离屏出图跟桌面、窗口层级、窗口是否置顶都没有关系。GDI 抓图降级为兜底诊断，不进判据。
+#
 # 页面资源在 windows/resources/web/，由 CMake 扫成资源表编进 exe；
 # 改完页面必须重新跑本脚本（或先用 scripts/dev-web.sh 在浏览器里看）。
 set -uo pipefail
@@ -162,9 +166,41 @@ if [ "$EVIDENCE" = "1" ]; then
   # 一个群 + 一个文件 + 一条评论。没有它，P2 是「还没有群组」、P3/P4 直接退回首页，
   # 逐页断言就没有对象了。用户名留空，冷启动才会落在 P1。
   step "准备取证用的 daemon（真实数据）"
+  # 页面由 daemon 从 jar 里按同源发出，jar 新不新直接决定截图是不是旧页面。
+  # 只判「jar 在不在」会让「改了页面或 daemon 源码、jar 还是旧的」照旧出图并判 PASS，
+  # 所以按 mtime 判依赖：任一依赖比 jar 新就重打。增量仍交给 gradle，这里只做粗粒度过期检查。
+  # 依赖表 = 决定 daemon.jar 内容的所有源码与构建输入：daemon 自己的类、它内联的 core 类、
+  # 内联的页面、以及可能改动依赖版本的构建脚本（漏一个就还是可能拿旧 jar 出图）。
   DEMO_JAR="$ROOT/daemon/build/dist/daemon.jar"
+  JAR_DEPS=(
+    "$ROOT/daemon/src"
+    "$ROOT/core/src"
+    "$ROOT/windows/resources/web"
+    "$ROOT/daemon/build.gradle.kts"
+    "$ROOT/core/build.gradle.kts"
+    "$ROOT/build.gradle.kts"
+    "$ROOT/settings.gradle.kts"
+    "$ROOT/gradle.properties"
+    "$ROOT/gradle/libs.versions.toml"
+  )
+  JAR_STALE=""
   if [ ! -f "$DEMO_JAR" ]; then
+    JAR_STALE="daemon.jar 不存在"
+  else
+    for dep in "${JAR_DEPS[@]}"; do
+      [ -e "$dep" ] || continue
+      NEWER=$(find "$dep" -type f -newer "$DEMO_JAR" -print -quit 2>/dev/null)
+      if [ -n "$NEWER" ]; then JAR_STALE="${NEWER#"$ROOT"/} 比 jar 新"; break; fi
+    done
+  fi
+  if [ -n "$JAR_STALE" ]; then
+    ok "daemon.jar 需要重建：$JAR_STALE"
     ( cd "$ROOT" && ./gradlew --console=plain -q :daemon:daemonJar ) || die "daemon.jar 构建失败"
+    JAR_STATE="本次重建（$JAR_STALE）"
+    ok "daemon.jar 重建完成：$(date -r "$DEMO_JAR" '+%Y-%m-%d %H:%M:%S')"
+  else
+    JAR_STATE="复用（比上面那些依赖都新）"
+    ok "daemon.jar 未过期：$JAR_STATE"
   fi
   if netstat -ano 2>/dev/null | grep -qE "TCP +127\.0\.0\.1:47200 +.*LISTENING"; then
     die "端口 47200 已被占用：先停掉手动起的 daemon 再跑取证"
@@ -201,23 +237,31 @@ if [ "$EVIDENCE" = "1" ]; then
   [ -n "$DEMO_GID" ] && [ -n "$DEMO_FID" ] || die "取证 daemon 没建出群或文件"
   ok "取证 daemon 就绪：群 $DEMO_GID 文件 $DEMO_FID"
 
-  step "启动 exe 逐页截图取证（冷启动 + P0 三态 + P1–P7 + 深色）"
+  step "逐页离屏截图取证（冷启动 + P0 三态 + P1–P7 + 深色）"
   rm -rf "$ART/ui"                     # 先清旧的，避免失败时留着上次的截图冒充本次
   mkdir -p "$ART/ui"
   EVID_PS="$(winpath "$WIN/scripts/capture-ui.ps1")"
   JOBS_JSON="$(winpath "$WIN/scripts/ui-capture-jobs.json")"
+  # 每页一个一次性进程：Huchuan.exe --shot=<png> 自己渲染自己写盘，写完退出。
+  # 不抓屏、不等窗口置顶，所以桌面不渲染也照样出图。
   if ! powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$EVID_PS" \
         -ExePath "$(winpath "$EXE")" -OutDir "$(winpath "$ART/ui")" \
         -JobsPath "$JOBS_JSON" >"$ART/ui/capture.stdout.log" 2>&1; then
     tail -n 25 "$ART/ui/capture.stdout.log" >&2
     die "逐页截图失败（完整日志：artifacts/windows/ui/capture.stdout.log）"
   fi
-  SHOTS=$(find "$ART/ui" -maxdepth 1 -name '*.png' | wc -l | tr -d ' ')
-  FAILED=$(tr -d '\r' < "$ART/ui/index.json" | sed -n 's/.*"failed": *\([0-9]*\).*/\1/p' | head -n1)
+  # .gdi.png 是兜底诊断图，可能比门禁图多；计数只认门禁那批。
+  SHOTS=$(find "$ART/ui" -maxdepth 1 -name '*.png' ! -name '*.gdi.png' | wc -l | tr -d ' ')
+  GDI_SHOTS=$(find "$ART/ui" -maxdepth 1 -name '*.gdi.png' | wc -l | tr -d ' ')
+  INDEX="$ART/ui/index.json"
+  FAILED=$(tr -d '\r' < "$INDEX" | sed -n 's/.*"failed": *\([0-9]*\).*/\1/p' | head -n1)
+  MODE=$(tr -d '\r' < "$INDEX" | sed -n 's/.*"mode": *"\([a-z]*\)".*/\1/p' | head -n1)
   [ "$SHOTS" -ge 16 ] || die "截图数量不足：只产出 $SHOTS 张"
+  [ "$MODE" = "offscreen" ] || die "index.json 里没有离屏截图标记（mode=${MODE:-缺失}），这批截图不是 --shot 出的"
   [ "$FAILED" = "0" ] || die "有 ${FAILED:-?} 张截图没通过 DOM / 像素断言（见 artifacts/windows/ui/index.json）"
   cp "$ART/ui/p2-home.png" "$ART/huchuan-window.png"
-  ok "截图 $SHOTS 张：artifacts/windows/ui（每张都断言了页名 + 页面文案 + 明暗底色）"
+  ok "离屏截图 $SHOTS 张：artifacts/windows/ui（每张都断言了页名 + 页面文案 + 明暗底色）"
+  if [ "$GDI_SHOTS" != "0" ]; then ok "另有 $GDI_SHOTS 张 GDI 兜底诊断图（*.gdi.png，不进判据）"; fi
   ok "首页截图：artifacts/windows/huchuan-window.png"
 fi
 
@@ -244,18 +288,24 @@ CXX_VER=$(grep -h "CMAKE_CXX_COMPILER_VERSION" "$BUILD"/CMakeFiles/*/CMakeCXXCom
   if [ "$EVIDENCE" = "1" ]; then
     echo
     echo "- 逐页截图：artifacts/windows/ui/（${SHOTS} 张，逐张断言页名 + 页面文案 + 明暗底色）"
+    echo "- 取证 daemon：daemon.jar ${JAR_STATE:-状态未记录}"
+    echo "- 出图方式：Huchuan.exe --shot=<png>，WebView2 ICoreWebView2CapturePreview 离屏渲染（不抓屏，桌面不渲染也成立）"
     echo "- 断言索引：artifacts/windows/ui/index.json"
     echo "- 首页截图：artifacts/windows/huchuan-window.png"
+    if [ "${GDI_SHOTS:-0}" != "0" ]; then
+      echo "- GDI 兜底诊断图：${GDI_SHOTS} 张（*.gdi.png，只供人工看，不进判据）"
+    fi
     echo
     echo "截图清单："
     echo
     for shot in "$ART/ui"/*.png; do
+      case "$shot" in *.gdi.png) continue ;; esac
       echo "    - $(basename "$shot")（$(stat -c %s "$shot") 字节）"
     done
     echo
-    echo "DOM 探针摘录（artifacts/windows/ui/p3-group.log）："
+    echo "DOM 探针摘录（artifacts/windows/ui/p3-group.log，截图那一刻的那条）："
     echo
-    grep "DOM 探针" "$ART/ui/p3-group.log" 2>/dev/null | sed 's/^/    /'
+    grep "DOM 探针(shot)" "$ART/ui/p3-group.log" 2>/dev/null | sed 's/^/    /'
   else
     echo
     echo "- 本次用 --no-evidence 跳过运行取证"

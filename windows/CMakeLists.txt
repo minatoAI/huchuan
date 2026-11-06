@@ -131,6 +131,8 @@ target_link_libraries(huchuan PRIVATE
   shlwapi
   shell32
   ole32
+  windowscodecs   # --shot= 离屏截图：用 WIC 解码 PNG 量颜色数/亮度（系统 dll，不进 exe 旁边）
+  uuid            # CLSID_FileOpenDialog / IID_IFileOpenDialog（只是导入库，不多一个 dll 依赖）
   user32
   gdi32
   ws2_32)                                            # 探端口 / 请 daemon 体面退出

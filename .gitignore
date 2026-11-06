@@ -15,6 +15,7 @@ spikes/
 artifacts/
 windows/build/
 windows/.tools/
+dist/
 tools/build-libtorrent-android/build/
 tools/build-libtorrent-android/build2/
 tools/build-libtorrent-android/build3/

@@ -59,6 +59,9 @@ fun FileScreen(
         return
     }
 
+    // P4 打开即清该文件未读（G4）：游标推到最新一条可见 op，落盘。
+    LaunchedEffect(groupId, fileId) { state.markFileRead(groupId, fileId) }
+
     val scope = rememberCoroutineScope()
     // 激活/休眠要真起真停 BT 任务，不能占界面线程。
     val switchLabel = stringResource(R.string.p4_activate_toggle)

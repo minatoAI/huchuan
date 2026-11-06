@@ -6,7 +6,7 @@ import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -36,8 +36,6 @@ import app.huchuan.ui.NewGroupScreen
 import app.huchuan.ui.SettingsDrawer
 import app.huchuan.ui.UserNameScreen
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -92,8 +90,9 @@ sealed interface Destination {
 }
 
 /**
- * 界面状态：数据全部来自 [GroupStore]（真机上是 M1 内核的投影），
- * 另加一个返回栈。revision 是刷新版本号：页面读它就订阅了数据变化。
+ * 界面状态：数据全部来自 [GroupStore]（真机上是 M1 内核的投影），另加一个返回栈。
+ * revision 是刷新版本号：内核事件推一次就 +1（见 HuchuanApp 的 DisposableEffect），
+ * 页面读它就订阅了数据变化。
  */
 class HuchuanState(
     val groups: GroupStore,
@@ -151,7 +150,6 @@ class HuchuanState(
 
     /** 加入或创建成功 → P3，且 P3 的系统返回必须落到 P2。 */
     fun openGroup(groupId: String) {
-        runtime?.prefs?.clearUnread(groupId)
         stack.clear()
         stack.add(Destination.Home)
         stack.add(Destination.GroupPage(groupId))
@@ -174,6 +172,21 @@ class HuchuanState(
      */
     suspend fun createGroup(name: String): Group = withContext(Dispatchers.IO) {
         groups.createGroup(name)
+    }
+
+    /**
+     * P3 进入群组：整群未读清零（G4）。推进读游标要写 state.json，不能占界面线程。
+     * 游标由内核按「可见 op 的顺序键」推进，重连补齐、乱序到达都不会算错。
+     */
+    suspend fun markGroupRead(groupId: String) = withContext(Dispatchers.IO) {
+        runtime?.markGroupRead(groupId)
+        Unit
+    }
+
+    /** P4 打开文件：该文件未读清零；群级未读跟着减。 */
+    suspend fun markFileRead(groupId: String, fileId: String) = withContext(Dispatchers.IO) {
+        runtime?.markFileRead(groupId, fileId)
+        Unit
     }
 
     /** P4 发评论：签名后要广播给对端，同样不能占界面线程。 */
@@ -223,12 +236,12 @@ fun HuchuanApp(
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
-    // 内核在别的线程改状态（进度、对端评论、成员上线），界面靠这个节拍刷新。
-    LaunchedEffect(state) {
-        while (isActive) {
-            delay(REFRESH_MS)
-            state.touch()
-        }
+    // 内核事件驱动刷新：KernelEvents（op_ingested / peer_announce / download_progress /
+    // file_add …）一有变化就重读一次数据，界面自己不起定时器。没有内核时是静态壳，
+    // 本来就不会变，不需要刷新。
+    DisposableEffect(state, runtime) {
+        val detach = runtime?.attachUiRefresh { state.touch() }
+        onDispose { detach?.invoke() }
     }
 
     fun goBack() {
@@ -309,5 +322,4 @@ fun HuchuanApp(
     }
 }
 
-/** 界面刷新节拍：内核状态变化不推事件，按固定节拍重读。 */
-private const val REFRESH_MS = 700L
+

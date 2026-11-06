@@ -32,6 +32,8 @@ class M1Kernel @JvmOverloads constructor(
      * Android 传 Keystore 包裹的实现，keySeed 不再明文落盘。
      */
     internal val secretBox: SecretBox = PlaintextSecretBox,
+    /** 本机平台（协议 §10 的 peer.announce.plat）：android / windows / unknown。宿主可覆盖。 */
+    val platform: String = Proto.detectPlatform(),
 ) : AutoCloseable {
 
     internal lateinit var identity: DeviceIdentity
@@ -47,7 +49,7 @@ class M1Kernel @JvmOverloads constructor(
 
     private val stateLock = Any()
     private val groupsById = LinkedHashMap<String, GroupRuntime>()
-    private val pubKeys = HashMap<String, ByteArray>()
+    private val pubKeys = PubRegistry()
     private val linkSet: MutableSet<PeerLink> = Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
     internal val lanDiscovery = LanDiscovery()
     internal val joinRate = JoinRateLimiter()
@@ -62,8 +64,8 @@ class M1Kernel @JvmOverloads constructor(
     private var server: PeerServer? = null
     private var monitorThread: Thread? = null
 
-    /** 每个文件上一次打点过的进度，避免同一百分比刷屏。 */
-    private val progressSeen = HashMap<String, Int>()
+    /** 每个文件上一次打点过的进度，避免同一百分比刷屏。（巡查线程读写、退群时主线程清，需同步） */
+    private val progressSeen = Collections.synchronizedMap(HashMap<String, Int>())
 
     @Volatile
     private var joinIntent: JoinIntent? = null
@@ -86,6 +88,10 @@ class M1Kernel @JvmOverloads constructor(
 
         bt = BtSession(btHint, File(dataDir, "bt"), ipFilterEnabled = true)
         bt.start()
+
+        // 重启续种（缺口 G2）：state.json 里记着「上次在做种」的条目，会话一起来就按判定挂回去。
+        // 放在 PeerServer / mDNS 之前：先让本机有东西可做种，再开始对外通告端口。
+        resumeSeeds()
 
         val srv = PeerServer(this)
         messagePortValue = srv.start()
@@ -156,6 +162,67 @@ class M1Kernel @JvmOverloads constructor(
         if (groupsById.size == 1) groupsById.values.first() else null
     }
 
+    // ------------------------------------------------------------------ 未读数（缺口 G4）
+
+    /** 整个群未读消息数（P2 的「N 条新消息」）；群不存在返回 0。 */
+    fun unreadCount(groupId: String): Int = group(groupId)?.unreadCount() ?: 0
+
+    /** 单个文件的未读数（P3 行上的角标）；群或文件不存在返回 0。 */
+    fun unreadCount(groupId: String, fileId: String): Int = group(groupId)?.unreadCount(fileId) ?: 0
+
+    /** P2 打开时清零整群未读，返回清掉的条数；群不存在返回 0。 */
+    fun markGroupRead(groupId: String): Int = group(groupId)?.markAllRead() ?: 0
+
+    /** P4 打开时清零该文件的未读，返回清掉的条数；群或文件不存在返回 0。 */
+    fun markFileRead(groupId: String, fileId: String): Int = group(groupId)?.markRead(fileId) ?: 0
+
+    // ------------------------------------------------------------------ 退群（缺口 G1）
+
+    /**
+     * 退群 / 解散群。
+     *
+     * 一次做完四件事：① 停掉该群全部 torrent（做种与下载都摘出会话，磁盘文件不动）；
+     * ② 关闭该群的全部消息链路（先发 0x42 bye，再断 socket）；③ 删群密钥（keySeed 与派生的 kGrp 就地清零）；
+     * ④ 从本地库移除（saveState 的快照里不再有这个群）。
+     *
+     * **幂等**：groupId 不在本地群列表里（没建过、已删过、或本来就不属于本机）返回 false，
+     * 不抛异常、不改库、不重复发事件。返回 true 表示这一次真的删掉了。
+     */
+    fun removeGroup(groupId: String): Boolean {
+        val group = synchronized(stateLock) { groupsById.remove(groupId) } ?: run {
+            events.log("group_remove_noop", mapOf("gid" to groupId))
+            return false
+        }
+        val fileIds = group.files().map { it.fileId }
+        // ① ②：停 torrent + 关连接
+        val (stopped, closedLinks) = group.purgeForRemoval("group_removed")
+        // 兜底：任何仍挂在被删群上的连接（极端竞态下没进 group.links 的）一并关掉
+        for (link in linkSet.toList()) {
+            if (link.group?.groupId == groupId) link.close("group_removed")
+        }
+        // ③ 的另一半：退群后不该再被同网段当成该群成员
+        try { lanDiscovery.unregister(groupId) } catch (_: Throwable) {}
+        // ③：删群密钥
+        val keyWiped = group.wipeKeys()
+        // 顺带清掉进度打点缓存里属于这个群的条目，避免长跑进程里越积越多
+        for (id in fileIds) progressSeen.remove(id)
+        // ④：从本地库移除（saveState 只看 groupsById，群已经不在里面了）
+        saveState()
+        events.log(
+            "group_removed",
+            mapOf(
+                "gid" to groupId,
+                "name" to group.name,
+                "torrents_stopped" to stopped.toString(),
+                "links_closed" to closedLinks.toString(),
+                "files" to fileIds.size.toString(),
+                "key_wiped" to keyWiped.toString(),
+            ),
+        )
+        events.groupRemoved(group)
+        return true
+    }
+
     /** 建群（协议 §11 第 1-3 步）。 */
     fun createGroup(name: String): GroupRuntime {
         val groupIdBytes = ByteArray(10).also { random.nextBytes(it) }
@@ -176,6 +243,10 @@ class M1Kernel @JvmOverloads constructor(
         )
         val rt = GroupRuntime(this, meta)
         rt.addMember(deviceId, deviceName, 1, identity.pub64.toHex())
+        // 创建者也要把自己的公钥登记进公钥库，不能只写进成员表。
+        // 少了这一句，别人把创建者的 file.list 条目回传过来时，本进程按 addedBy 取不到公钥，
+        // 只能按 no_pub 丢掉（证据 artifacts/m1/log-catchup-a.log 里 232 条 file_list_rejected reason=no_pub）。
+        registerPub(deviceId, identity.pub64)
         synchronized(stateLock) { groupsById[groupId] = rt }
         if (localMessagePort() > 0) lanDiscovery.register(meta, localMessagePort(), localBtPort())
         saveState()
@@ -212,6 +283,9 @@ class M1Kernel @JvmOverloads constructor(
         )
         val rt = GroupRuntime(this, meta)
         rt.addMember(deviceId, deviceName, 1, identity.pub64.toHex())
+        // 自己的公钥同样进库：join.ok.members 正常情况下已经把本机这条带回来了，这里兜住
+        // 「应答方没把自己列进 members」的老实现，否则本机条目在别人的 file.list 里一律 no_pub。
+        registerPub(deviceId, identity.pub64)
         // 成员表里带 pub（协议 §10）。先算 deviceId(pub) == dev 再登记：对不上的整条丢掉，
         // 对得上的写进公钥库 —— 紧接着要处理的 files 快照就靠它按 addedBy 验签。
         var pubs = 0
@@ -370,23 +444,14 @@ class M1Kernel @JvmOverloads constructor(
 
     // ------------------------------------------------------------------ 设备公钥
 
-    internal fun pubOf(dev: String): ByteArray? = synchronized(stateLock) { pubKeys[dev] }
+    internal fun pubOf(dev: String): ByteArray? = pubKeys.of(dev)
+
+    /** 已登记公钥的十六进制形式；没有登记返回 ""。给宿主做诊断用（不打日志）。 */
+    fun pubHexOf(dev: String): String = pubKeys.of(dev)?.toHex() ?: ""
 
     internal fun registerPub(dev: String, pub: ByteArray) {
-        if (dev.isEmpty() || pub.size != 64) return
-        val changed = synchronized(stateLock) {
-            val old = pubKeys[dev]
-            if (old == null || !old.contentEquals(pub)) {
-                pubKeys[dev] = pub
-                true
-            } else {
-                false
-            }
-        }
-        if (changed) {
-            // 公钥落库，供离线验签（协议 §1.2 的 deviceId 由公钥唯一决定）
-            saveStateIfStarted()
-        }
+        // 公钥落库，供离线验签（协议 §1.2 的 deviceId 由公钥唯一决定）
+        if (pubKeys.register(dev, pub)) saveStateIfStarted()
     }
 
     // ------------------------------------------------------------------ 跨设备时钟（只用于展示时延）
@@ -462,7 +527,7 @@ class M1Kernel @JvmOverloads constructor(
             jobj(
                 "format" to jstr("huchuan-m1-state/1"),
                 "device" to jobj("dev" to jstr(identity.deviceId), "name" to jstr(deviceName)),
-                "keys" to J.Obj(pubKeys.entries.associate { it.key to jstr(it.value.toHex()) }),
+                "keys" to J.Obj(pubKeys.entries().entries.associate { it.key to jstr(it.value.toHex()) }),
                 "groups" to jarr(allGroups().map { it.toStoreJson() }),
             )
         }
@@ -507,7 +572,7 @@ class M1Kernel @JvmOverloads constructor(
             if (keys != null) {
                 for (entry in keys.fields.entries) {
                     val value = entry.value as? J.Str ?: continue
-                    pubKeys[entry.key] = hexToBytes(value.value)
+                    pubKeys.register(entry.key, hexToBytes(value.value))
                 }
             }
             val groupArray = root.arr("groups") ?: emptyList()
@@ -542,6 +607,19 @@ class M1Kernel @JvmOverloads constructor(
                     val oo = op as? J.Obj ?: continue
                     try { rt.restoreOp(OpRecord.fromJson(oo)) } catch (_: Exception) {}
                 }
+                // 做种集合（缺口 G2）：先记成待续种，等 BT 会话起来后由群自己判定（文件还在不在 / 大小对不对）。
+                for (s in o.arr("seeding") ?: emptyList()) {
+                    val so = s as? J.Obj ?: continue
+                    val fileId = so.str("fileId") ?: continue
+                    rt.restoreSeeding(fileId, so.str("path") ?: "")
+                }
+                // 未读游标（缺口 G4）：没有这一段的旧 state.json 读回来就是「全都未读」，
+                // 所以缺字段一律当没有游标，不做兼容补算。
+                for (r in o.arr("read") ?: emptyList()) {
+                    val ro = r as? J.Obj ?: continue
+                    val fileId = ro.str("fileId") ?: continue
+                    rt.restoreReadCursor(fileId, ReadCursor.fromJson(ro))
+                }
                 o.num("lamport")?.let { rt.oplog.setLamport(it) }
                 synchronized(stateLock) { groupsById[gid] = rt }
             }
@@ -549,6 +627,28 @@ class M1Kernel @JvmOverloads constructor(
         } catch (e: Throwable) {
             events.log("state_load_error", mapOf("error" to e.toString()))
         }
+    }
+
+    /**
+     * 重启续种（缺口 G2）：逐群把「上次在做种」的条目挂回会话，失败降级为休眠并记日志。
+     * 返回 (恢复数, 降级数)；日志 `seed_resume_done` 每轮都打，0 条也是证据。
+     */
+    private fun resumeSeeds(): Pair<Int, Int> {
+        var resumed = 0
+        var skipped = 0
+        for (g in allGroups()) {
+            val (r, s) = try {
+                g.resumeSeeds()
+            } catch (e: Throwable) {
+                events.log("seed_resume_error", mapOf("group_id" to g.groupId, "error" to e.toString()))
+                0 to 0
+            }
+            resumed += r
+            skipped += s
+        }
+        events.log("seed_resume_done", mapOf("resumed" to resumed.toString(), "skipped" to skipped.toString()))
+        if (resumed + skipped > 0) saveState()
+        return resumed to skipped
     }
 
     // ------------------------------------------------------------------ 后台巡查
@@ -570,6 +670,8 @@ class M1Kernel @JvmOverloads constructor(
                         ),
                     )
                     for (g in groups) {
+                        // 做种集合先对账：文件被移走删掉、或校验后数据不全的，就地降级为休眠（缺口 G2 兜底）。
+                        g.reconcileSeeding()
                         for (f in g.files()) {
                             if (!g.isLocalTask(f.fileId) || g.isLocalSeed(f.fileId)) continue
                             if (!g.isComplete(f.fileId)) {
@@ -587,9 +689,11 @@ class M1Kernel @JvmOverloads constructor(
                                         ),
                                     )
                                 }
-                            }
-                            if (g.isComplete(f.fileId)) {
-                                if (g.markCompleted(f.fileId)) {
+                                g.connectSeeders(f.fileId)
+                            } else {
+                                // 完成判定 → 做种集合，唯一一处（以前这里只记「上报过了」不进做种集合）。
+                                val result = g.markCompleted(f.fileId)
+                                if (result.first) {
                                     events.fileCompleted(g, f)
                                     events.log(
                                         "download_completed",
@@ -602,8 +706,8 @@ class M1Kernel @JvmOverloads constructor(
                                     )
                                     g.setUploadLimitKbps(f.fileId, 0)
                                 }
-                            } else {
-                                g.connectSeeders(f.fileId)
+                                // 做种数变了才重新自报（协议 §10 的 peer.announce.seeds）
+                                if (result.seeding) g.broadcastPeerAnnounce(null)
                             }
                         }
                     }

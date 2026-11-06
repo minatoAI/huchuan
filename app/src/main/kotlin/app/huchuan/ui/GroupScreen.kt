@@ -48,6 +48,10 @@ fun GroupScreen(
         return
     }
 
+    // P3 进入即清未读（G4）：内核按可见 op 与读游标现算，这里只把游标推到最后一条。
+    // 从 P4 返回、从 P2 进入都会走到这里 —— 只要人回到了群组页，这个群就没有未读了。
+    LaunchedEffect(groupId) { state.markGroupRead(groupId) }
+
     val scope = rememberCoroutineScope()
     // SAF 只负责给出 URI；拷贝到私有目录、建种、广播都在内核侧的后台线程完成。
     val picker = rememberLauncherForActivityResult(

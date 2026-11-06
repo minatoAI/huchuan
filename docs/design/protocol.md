@@ -328,7 +328,12 @@ members 每条带 `pub`（64 B 裸值，128 hex，与 §1.2 公钥编码、本�
 **0x21 log.ops**：ops(≤200) ‖ more ‖ nonce。例：{"t":"log.ops","ops":[{…op…}],"more":false,"nonce":"aa01"}
 **0x22 log.op**：{"t":"log.op","op":{…}}，op 字段见 §6。
 **0x23 member.name**：{"t":"member.name","dev":…,"pub":…(128 hex)、"name":…,"nameSeq":3,"ts":…,"sig":…}，见 §1.3。
-**0x30 peer.announce**：gid ‖ dev ‖ btPort(u16) ‖ btHost(可选，缺省用 TLS 对端地址) ‖ ts ‖ sig。例：{"t":"peer.announce","gid":"7Q2F9C4M1XZ8KD3V","dev":"7Q2F9C4M1XZ8KD3V","btPort":51413,"ts":1762381200500,"sig":"1c2d…"}
+**0x30 peer.announce**：gid ‖ dev ‖ btPort(u16) ‖ btHost(可选，缺省用 TLS 对端地址) ‖ plat(可选) ‖ seeds(可选) ‖ ts ‖ sig。例：{"t":"peer.announce","gid":"7Q2F9C4M1XZ8KD3V","dev":"7Q2F9C4M1XZ8KD3V","btPort":51413,"plat":"windows","seeds":2,"ts":1762381200500,"sig":"1c2d…"}
+
+    两个新增的可选字段（口径与 btHost 相同：不进 peer1 签名域，缺省或认不出都不拒绝整帧）：
+    - plat：发送方平台，取值只有 android / windows / unknown；缺省或认不出的值一律按 unknown 处理。
+    - seeds：发送方自报的「本群当前做种文件数」（u32，≥0，缺省 0）。收端只用于显示成员做种数，不据此改任何准入或传输判定。
+    两者都在本机做种集合变化时重新广播一次（共享新文件、下载完成转做种、休眠摘掉做种、建连后的首帧），不需要额外的心跳周期。
 **0x40/41 ping·pong**：{"t":"ping","ts":1762381200000}；**0x42 bye**：{"t":"bye","code":"idle"}；**0x7F err**：{"t":"err","code":"E_RATE","msg":"join too frequent","ref":"aa01"}
 
 | err code | 触发 | | err code | 触发 |

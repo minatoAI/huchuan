@@ -53,19 +53,6 @@ class AppPrefs(context: Context) : LocalDeviceStore {
         prefs.edit().putString(KEY_NOTIFY + groupId, level.name).apply()
     }
 
-    /** 群组未读计数（内存态）：收到别人的评论时 +1，进群组页清零。 */
-    private val unread = HashMap<String, Int>()
-
-    fun bumpUnread(groupId: String) {
-        synchronized(unread) { unread[groupId] = (unread[groupId] ?: 0) + 1 }
-    }
-
-    fun clearUnread(groupId: String) {
-        synchronized(unread) { unread.remove(groupId) }
-    }
-
-    fun unreadOf(groupId: String): Int = synchronized(unread) { unread[groupId] ?: 0 }
-
     companion object {
         private const val KEY_USER_NAME = "user_name"
         private const val KEY_UPLOAD_LIMIT = "upload_limit_kbps"

@@ -1,5 +1,5 @@
 {
-  "note": "逐页截图任务表。page 必须等于 document.body.dataset.page；expect 必须出现在同一条稳定态 DOM 探针日志里（页面可见文案）。数据来自取证 daemon（scripts/build-windows.sh 先起一个带「老板的群」+ 一个文件的 daemon），涉及数据的断言写的就是那份料的字面。",
+  "note": "逐页截图任务表。page 必须等于 document.body.dataset.page；expect 必须出现在截图那一刻的 DOM 探针（壳日志里的 DOM 探针(shot)）里。route 决定落到哪一页，page 决定壳等到哪一页再截（--shot-page）；两者不一致就是任务表写错了。数据来自取证 daemon（scripts/build-windows.sh 先起一个带「老板的群」+ 一个文件的 daemon），涉及数据的断言写的就是那份料的字面。shotDelayMs 是导航完成后最少等多久再截（默认 2200），shotTimeoutMs 是等 page 的上限（默认 15000）。probe 只给 GDI 兜底那条路用，不是门禁。",
   "jobs": [
     {
       "name": "cold-start",
@@ -8,6 +8,8 @@
       "probe": "late",
       "page": "p1",
       "expect": "最多 20 字",
+      "shotDelayMs": 1200,
+      "shotTimeoutMs": 20000,
       "describe": "冷启动：不带任何参数，自检放行后自动落在 P1（零点击）"
     },
     {
@@ -34,6 +36,7 @@
       "hold": "result",
       "page": "p0",
       "expect": "可互传",
+      "shotDelayMs": 2600,
       "describe": "P0 自检 · 成功后（自动放行前）",
       "theme": "light"
     },

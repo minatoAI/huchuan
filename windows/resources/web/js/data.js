@@ -472,7 +472,7 @@ const Store = (function () {
       });
     },
 
-    /** 本机绝对路径。浏览器拿不到 <input type=file> 的真实路径，所以页面收的是路径字符串。 */
+    /** 本机绝对路径：由壳的系统文件选择器给出（app.js 的 Shell 桥），浏览器里拿不到。 */
     addFile: function (groupId, path) {
       return Api.addFile(groupId, path).then(function (data) {
         const created = data.file;

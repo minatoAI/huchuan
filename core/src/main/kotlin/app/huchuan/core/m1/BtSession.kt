@@ -186,6 +186,26 @@ class BtSession(
         return st.numPeers()
     }
 
+    /**
+     * 做种侧健康状态（巡查对账用）：
+     *   finished   数据完整，可以对外做种
+     *   checking   正在做片上校验（结果还没出来，先不下结论）
+     *   pending    刚挂上、元数据/状态还没就绪（同上）
+     *   incomplete 校验过但缺片 —— 不能当作做种，否则对端会连上一个拿不到数据的种子
+     *   missing    torrent 已经不在会话里
+     *
+     * 判定顺序有意义：`isFinished` 先看，避免「校验已过但 state 还停在 downloading」被误判成缺片。
+     */
+    fun seedState(fileId: String): String {
+        val st = status(fileId, false) ?: return "missing"
+        if (st.isFinished) return "finished"
+        return when (st.state()) {
+            TorrentStatus.State.CHECKING_FILES, TorrentStatus.State.CHECKING_RESUME_DATA -> "checking"
+            TorrentStatus.State.UNKNOWN, TorrentStatus.State.DOWNLOADING_METADATA -> "pending"
+            else -> "incomplete"
+        }
+    }
+
     fun savedFile(fileId: String): File? {
         val task = synchronized(lock) { tasks[fileId] } ?: return null
         return File(task.savePath, task.name)

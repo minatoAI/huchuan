@@ -36,11 +36,15 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 壳启动后做三件事，然后才导航：
 
 1. 探 `127.0.0.1:47200`。已经在跑 → 直接复用（退出时也不会去关它，那是别人的进程）。
-2. 没在跑 → 按 `--daemon-jar=` → 环境变量 `HUCHUAN_DAEMON_JAR` → `%LOCALAPPDATA%\Huchuan\daemon.jar` →
-   exe 同级 `daemon.jar` → 源码树 `daemon/build/dist/daemon.jar` 的顺序找 jar，
-   用 `javaw.exe`（`%JAVA_HOME%\bin` 优先，其次 PATH）以 `--port=47200` 拉起，
-   并把它绑进一个 `KILL_ON_JOB_CLOSE` 的 job object。
+2. 没在跑 → 按 `--daemon-jar=` → 环境变量 `HUCHUAN_DAEMON_JAR` → exe 同级（`daemon.jar` 或
+   `daemon\daemon.jar`）→ `%LOCALAPPDATA%\Huchuan\daemon\daemon.jar` → 源码树
+   `daemon/build/dist/daemon.jar` 的顺序找 jar；java 按 **exe 同级 `runtime\bin\javaw.exe`** →
+   `%JAVA_HOME%\bin` → PATH 的顺序找。找到就以 `--port=47200` 拉起，并把它绑进一个
+   `KILL_ON_JOB_CLOSE` 的 job object。
 3. 导航到 `http://127.0.0.1:47200/index.html`。
+
+绿色版（`dist/Huchuan/`）靠第 2 步的头两项自洽：exe 同级既有 `daemon.jar` 也有 `runtime/`，
+所以机器上装没装 Java 都一样，见 `docs/daemon-api.md` §8。
 
 退出时先 `POST /api/shutdown` 让它落盘收尾，3 秒没退就让 job 统一带走 —— 壳崩溃或被杀也一样，
 不会留孤儿 daemon。
@@ -57,10 +61,24 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 | `theme` | `light` / `dark` | 强制主题（默认跟随系统） |
 | `network` | `pass` / `limited` / `fail` | 强制自检结论；不带 = 用真实自检（daemon 在不在） |
 | `hold` | `boot` / `checking` / `result` | 把 P0 停在某个阶段，供截图 |
+| `pick` | `1` | 进 P3 后自动点一次「添加文件」，用来无人值守地验壳的文件选择器 |
 | `api` | `http://host:port` | 浏览器里指定 daemon 地址（跨源场景 / 换端口调试） |
 | `manual` | `host:port`（逗号分隔） | 加入群时的手动候选，填对方的消息层端口 |
 
-例：`http://127.0.0.1:47200/?route=p3&theme=dark`；exe：`Huchuan.exe --route=p3 --theme=dark`。
+壳自己的开关（不属于页面参数，正常双击一个都不带）：`--daemon-jar=`、`--daemon-port=`、
+`--daemon-data-dir=`（给测试用独立数据目录，别动 `%LOCALAPPDATA%\Huchuan\daemon`）。
+
+取证专用的离屏截图开关（只有壳认，页面不认；用法见 §5.1）：
+
+| 参数 | 取值 | 作用 |
+| --- | --- | --- |
+| `--shot` | PNG 绝对路径 | 离屏渲染一张图写盘后退出（WebView2 `CapturePreview`），不抓屏 |
+| `--shot-page` | `p0`…`p7` | 等到 `document.body.dataset.page` 等于这一页再截；只决定等哪一页，落到哪一页仍由 `--route=` 决定 |
+| `--shot-delay` | 毫秒，默认 1200 | 导航完成后最少等多久再截（留出首帧、字体、接口回来） |
+| `--shot-timeout` | 毫秒，默认 12000 | 等 `--shot-page` 的上限，超时就按当前页截并记一条告警 |
+
+例：`http://127.0.0.1:47200/?route=p3&theme=dark`；exe：`Huchuan.exe --route=p3 --theme=dark`；
+离屏截一张 P4 深色：`Huchuan.exe --route=p4 --shot-page=p4 --theme=dark --shot=D:\tmp\p4.png`。
 
 ## 2. 目录
 
@@ -73,11 +91,12 @@ windows/resources/web/
   js/app.js           路由 + 八页视图 + 事件（文案表 COPY 在文件顶部）
 windows/scripts/
   dev-server.mjs      开发用静态服务器（node 内置模块，零依赖；只在不想起 daemon 时用）
-  capture-ui.ps1      逐页截图取证（纯 ASCII，见 §5 的坑）
+  capture-ui.ps1      逐页截图取证：离屏截图是门禁，GDI 抓图降级为兜底诊断（纯 ASCII，见 §5 的坑）
   ui-capture-jobs.json 截图任务表：页名 / 路由 / 主题 / 断言文案
   click-navigate.ps1  点击链路冒烟（可选，不进构建门禁）
-scripts/build-windows.sh 构建 + 内嵌 + 起取证 daemon + 截图
-scripts/m1-windows.sh    双 daemon 端到端验收（daemon 侧验收，见 docs/daemon-api.md §9）
+scripts/build-windows.sh   构建 + 内嵌 + 起取证 daemon + 截图
+scripts/package-windows.sh 绿色版打包：jlink runtime + exe + jar → dist/Huchuan/（见 docs/daemon-api.md §8）
+scripts/m1-windows.sh      双 daemon 端到端验收（daemon 侧验收，见 docs/daemon-api.md §9）
 ```
 
 ## 3. 数据层：data.js 怎么接的
@@ -103,11 +122,27 @@ WS 只负责说「变了」，不搬数据：收到 `state`（有东西变了）
 画完再还回去；草稿（`State.draftComment`）本来就存在状态里。所以正在打字时被刷新不会丢字、
 不会掉焦点。
 
-### 3.2 添加文件收的是「本机绝对路径」
+### 3.2 添加文件走壳的系统选择器
 
-浏览器出于安全拿不到 `<input type=file>` 的真实路径，而 `POST /api/groups/{gid}/files` 要的
-就是路径。所以 P3 的工具栏是一个路径输入框 + 「添加文件」按钮（Enter 也能提交），
-失败时把 daemon 的 `error` 原文显示在输入框下面。
+`POST /api/groups/{gid}/files` 要的是**本机绝对路径**，浏览器拿不到这个值（`<input type=file>`
+只给 File 对象）。P3 的工具栏因此只有一个「添加文件」按钮，路径由壳问系统要：
+
+    页面点「添加文件」
+      → window.chrome.webview.postMessage({type:'pick-file'})
+      → 壳 PostMessage(WM_APP+1) 回消息循环，开 IFileOpenDialog（模态）
+      → 选中：{type:'file-picked', path:'C:\\…\\a.mp4'}
+        取消：{type:'pick-file-cancelled'}
+      → 页面拿 path 调 daemon，成功后按 spec 流程 4 直接进 P4
+
+- 壳这一侧：`main.cpp` 的 `OnWebMessageReceived` → `PickFileAndReply`。对话框只收真实文件
+  （`FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST`），和 daemon 那头的校验对齐。
+- 页面这一侧：`app.js` 的 `Shell`（`window.chrome.webview` 存在才有）、`pickFile`、
+  `addPickedFile`。壳桥不在（普通浏览器里）时点按钮只显示「只能在互传窗口里选文件」。
+- 日志：壳的 `shell.log` 里一进一出两条对称记录 —— `页面消息：{"type":"pick-file"}`、
+  `回页面：{"type":"file-picked",…}`，排查时直接 grep `pick-file`。
+- 失败（daemon 拒绝、文件被删、权限不够）把 daemon 的 `error` 原文显示在按钮下面。
+
+P3 已经没有输入框了，所以 `Enter` 就是这一页的主操作（见 §8 第 10 行）。
 
 ## 4. 内嵌：资源表怎么来的（现在只是兜底）
 
@@ -131,24 +166,36 @@ html / css / js / svg / png / woff2，按路径排序后：
 ## 5. 构建与验收
 
 ```bash
-bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 16 张截图（约 55 秒）
+bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 16 张离屏截图（约 55 秒）
 bash scripts/build-windows.sh --no-evidence  # 只编译
 bash scripts/build-windows.sh --clean        # 先清 windows/build
+bash scripts/package-windows.sh              # 绿色版：jlink runtime + exe + jar → dist/Huchuan/
 ```
 
 四道关，任一不过脚本退出非 0：
 
 1. **构建**：MSVC + Ninja + /MT 静态 CRT，产物 `windows/build/Huchuan.exe`。
 2. **绿色版**：exe 同级不许有 dll；导入表只允许系统 dll（ADVAPI32 / GDI32 / KERNEL32 / SHELL32 /
-   SHLWAPI / USER32 / WS2_32 / ole32）。
+   SHLWAPI / USER32 / WS2_32 / ole32）。离屏截图用的 WIC（`windowscodecs`）是 COM 运行时装起来的，
+   只把 CLSID 编进 exe，导入表里不会多一行。
 3. **取证 daemon**：脚本自己起一个 daemon（`artifacts/windows/daemon/`，端口 47200），
    建一个群「老板的群」、共享一个 1 MiB 文件、发一条评论。没有它，P2 是「还没有群组」，
    P3/P4 会直接退回首页，逐页断言就没有对象了。用户名故意留空，冷启动才会落在 P1。
-4. **渲染**：`capture-ui.ps1` 按 `ui-capture-jobs.json` 逐页启动 exe，每张图必须同时满足
-   - 运行日志里出现该页的稳定态探针 `DOM 探针(settled)：page=<页>| …`，且正文包含该页断言文案；
-   - 截图窗口像素非空白（颜色数 ≥ 32），浅色平均亮度 ≥ 140、深色 ≤ 120。
+   **jar 过期就重打，不能只看它存不存在**：页面由这个 daemon 从 jar 里发出，jar 是旧的时候
+   门禁照样能出一堆「合格」的图，判的却是旧页面 —— 所以脚本比 mtime：`daemon/src/**`、
+   `core/src/**`、`windows/resources/web/**`、`daemon/build.gradle.kts`、
+   `core/build.gradle.kts`、根 `build.gradle.kts` / `settings.gradle.kts` / `gradle.properties`、
+   `gradle/libs.versions.toml` 任一比 `daemon.jar` 新（或 jar 不存在）就先跑 `:daemon:daemonJar`，
+   增量仍然交给 gradle，脚本只做这一个粗粒度判断；是复用还是本次重建，
+   `artifacts/windows/build-report.md` 里会记一行。
+4. **渲染**：`capture-ui.ps1` 按 `ui-capture-jobs.json` 逐页跑一个一次性 exe
+   （`--shot=<png> --shot-page=<页>`，出图方式见 §5.1），每张图必须同时满足
+   - 运行日志里出现截图那一刻的探针 `DOM 探针(shot)：page=<页>| …`，且正文包含该页断言文案；
+   - PNG 像素非空白（颜色数 ≥ 8；没渲染出来的那一帧只有 1 种颜色），
+     浅色平均亮度 ≥ 140、深色 ≤ 120。
 
-逐张证据写进 `artifacts/windows/ui/index.json`（页名、断言文案、窗口尺寸、颜色数、亮度、探针原文）。
+逐张证据写进 `artifacts/windows/ui/index.json`（页名、断言文案、出图方式 `mode=offscreen`、
+进程退出码、尝试次数、尺寸、颜色数、主色占比、亮度、探针原文）。每页最多重跑 3 次（`-Attempts`）。
 
 两个已经踩过的坑，改这里之前先看一眼：
 
@@ -165,6 +212,30 @@ bash scripts/build-windows.sh --clean        # 先清 windows/build
 powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/click-navigate.ps1 \
   -ExePath "$(cygpath -w windows/build/Huchuan.exe)" -OutDir "$(cygpath -w artifacts/windows/ui/nav)"
 ```
+
+### 5.1 为什么截图不抓屏
+
+2026-11 实测：这个桌面会话根本不渲染 —— 整屏 `CopyFromScreen` 抓 3840×2160 只有 **1 种颜色**；
+同一个 exe 走 GDI 抓窗口也是 `colors=1`、主色 100%，而那一页的 DOM 探针（页名 + 文案）完全正常。
+显示器关闭、显示模式变化、远程会话断开都会造成这种状态，跟页面好坏无关。
+旧门禁把「GDI 截图非空白」当判据，在这种环境下必然全红 —— 凡是依赖"屏幕上有东西"的取证都不会绿。
+
+所以出图走壳自己的一条路：`Huchuan.exe --shot=<png>` 让 **WebView2 渲染进程合成当前页面**，
+用 `ICoreWebView2CapturePreview` 直接拿到 PNG，写盘后退出。它跟屏幕内容、窗口层级、
+窗口是否在前台/置顶都没有关系，桌面不渲染照样出图。每个页面一个一次性进程，
+时序是：导航完成 → 轮询 `document.body.dataset.page` 等目标页 → 打一条 `DOM 探针(shot)` →
+截图 → 壳自己用 WIC 把 PNG 解一遍（颜色数、主色占比、平均亮度）自检 → 合格写盘退出，
+不合格隔 400 ms 重来，最多 6 次。
+
+`capture-ui.ps1` 里还留着老的 GDI 抓窗口那条路（`CopyFromScreen`），但它**不是门禁**：
+上面那种桌面环境下它只会返回一块纯色，而它唯一的价值是"窗口上到底画了什么"（标题栏、
+层级、遮挡），所以只在离屏截图失败时跑一次，产物是 `<页名>.gdi.png` + `<页名>.gdi.log`，
+记进 `index.json` 的 `gdi` 字段，页面的 `ok` 不会因此变真。
+
+对应的断言阈值两边共用一套：颜色数 ≥ 8（空白帧 = 1 种颜色），浅色平均亮度 ≥ 140、深色 ≤ 120。
+历史阈值是"颜色数 ≥ 32"，那是给带窗口边框的 GDI 抓图定的；离屏出图没有窗口边框，
+P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种颜色、主色占到 99.6%，
+32 会把好图判成空白 —— 门槛因此下调到 8，并把"主色占比"留作证据而不是判据。
 
 ## 6. 截图清单
 
@@ -189,7 +260,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/click-naviga
 | `p4-file-dark.png` | P4 | 深色 | 单文件限速 |
 | `p7-settings-dark.png` | P7 | 深色 | 全局限速 |
 
-同名 `.log` 是该次运行被截断后拷出的完整壳日志（含资源命中、导航、三次 DOM 探针）。
+同名 `.log` 是该次运行被截断后拷出的完整壳日志（含资源命中、导航、`nav`/`settled`/`late`/`shot`
+四条 DOM 探针、以及 `离屏截图：第 N 次尝试 …` / `离屏截图完成：…` 两行统计）。
+图本身是 1650×1140（窗口 1100×760 DIP × 150% 缩放，离屏出图按进程 DPI 渲染），不含窗口边框。
 
 ## 7. 页面与文案
 
@@ -209,10 +282,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/click-naviga
 | 4 | 本机成员平台 | `Android` | `Windows` |
 | 5 | P3 文件列表 | 两行 ListItem（名称 / 大小·做种·进度 + 状态 chip） | 列对齐：名称+进度条 / 大小 / 做种 n / 状态 chip；窗口窄于 900px 折回单列 |
 | 6 | P4 版面 | 单栏纵向 | 双栏：左传输控制（进度、激活开关、单文件限速），右评论列表 + 输入行 |
-| 7 | 添加文件 | SAF `OpenDocument` | 本机绝对路径输入框（浏览器拿不到 `<input type=file>` 的真实路径）；两者都直接落内核 |
+| 7 | 添加文件 | SAF `OpenDocument` | 壳调 `IFileOpenDialog`，把选中的绝对路径回传给页面（浏览器拿不到 `<input type=file>` 的真实路径）；两者都直接落内核 |
 | 8 | 复制邀请码 | ClipboardManager + Snackbar | `navigator.clipboard`，失败退回 `execCommand`；「已复制」在行内显示 1.6 秒 |
 | 9 | 主题 | `isSystemInDarkTheme()` | `prefers-color-scheme`；窗口标题栏与 WebView2 首帧底色跟着页面主题走 |
-| 10 | 键盘 | 无 | `Enter` 提交当前页主操作（保存 / 加入 / 发送 / 创建 / 添加文件），`Esc` 关闭抽屉或返回 |
+| 10 | 键盘 | 无 | `Enter` 提交当前页主操作（保存 / 加入 / 发送 / 创建；P3 上是打开文件选择器），`Esc` 关闭抽屉或返回 |
 
 ## 9. 当前限制
 
@@ -223,8 +296,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/click-naviga
 3. **别人的做种数与平台是 0 / 「未知」**，只有本机是真数。缺口 G3。
 4. **群只能建、不能退**。core 没有退出群的 API。缺口 G1。
 5. **评论发出去不能删**。缺口 G6。
-6. **JRE 要自己装**：壳找 `JAVA_HOME` 或 PATH 里的 `javaw.exe`；没有 Java 时退回内嵌页面并显示
-   「网络不可用」。jlink 打包方案写在 `docs/daemon-api.md` §8，本轮不做。
+6. **绿色版自带 JRE**：`dist/Huchuan/` 里带着 jlink 裁出来的 `runtime/`（26.88 MiB），目标机
+   不用装 Java。只有在既没有 `runtime/` 又没装 Java 的机器上（比如直接跑 `windows/build/Huchuan.exe`），
+   壳才退回内嵌页面并显示「网络不可用」。打包见 `docs/daemon-api.md` §8。
 7. **跨网还没开**：只走局域网 mDNS + 手动地址，没有 tracker、没有打洞、没有端口映射窗口。
 8. **无鉴权**：daemon 只监听 127.0.0.1，本机任何进程都能调它的 API。M1 接受这个前提。
 
@@ -235,8 +309,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/click-naviga
 | `index.html` | 947 |
 | `css/tokens.css` | 2,573 |
 | `css/app.css` | 15,494 |
-| `js/data.js` | 16,481 |
-| `js/app.js` | 38,649 |
-| **页面资源合计** | **74,144**（预算 200 KB） |
-| `Huchuan.exe` | 344,064（WebView2 运行时是系统组件，不在 exe 内） |
-| `daemon.jar` | 8,033,932（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
+| `js/data.js` | 16,476 |
+| `js/app.js` | 40,249 |
+| **页面资源合计** | **75,739**（预算 200 KB） |
+| `Huchuan.exe` | 358,400（WebView2 运行时是系统组件，不在 exe 内） |
+| `daemon.jar` | 8,049,914（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
+| `runtime/`（jlink） | 28,186,664（26.88 MiB，模块 `java.base,java.logging,jdk.crypto.ec`） |
+| **`dist/Huchuan` 合计** | **36,594,978**（34.90 MiB，拷走就能跑，目标机不用装 Java） |

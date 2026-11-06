@@ -3,6 +3,8 @@ package app.huchuan.kernel
 import android.content.Context
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import app.huchuan.core.GroupFile
 import app.huchuan.core.m1.FileEntry
@@ -12,6 +14,8 @@ import app.huchuan.core.m1.M1Kernel
 import app.huchuan.core.m1.OpRecord
 import app.huchuan.core.m1.SecretBox
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Android 侧的 M1 内核宿主：进程内嵌内核 + 组播锁 + 日志出口 + SAF 导入。
@@ -69,6 +73,66 @@ class M1Runtime(context: Context) {
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var startRequested = false
+
+    // ------------------------------------------------------------------ 内核事件 → 界面
+
+    /**
+     * 界面刷新的唯一驱动：内核事件（KernelEvents）。
+     *
+     * 内核在消息层线程 / 巡查线程上回调，这里把它压成一次「界面重新读数据」：
+     * 同一节拍里的多条事件只算一次（refreshPending），未读数在独立线程上取
+     * （不在内核回调里重入内核查询），改 Compose state 的那一步最后投回主线程。
+     * 界面侧因此不再自己起定时器 —— 没有内核事件就没有重绘。
+     */
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val eventThread = Executors.newSingleThreadExecutor { job ->
+        Thread(job, "huchuan-ui-bridge").apply { isDaemon = true }
+    }
+    private val refreshPending = AtomicBoolean(false)
+    private val lastUnread = HashMap<String, Int>()
+
+    @Volatile
+    private var uiRefresh: (() -> Unit)? = null
+
+    /** 注册界面刷新（主线程调用，注册即刷一次）；返回注销句柄。 */
+    fun attachUiRefresh(listener: () -> Unit): () -> Unit {
+        uiRefresh = listener
+        listener()
+        return { if (uiRefresh === listener) uiRefresh = null }
+    }
+
+    private fun requestUiRefresh() {
+        if (!refreshPending.compareAndSet(false, true)) return
+        try {
+            eventThread.execute {
+                refreshPending.set(false)
+                logUnreadChanges()
+                mainHandler.post { uiRefresh?.invoke() }
+            }
+        } catch (_: Throwable) {
+            refreshPending.set(false)
+        }
+    }
+
+    /** 未读数只在变化时打一行：脚本用 event=ui_unread ... unread=N 断言 P2 角标。 */
+    private fun logUnreadChanges() {
+        val groups = try {
+            kernel.groups()
+        } catch (_: Throwable) {
+            return
+        }
+        for (group in groups) {
+            val unread = try {
+                group.unreadCount()
+            } catch (_: Throwable) {
+                continue
+            }
+            val previous = synchronized(lastUnread) { lastUnread.put(group.groupId, unread) }
+            if (previous != unread) {
+                Log.i(TAG, "event=ui_unread group_id=" + group.groupId + " unread=" + unread)
+            }
+        }
+    }
 
     // ------------------------------------------------------------------ 生命周期
 
@@ -167,6 +231,28 @@ class M1Runtime(context: Context) {
         completed.add(fileId)
     }
 
+    // ------------------------------------------------------------------ 未读数（G4）
+
+    /** 打开 P3：整群未读清零，返回清掉的条数。要写 state.json，界面线程不许调。 */
+    fun markGroupRead(groupId: String): Int {
+        val cleared = kernel.markGroupRead(groupId)
+        Log.i(TAG, "event=ui_mark_read scope=group group_id=" + groupId + " cleared=" + cleared)
+        requestUiRefresh()
+        return cleared
+    }
+
+    /** 打开 P4：该文件未读清零，返回清掉的条数。同样要离开界面线程。 */
+    fun markFileRead(groupId: String, fileId: String): Int {
+        val cleared = kernel.markFileRead(groupId, fileId)
+        Log.i(
+            TAG,
+            "event=ui_mark_read scope=file group_id=" + groupId + " file_id=" + fileId +
+                " cleared=" + cleared,
+        )
+        requestUiRefresh()
+        return cleared
+    }
+
     // ------------------------------------------------------------------ 事件出口
 
     /**
@@ -177,14 +263,20 @@ class M1Runtime(context: Context) {
 
         override fun log(event: String, fields: Map<String, String>) {
             Log.i(TAG, format(event, fields))
+            // 除心跳外的每条内核日志都意味着界面上的某个数字变了：op_ingested → 未读，
+            // peer_announce → 成员平台/做种数，download_progress → 进度与速率，file_add → 清单。
+            // heartbeat 每 2 s 一条，跟界面状态无关，不拿它当刷新节拍。
+            if (event != "heartbeat") requestUiRefresh()
         }
 
         override fun joined(group: GroupRuntime) {
             Log.i(TAG, "event=ui_joined group_id=" + group.groupId + " name=" + clean(group.name))
+            requestUiRefresh()
         }
 
         override fun memberJoined(group: GroupRuntime, deviceId: String, name: String) {
             Log.i(TAG, "event=ui_member_joined group_id=" + group.groupId + " dev=" + deviceId + " name=" + clean(name))
+            requestUiRefresh()
         }
 
         override fun fileAdded(group: GroupRuntime, entry: FileEntry) {
@@ -193,6 +285,7 @@ class M1Runtime(context: Context) {
                 "event=ui_file_added group_id=" + group.groupId + " file_id=" + entry.fileId +
                     " name=" + clean(entry.name) + " size=" + entry.size,
             )
+            requestUiRefresh()
         }
 
         override fun fileCompleted(group: GroupRuntime, entry: FileEntry) {
@@ -202,15 +295,17 @@ class M1Runtime(context: Context) {
                 "event=ui_file_completed group_id=" + group.groupId + " file_id=" + entry.fileId +
                     " size=" + entry.size + " path=" + (group.savedFile(entry.fileId)?.absolutePath ?: ""),
             )
+            requestUiRefresh()
         }
 
+        // 未读数不在这里累加：内核按「可见 op 与读游标」现算，这里只让界面重读一次。
         override fun opReceived(group: GroupRuntime, op: OpRecord) {
-            prefs.bumpUnread(group.groupId)
             Log.i(
                 TAG,
                 "event=ui_op_received group_id=" + group.groupId + " file_id=" + op.fileId +
                     " op_id=" + op.opId + " author=" + op.author + " body=" + clean(op.body),
             )
+            requestUiRefresh()
         }
 
         private fun format(event: String, fields: Map<String, String>): String {

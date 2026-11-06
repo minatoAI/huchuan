@@ -44,7 +44,8 @@ const COPY = {
 
   // P3 群组
   p3_add_file: '添加文件',
-  p3_add_path: '本机文件绝对路径',
+  p3_add_need_shell: '只能在互传窗口里选文件',
+  p3_add_failed: '添加失败',
   p3_members: function (n) { return '成员（' + n + ' 人）'; },
   p3_seeding: '做种中',
   p3_sleeping: '休眠',
@@ -110,6 +111,7 @@ const Params = new URLSearchParams(location.search);
 const Dev = {
   network: Params.get('network') || '',  // ''（真实自检）| pass | limited | fail
   hold: Params.get('hold') || '',        // boot | checking | result
+  pick: Params.get('pick') || '',        // 1 = 进 P3 后自动弹一次系统选择器（验证壳桥用）
 };
 
 const app = document.getElementById('app');
@@ -515,8 +517,6 @@ function viewGroup() {
     }) +
     '<div class="content"><div class="page page-wide">' +
       '<div class="toolbar">' +
-        '<input class="input" id="add-path" autocomplete="off" spellcheck="false" ' +
-          'placeholder="' + COPY.p3_add_path + '" aria-label="' + COPY.p3_add_path + '">' +
         '<button class="btn btn-primary" data-act="add-file">' + COPY.p3_add_file + '</button>' +
       '</div>' +
       '<p class="field-note is-error" id="add-note" hidden></p>' +
@@ -671,27 +671,62 @@ function joinGroup() {
 }
 
 /**
- * 添加文件：daemon 要的是「本机绝对路径」。
- * 浏览器出于安全拿不到 <input type=file> 的真实路径，所以这里收路径字符串 —— 这也正是
- * POST /api/groups/{gid}/files 的入参（docs/daemon-api.md）。
+ * 壳桥：页面在 WebView2 里由壳承载时，window.chrome.webview 就是壳本身。
+ * 点「添加文件」发 {type:'pick-file'}，壳弹系统文件选择器，把选中的绝对路径回成
+ * {type:'file-picked', path:'…'} —— 这正是 POST /api/groups/{gid}/files 的入参
+ * （docs/daemon-api.md）。浏览器里没有这个对象，也就没有那条上行通道。
  */
-function addFileFromPath() {
-  const input = document.getElementById('add-path');
+const Shell = {
+  available: !!(window.chrome && window.chrome.webview && window.chrome.webview.postMessage),
+  pending: false,
+  listen: function () {
+    if (!Shell.available) return;
+    window.chrome.webview.addEventListener('message', function (event) {
+      const message = event.data || {};
+      if (message.type === 'file-picked') {
+        Shell.pending = false;
+        addPickedFile(message.path);
+      } else if (message.type === 'pick-file-cancelled') {
+        Shell.pending = false;
+        setAddBusy(false);
+      }
+    });
+  },
+};
+
+function setAddNote(text) {
   const note = document.getElementById('add-note');
+  if (!note) return;
+  note.textContent = text || '';
+  note.hidden = !text;
+}
+
+function setAddBusy(busy) {
+  const button = app.querySelector('[data-act="add-file"]');
+  if (button) button.disabled = !!busy;
+}
+
+/** 点「添加文件」：路径由壳的系统选择器给，页面不猜。 */
+function pickFile() {
   const group = Store.group(State.groupId);
-  if (!input || !group) return;
-  const path = input.value.trim();
-  if (!path) {
-    input.focus();
+  if (!group) return;
+  if (!Shell.available) {
+    setAddNote(COPY.p3_add_need_shell);
     return;
   }
-  if (note) note.hidden = true;
-  input.disabled = true;
+  if (Shell.pending) return;
+  Shell.pending = true;
+  setAddNote('');
+  setAddBusy(true);
+  window.chrome.webview.postMessage({ type: 'pick-file' });
+}
+
+/** 壳回传的本机绝对路径 → daemon。 */
+function addPickedFile(path) {
+  const group = Store.group(State.groupId);
+  setAddBusy(false);
+  if (!group || !path) return;
   Store.addFile(group.id, path).then(function (created) {
-    if (input) {
-      input.disabled = false;
-      input.value = '';
-    }
     if (!created) return;
     // spec 流程 4：添加文件完成后直接进 P4，开关默认开。
     State.fileId = created.id;
@@ -699,11 +734,7 @@ function addFileFromPath() {
     State.replyTo = null;
     Nav.go('p4', created.id);
   }).catch(function (error) {
-    if (input) input.disabled = false;
-    if (note) {
-      note.textContent = (error && error.message) || '添加失败';
-      note.hidden = false;
-    }
+    setAddNote((error && error.message) || COPY.p3_add_failed);
   });
 }
 
@@ -890,7 +921,7 @@ document.addEventListener('click', function (event) {
       break;
 
     case 'add-file':
-      addFileFromPath();
+      pickFile();
       break;
 
     case 'save-name':
@@ -1068,9 +1099,12 @@ document.addEventListener('keydown', function (event) {
   } else if (id === 'comment-input') {
     event.preventDefault();
     sendComment();
-  } else if (id === 'add-path') {
+  } else if (!id && State.route === 'p3' &&
+             !(event.target && event.target.closest &&
+               event.target.closest('[data-act="add-file"]'))) {
+    // P3 没有输入框了：Enter 就是这一页的主操作（按钮自己聚焦时浏览器会补一次 click，跳过）
     event.preventDefault();
-    addFileFromPath();
+    pickFile();
   }
 });
 
@@ -1115,6 +1149,8 @@ function sendComment() {
     if (query.addEventListener) query.addEventListener('change', apply);
   }
 
+  Shell.listen();   // P3 的「添加文件」要靠壳回传路径
+
   const initial = Params.get('route') || 'p0';
   // 先把 daemon 的快照拿下来再进开屏：P0 的自检判据就是「daemon 在不在」。
   Store.boot().then(function () {
@@ -1122,6 +1158,12 @@ function sendComment() {
     State.groupId = first ? first.id : '';
     Store.onChange(onDataChanged);
     seedStack(initial, Params.get('file') || null);
+    if (Dev.pick === '1') {
+      // 无人值守地验证「页面 → 壳 → 系统选择器 → 回传」这条链：等页面稳定后自动点一次。
+      setTimeout(function () {
+        if (State.route === 'p3') pickFile();
+      }, 1200);
+    }
   });
 })();
 

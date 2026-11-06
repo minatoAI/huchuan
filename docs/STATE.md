@@ -43,11 +43,15 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 
 ## 在飞
 
-- M1.2 收尾：protocol §13 结案、DesktopPeer 时延、file.list 覆盖用例
-- DEV devkit 补 input text / launch --extra
-
+- DEVV 真机验证做种计数与重启续种（含 app 兜底清理）
+- JARFIX 截图门禁的 jar 时效判断
 
 ## 已完成
+- WIN Windows 打包 → dist/Huchuan 34.9 MiB（jlink 运行时，无需装 Java）+ IFileOpenDialog 文件选择器；m1-windows 37/37 PASS
+- SHOT WebView2 离屏截图 → 桌面不渲染环境下 build-windows 16/16 PASS（index.json mode=offscreen）
+- CORE-FIX 做种计数与重启续种 → SeedingLedger 单一来源（下载完成/休眠/重启/文件缺失全走它）、state.json 存 seeding 数组、重启按原 info 字典续种；selftest 110 条，headless 35 CHECK PASS
+- APP Android 接未读角标 / 成员做种数与平台 → 真机 25 checks PASS；角标、清未读、成员平台与做种数全部有真数据
+- CORE 内核缺口 → 创建者公钥登记（no_pub 从 232 条降到 0）、peer.announce 补 plat/seeds、未读游标、removeGroup；selftest 90 条
 - DAEMON Windows 本地服务 → daemon/（9 文件，单文件 jar 8.0 MB）+ Web UI 接真实数据；管理层复跑 m1-windows.sh：36/36 PASS（双 daemon、32 MiB、SHA 一致、WS 推送、shutdown 干净）
 - M1.1 协议内核修正 → join.ok 独立签名域、file.list 条目签名、公钥随 join.ok/member.name 分发、时延改本地口径、单帧失败不再断链；管理层复跑 25 CHECK PASS
 - C2 真机 M1 闭环 → scripts/m1-device.sh（26 checks）；管理层复跑 --quick：PASS 19 checks；Android↔桌面 32 MiB 双端 SHA 一致、评论双向、Keystore 包裹 keySeed、无 Scudo

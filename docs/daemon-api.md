@@ -20,6 +20,9 @@ java -jar daemon/build/dist/daemon.jar
 
 # 或者直接跑
 ./gradlew :daemon:run
+
+# 绿色版里不用系统 java：dist/Huchuan/runtime/bin/java.exe 就是 daemon 的运行时（见 §8）
+dist/Huchuan/runtime/bin/java.exe -jar dist/Huchuan/daemon.jar
 ```
 
 启动成功后 stdout 会打一行机读的就绪信号，脚本可以直接等它：
@@ -237,6 +240,9 @@ POST { "userName": "我的设备" }          // 字段都可选，给几个改�
 `path` 必须是**本机绝对路径**且是普通文件、非空。daemon 建 v1 私有种子并开始做种，
 同时把路径记进 `settings.json`（重启后据此恢复做种，见 §6）。
 
+这个路径由 Windows 壳的系统文件选择器给出（`IFileOpenDialog`），页面不自己拼 —— 见
+`docs/windows-ui.md` §3.2。浏览器里没有那条通道，所以直接开浏览器时「添加文件」用不了。
+
 #### `GET /api/groups/{gid}/files/{fid}`
 
 `{"file": 文件对象, "comments": [评论...]}`
@@ -381,35 +387,58 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 
 ---
 
-## 8. 待办：JRE 打包（本轮不做，方案先定）
+## 8. JRE 打包：绿色版（已落地）
 
-现状：daemon 要一个 JDK/JRE 17+。壳按 `JAVA_HOME\bin\javaw.exe` → PATH 里的 `javaw.exe` 找，
-找不到就退回内嵌页面（页面显示自检失败）。用户机器上没装 Java 时 daemon 起不来。
+daemon 要 JDK 17+ 的运行时，目标机不该为它装 Java。`scripts/package-windows.sh` 用 jlink 裁出
+只含 daemon 用到模块的 runtime，和壳、jar 组成一个目录，拷走就能双击：
 
-**方案 A（推荐）：jlink 精简运行时 + 固定目录**
+    dist/runtime/                jlink 产物（只含 daemon 用到的模块）
+    dist/Huchuan/
+      Huchuan.exe                壳（windows/build/Huchuan.exe）
+      daemon.jar                 同一份 jar：壳在 exe 同级优先找它
+      runtime/                   上面那份 runtime 的副本：壳在 exe 同级优先用它
 
-1. `jdeps --multi-release 17 --print-module-deps daemon.jar` 找出实际用到的模块
-   （预计是 `java.base`、`java.logging`、`java.naming`、`java.security.jgss` 这几类）。
-2. `jlink --add-modules <上面那串> --strip-debug --no-man-pages --no-header-files
-   --compress=zip-6 --output runtime`（体积预估 45–60 MB）。
-3. 产物布局（绿色版，拷走就能跑）：
+一条命令：`bash scripts/package-windows.sh`（`--skip-jar` / `--skip-exe` / `--clean` 可选）。
 
-       Huchuan.exe
-       daemon\daemon.jar
-       runtime\bin\javaw.exe
-       runtime\lib\...
+### 模块清单怎么来的
 
-4. 壳的查找顺序补一条：`<exe 目录>\runtime\bin\javaw.exe` 优先于 `JAVA_HOME`。
-5. 验收：在没装 Java 的机器上双击 exe → 窗口起来 → P0 显示「可互传」。
+```bash
+jdeps --multi-release 17 --ignore-missing-deps --print-module-deps daemon.jar
+# → java.base,java.logging
+```
 
-**方案 B（备选）：GraalVM native-image**
+再补一个 jdeps 看不见的：**`jdk.crypto.ec`**。core 生成邀请码要 EC `KeyPairGenerator`，它是
+Security provider 里的东西，字节码里没有直接引用；少了这一项内核启动直接抛
+`NoSuchAlgorithmException: EC KeyPairGenerator not available`，daemon 起不来、页面只剩「网络不可用」。
+所以打包脚本在 jlink 之后**用产出的 runtime 起一次 daemon 并等 `/api/health` 回 ok**：模块少一个
+就当场失败，而不是等用户双击才发现。
 
-`daemon.jar` → 单文件 exe（约 60 MB，启动 < 100 ms）。风险是反射 / `libtorrent4j` 的 JNI 与
-jmdns 的运行时反射要写一堆 `--initialize-at-build-time` / `reflect-config.json`，
-调试成本明显高于方案 A，收益只是启动快一点。
+jlink 参数：`--strip-debug --no-man-pages --no-header-files --compress=2`。
+`--compress` 的写法在 JDK 21 换过（17/18/19/20 只认 `0|1|2`，21+ 才认 `zip-0…zip-9`），
+脚本按 `java -version` 的主版本自动选。
 
-**暂定结论**：走方案 A，脚本 `scripts/package-windows.sh` 下一轮补；本轮只保证
-「机器上有 JDK 17 就能跑」。
+### 实际体积（JDK 17 Temurin，2026-11-06）
+
+| 项 | 字节 | MiB |
+| --- | ---: | ---: |
+| `Huchuan.exe` | 358,400 | 0.34 |
+| `daemon.jar` | 8,049,914 | 7.68 |
+| `runtime/` | 28,186,664 | 26.88 |
+| **合计 `dist/Huchuan`** | **36,594,978** | **34.90** |
+
+runtime 预算是 60 MiB，超了脚本直接失败（说明模块挑多了或压缩没开）。
+
+### 壳怎么找到它们
+
+- **Java**（`main.cpp` 的 `FindJava`）：exe 同级 `runtime\bin\javaw.exe` → `JAVA_HOME\bin` →
+  PATH 上的 `javaw.exe` / `java.exe`。三处都没有就退回 exe 内嵌页面，自检显示「网络不可用」，
+  点「重试」会重新连（daemon 一起来就恢复）。
+- **daemon.jar**（`ResolveDaemonJar`）：`--daemon-jar=` → `HUCHUAN_DAEMON_JAR` →
+  exe 同级（`daemon.jar` 或 `daemon\daemon.jar`）→ `%LOCALAPPDATA%\Huchuan\daemon\daemon.jar` →
+  源码树。exe 同级排在 `%LOCALAPPDATA%` 前面：绿色版目录里那份就是跟这个 exe 一起发出去的版本。
+
+**为什么不是 GraalVM native-image**：libtorrent4j 的 JNI 与 jmdns 的运行时反射要写一堆
+`--initialize-at-build-time` / `reflect-config.json`，调试成本明显高于 jlink，收益只是启动快一点。
 
 ---
 
@@ -421,3 +450,9 @@ bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 
 脚本自己起 A/B 两个 daemon（47200 / 47201），走完建群 → 后 8 位加入 → 共享 32 MiB →
 下载 → SHA-256 比对 → 评论回流 → WS 推送 → Web UI 数据通路，最后打印 `PASS` / `FAIL`。
+共 37 条断言。
+
+第 37 条验绿色版：用 `cmd` 把 `JAVA_HOME` 清空、`PATH` 只留 `C:\Windows\System32`（复现
+「目标机没装 Java」），再启动 `dist/Huchuan/Huchuan.exe`，要求 47290 上的 `/api/health` 通，
+且壳日志里「拉起 daemon」用的 java 是 exe 同级的 `runtime\bin\javaw.exe`。
+`dist/Huchuan` 不存在时脚本会先跑一次 `scripts/package-windows.sh`。

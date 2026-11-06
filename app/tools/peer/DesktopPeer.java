@@ -24,7 +24,7 @@ import java.util.concurrent.TimeUnit;
  * 桌面 JVM 对端：真机验收里的「另一台设备」。
  *
  *   host：建群 → 打印邀请码后 8 位 → 等对端加入 → 等对端共享文件 → 下载并比对 SHA-256
- *         → 发评论 → 等对端回评论 → 共享压力文件做种 → 一直服务到脚本收工
+ *         → 发评论 → 等对端回评论 →（可选）延迟补一条评论 → 共享压力文件做种 → 服务到脚本收工
  *   join：只拿后 8 位加入（+ 可选手动 IP:port）→ 共享文件 → 下载对端的文件 → 评论 → 等回复
  *
  * 输出是结构化行（"PEER <event> k=v ..."），脚本只 grep 文本。
@@ -43,7 +43,8 @@ public final class DesktopPeer {
         try {
             if (args.length == 0) {
                 System.err.println("usage: DesktopPeer <host|join> data=<dir> work=<dir> [name=..] [tail8=..] [manual=ip:port] "
-                        + "[msg_port=..] [bt_port=..] [share=path1,path2] [comment=..] [expect_comment=..] [download=0|1] [hold=seconds]");
+                        + "[msg_port=..] [bt_port=..] [share=path1,path2] [comment=..] [expect_comment=..]"
+                        + " [echo=..] [echo_delay_ms=..] [download=0|1] [hold=seconds]");
                 System.exit(2);
             }
             String role = args[0];
@@ -184,12 +185,14 @@ public final class DesktopPeer {
             System.out.flush();
         }
 
+        String remoteFileId = null;
         if (doDownload) {
             FileEntry remote = waitRemoteFile(kernel, group, FILE_TIMEOUT_MS);
             if (remote == null) {
                 fail("file_not_seen");
                 return;
             }
+            remoteFileId = remote.getFileId();
             System.out.println("PEER file_seen file_id=" + remote.getFileId()
                     + " name=" + clean(remote.getName())
                     + " size=" + remote.getSize()
@@ -273,7 +276,26 @@ public final class DesktopPeer {
         System.out.println("PEER reply_seen ok=" + gotReply);
         System.out.flush();
 
-        // ---------------------------------------------------------- 5. 一直做种
+        // ---------------------------------------------------------- 5. 延迟补一条评论
+        // 真机侧要验「P2 群行未读角标」：手机回完评论后会退回 P2，它不在群组页上的时候
+        // 必须有人发一条新评论，角标才有机会出现。delay 从「收到手机评论」开始算，
+        // 留出手机返回 P2 的时间。echo=<正文> 不传就跳过。
+        String echo = opts.getOrDefault("echo", "");
+        long echoDelayMs = Long.parseLong(opts.getOrDefault("echo_delay_ms", "20000"));
+        if (!echo.isEmpty() && remoteFileId != null) {
+            long echoAt = System.currentTimeMillis() + echoDelayMs;
+            while (System.currentTimeMillis() < echoAt) {
+                Thread.sleep(100);
+            }
+            OpRecord echoed = group.comment(remoteFileId, echo, null);
+            System.out.println("PEER echo_comment_sent op_id=" + echoed.getOpId()
+                    + " body=" + clean(echo)
+                    + " file_id=" + remoteFileId
+                    + " delay_ms=" + echoDelayMs);
+            System.out.flush();
+        }
+
+        // ---------------------------------------------------------- 6. 一直做种
         long holdDeadline = System.currentTimeMillis() + holdSeconds * 1000L;
         while (System.currentTimeMillis() < holdDeadline) {
             Thread.sleep(2000);

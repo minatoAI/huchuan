@@ -28,9 +28,15 @@ import androidx.compose.ui.unit.dp
 import app.huchuan.HuchuanState
 import app.huchuan.R
 import app.huchuan.core.Member
+import app.huchuan.core.m1.Proto
 import kotlinx.coroutines.launch
 
-/** P6 成员。入口：P3 顶部「成员（n 人）」；出口：系统返回 → P3。 */
+/**
+ * P6 成员。入口：P3 顶部「成员（n 人）」；出口：系统返回 → P3。
+ *
+ * 「做种 n」与平台来自 MemberRecord（协议 §10 的 peer.announce.plat / seeds）：
+ * 本机是真值，别人是他自己最后一次自报的值；没自报过就是「未知」/ 0。
+ */
 @Composable
 fun MembersScreen(
     state: HuchuanState,
@@ -102,6 +108,14 @@ fun MembersScreen(
     }
 }
 
+/** 平台标签：android / windows / unknown 三个协议取值 → P6 上显示的字。 */
+@Composable
+private fun platformLabel(platform: String): String = when (platform) {
+    Proto.PLATFORM_ANDROID -> stringResource(R.string.p6_platform_android)
+    Proto.PLATFORM_WINDOWS -> stringResource(R.string.p6_platform_windows)
+    else -> stringResource(R.string.p6_platform_unknown)
+}
+
 @Composable
 private fun MemberRow(member: Member) {
     ListItem(
@@ -129,7 +143,7 @@ private fun MemberRow(member: Member) {
         },
         trailingContent = {
             Text(
-                text = member.platform,
+                text = platformLabel(member.platform),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

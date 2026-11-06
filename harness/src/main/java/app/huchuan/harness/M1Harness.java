@@ -286,6 +286,9 @@ public final class M1Harness {
                 }
             }
 
+            // 缺陷回归的起点：还没开始下载时，本机在这个群一份都没在做种（seeds 必须是 0）
+            int seedsBeforeDownload = group.seedingFileCount();
+            RunLog.out("M1 B seeding_count phase=before_download value=" + seedsBeforeDownload + " expect=0");
             boolean started = group.startDownload(entry.getFileId());
             RunLog.out("M1 B download_start ok=" + started);
             if (!started) {
@@ -358,9 +361,95 @@ public final class M1Harness {
                     + " seq=" + op.getSeq()
                     + " sent_at=" + op.getTs());
             Thread.sleep(2000);
-            RunLog.out("M1 B flow_done");
+
+            // ---------- 做种集合 + 重启续种（缺陷回归 / 原缺口 G2）----------
+            // 这一段证明「完成判定 → 做种集合」只有一份来源：本机自报的 seeds 与 P3 的做种状态都读
+            // GroupRuntime.seedingFileCount()。真机缺陷（docs/m1-device.md §6-6）就是这里一直停在 0。
+            int seedsAfterDownload = awaitSeedingCount(group, 1, 20_000L);
+            RunLog.out("M1 B seeding_count phase=after_download value=" + seedsAfterDownload + " expect=1");
+
+            // 休眠 → 移出做种集合；再激活 → 又回来（同一条完成判定，幂等）
+            group.stopFile(entry.getFileId());
+            int seedsAfterHibernate = group.seedingFileCount();
+            RunLog.out("M1 B seeding_count phase=after_hibernate value=" + seedsAfterHibernate + " expect=0");
+            group.startDownload(entry.getFileId());
+            int seedsAfterReactivate = awaitSeedingCount(group, 1, 20_000L);
+            RunLog.out("M1 B seeding_count phase=after_reactivate value=" + seedsAfterReactivate + " expect=1");
+
+            // 再共享一个小文件：留给下面「文件缺失」用例（本机共享的做种）
+            File extraShare = workDir.resolve("share").resolve("resume-extra.bin").toFile();
+            createRandomFile(extraShare, 64 * 1024);
+            FileEntry extraEntry = group.addFile(extraShare);
+            int seedsAfterAdd = group.seedingFileCount();
+            RunLog.out("M1 B file_shared_extra file_id=" + extraEntry.getFileId()
+                    + " path=" + clean(extraShare.getPath())
+                    + " seeding_count=" + seedsAfterAdd + " expect=2");
+
+            // 重启续种：关掉内核再按同一份 state.json 起来（关的是内核，进程不退，
+            // loadState → resumeSeeds 走的就是生产代码那条路）。
+            // 采样线程必须在关内核之前停掉：Sampler 握着这个内核的会话，采一个已经停掉的会话会打出
+            // source=unavailable 的行，脚本的 dht 断言会把它当坏样本（重启后的采样因此不重开）。
             stopSampler();
             kernel.close();
+            M1Kernel kernel2 = new M1Kernel(dataDir.toFile(), name, msgPort, btPort, events);
+            events.attach(kernel2);
+            kernel2.start();
+            GroupRuntime group2 = firstGroup(kernel2, "B");
+            int seedsAfterRestart = awaitSeedingCount(group2, 2, 15_000L);
+            RunLog.out("M1 B seeding_count phase=after_restart value=" + seedsAfterRestart
+                    + " expect=2 groups=" + kernel2.groups().size()
+                    + " files=" + group2.files().size());
+
+            // 文件缺失：删掉那条小文件的本地副本再重启 → 它降级为休眠（不崩、不算做种），
+            // 下载来的那条照常续种。
+            kernel2.close();
+            boolean extraDeleted = Files.deleteIfExists(extraShare.toPath());
+            M1Kernel kernel3 = new M1Kernel(dataDir.toFile(), name, msgPort, btPort, events);
+            events.attach(kernel3);
+            kernel3.start();
+            GroupRuntime group3 = firstGroup(kernel3, "B");
+            int seedsAfterMissing = awaitSeedingCount(group3, 1, 10_000L);
+            GroupRuntime.LocalRole missingRole = group3.localRole(extraEntry.getFileId());
+            RunLog.out("M1 B seeding_count phase=after_restart_file_missing value=" + seedsAfterMissing
+                    + " expect=1 file_deleted=" + extraDeleted
+                    + " missing_file_role=" + missingRole + " expect=NONE");
+
+            // 巡查对账：把「下载来的那条」的 torrent 从会话里摘掉 —— 等价于本机数据没了，但不碰磁盘文件
+            // （Windows 上做种中的文件被 libtorrent 占着句柄，删不掉；真机 Android 上删得掉，走的是同一段降级动作）。
+            // 两拍之内应当降级为休眠、做种数回到 0，进程不崩。
+            boolean detached = detachTorrent(kernel3, entry.getFileId());
+            int seedsAfterDetach = awaitSeedingCount(group3, 0, 15_000L);
+            RunLog.out("M1 B seeding_count phase=after_torrent_detached value=" + seedsAfterDetach
+                    + " expect=0 detached=" + detached);
+            kernel3.close();
+
+            boolean seedingOk = seedsBeforeDownload == 0
+                    && seedsAfterDownload == 1
+                    && seedsAfterHibernate == 0
+                    && seedsAfterReactivate == 1
+                    && seedsAfterAdd == 2
+                    && seedsAfterRestart == 2
+                    && seedsAfterMissing == 1
+                    && missingRole == GroupRuntime.LocalRole.NONE
+                    && detached
+                    && seedsAfterDetach == 0;
+            // 一次说清整条状态机的读数，脚本按 grep 就能看出是哪一格错了
+            RunLog.out("M1 B seeding_transitions result=" + (seedingOk ? "pass" : "fail")
+                    + " before_download=" + seedsBeforeDownload
+                    + " after_download=" + seedsAfterDownload
+                    + " after_hibernate=" + seedsAfterHibernate
+                    + " after_reactivate=" + seedsAfterReactivate
+                    + " after_add=" + seedsAfterAdd
+                    + " after_restart=" + seedsAfterRestart
+                    + " after_restart_file_missing=" + seedsAfterMissing
+                    + " missing_role=" + missingRole
+                    + " after_torrent_detached=" + seedsAfterDetach);
+            RunLog.out("M1 B flow_done");
+            if (!seedingOk) {
+                // 回归就判 FAIL：这一格错掉时真机上 P6 的「做种 n」会跟着错，不能只留一行日志。
+                fail("B", "seeding_transitions_failed");
+                return;
+            }
             RunLog.out("RESULT=PASS");
             System.exit(0);
         } finally {
@@ -670,6 +759,60 @@ public final class M1Harness {
             Thread.sleep(100);
         }
         return false;
+    }
+
+    /**
+     * 轮询到期望的做种数。完成判定与做种集合的推进在巡查线程（2 s 一拍），所以下载完成后
+     * 读数不是立刻变的；超时返回最后一次读数，由调用方判 FAIL 并说清期望值。
+     */
+    static int awaitSeedingCount(GroupRuntime group, int expect, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        int value = group.seedingFileCount();
+        while (value != expect && System.currentTimeMillis() < deadline) {
+            Thread.sleep(100);
+            value = group.seedingFileCount();
+        }
+        return value;
+    }
+
+    /**
+     * 测试用：把一条正在做种的 torrent 从会话里摘掉，模拟「本机数据没了」，不碰磁盘文件。
+     *
+     * Windows 上做种中的文件被 libtorrent 占着句柄、删不掉，所以「文件没了 → 移出做种集合」这条只能用
+     * 最近的同源路径证明：降级动作（GroupRuntime.demote）是同一段代码。反射取 BtSession —— core 没有把
+     * 这个动作暴露成公开 API，harness 一贯用反射（见 Probe）。
+     */
+    static boolean detachTorrent(Object kernel, String fileId) {
+        try {
+            Object bt = kernelField(kernel, "bt");
+            java.lang.reflect.Method m = bt.getClass().getMethod("removeTorrent", String.class);
+            return Boolean.TRUE.equals(m.invoke(bt, fileId));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static Object kernelField(Object target, String name) throws Exception {
+        Class<?> c = target.getClass();
+        while (c != null && c != Object.class) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(target);
+            } catch (NoSuchFieldException e) {
+                c = c.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException(name);
+    }
+
+    /** 重启后从 state.json 恢复出来的那个群；恢复不出来就当场 FAIL，不静默跳过。 */
+    static GroupRuntime firstGroup(M1Kernel kernel, String role) {
+        if (kernel.groups().isEmpty()) {
+            fail(role, "no_group_after_restart");
+        }
+        return kernel.groups().get(0);
     }
 
     static int optInt(Map<String, String> opts, String key, int def) {

@@ -11,8 +11,17 @@ import app.huchuan.core.m1.InviteCode;
 import app.huchuan.core.m1.J;
 import app.huchuan.core.m1.Json;
 import app.huchuan.core.m1.JsonParseException;
+import app.huchuan.core.m1.EntryCheck;
 import app.huchuan.core.m1.MemberNameMsg;
+import app.huchuan.core.m1.OpRecord;
+import app.huchuan.core.m1.PeerAnnounceMsg;
+import app.huchuan.core.m1.Proto;
+import app.huchuan.core.m1.PubRegistry;
+import app.huchuan.core.m1.ReadCursor;
+import app.huchuan.core.m1.SeedRestore;
+import app.huchuan.core.m1.SeedingLedger;
 import app.huchuan.core.m1.SignBytes;
+import app.huchuan.core.m1.Unread;
 
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
@@ -42,6 +51,10 @@ public final class SelfTest {
             inviteCode();
             identity();
             joinAndFileSigning();
+            creatorEntryVerification();
+            peerAnnounceFields();
+            unreadCursor();
+            seedingLedger();
             signBytes();
             json();
             framing();
@@ -326,6 +339,231 @@ public final class SelfTest {
             tooLarge = true;
         }
         check("framing.max_65536_enforced", tooLarge);
+    }
+
+    // ---------------------------------------------------------------- 创建者验自己的条目（缺陷回归）
+
+    /**
+     * 「创建者能验自己的条目」——M1 的缺陷回归断言。
+     *
+     * 缺陷现场：createGroup 只把公钥写进成员表、没写进公钥库，于是同一个进程里，别人把创建者发布的
+     * 条目从 file.list 回传时，创建者按 addedBy 取不到公钥，全按 reason=no_pub 丢掉
+     * （证据 artifacts/m1/log-catchup-a.log，232 条）。
+     *
+     * 这里钉的是修好之后必须成立的两件事，用生产代码（PubRegistry + EntryCheck）而不是重写一遍逻辑：
+     *   1. 创建者把自己的 pub64 登记进库后，自己签的 file1 条目必须验得过；
+     *   2. 没登记时 reason 必须是 no_pub —— 也就是原缺陷的确切症状，防止有人把验签放宽成「找不到公钥就放过」。
+     */
+    private static void creatorEntryVerification() {
+        DeviceIdentity creator = DeviceIdentity.Companion.generate();
+        PubRegistry registry = new PubRegistry();
+        FileEntry unsigned = new FileEntry(
+                "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
+                "创建者自己发的文件.bin",
+                1048576L,
+                65536,
+                creator.getDeviceId(),
+                1762381400000L,
+                "magnet:?xt=urn:btih:c0ffee00",
+                "",
+                "");
+        String sig = creator.sign(Domains.FILE, unsigned.signFields());
+        FileEntry signed = new FileEntry(
+                unsigned.getFileId(), unsigned.getName(), unsigned.getSize(), unsigned.getPieceSize(),
+                unsigned.getAddedBy(), unsigned.getAddedAt(), unsigned.getMagnet(), unsigned.getTorrent(), sig);
+
+        // 没登记 = 原缺陷：条目好端端的，就是没人认得作者的公钥
+        check("creator.unregistered_entry_is_no_pub",
+                "no_pub".equals(EntryCheck.INSTANCE.reason(registry.of(creator.getDeviceId()), signed)));
+
+        // createGroup 现在做的就是这一句
+        check("creator.self_pub_register_changed", registry.register(creator.getDeviceId(), creator.getPub64()));
+        check("creator.self_pub_idempotent", !registry.register(creator.getDeviceId(), creator.getPub64()));
+        check("creator.self_entry_verifies",
+                EntryCheck.INSTANCE.accepts(registry.of(creator.getDeviceId()), signed));
+        check("creator.self_entry_reason_empty",
+                "".equals(EntryCheck.INSTANCE.reason(registry.of(creator.getDeviceId()), signed)));
+
+        // 换一把钥匙仍然必须拒：修的是「取不到公钥」，不是放宽验签
+        DeviceIdentity other = DeviceIdentity.Companion.generate();
+        check("creator.other_key_entry_bad_sig",
+                "bad_sig".equals(EntryCheck.INSTANCE.reason(other.getPub64(), signed)));
+
+        // 条目的 sig 被清掉时必须报 no_sig（file.list 的原样携带要求）
+        FileEntry noSig = new FileEntry(
+                signed.getFileId(), signed.getName(), signed.getSize(), signed.getPieceSize(),
+                signed.getAddedBy(), signed.getAddedAt(), signed.getMagnet(), signed.getTorrent(), "");
+        check("creator.entry_without_sig_no_sig",
+                "no_sig".equals(EntryCheck.INSTANCE.reason(creator.getPub64(), noSig)));
+    }
+
+    // ---------------------------------------------------------------- peer.announce 补的两个字段（G3）
+
+    /**
+     * 协议 §10 的 0x30 只补两个可选字段：plat（android/windows/unknown）与 seeds（自报做种数）。
+     * 三件事必须同时成立，否则两端会静默不认：
+     *   1. JSON 往返保真；2. 缺字段有默认值；3. 认不出的平台归一成 unknown（不拒绝整帧）；
+     *   4. **它们不进 peer1 签名域** —— 只补字段，不改既有签名口径（老实现的 sig 仍然验得过）。
+     */
+    private static void peerAnnounceFields() {
+        String body = "{\"gid\":\"7Q2F9C4M1XZ8KD3V\",\"dev\":\"7Q2F9C4M1XZ8KD3V\",\"btPort\":51413,"
+                + "\"plat\":\"android\",\"seeds\":3,\"ts\":1762381200500,\"sig\":\"1c2d\"}";
+        PeerAnnounceMsg parsed = PeerAnnounceMsg.Companion.fromJson(Json.INSTANCE.parse(body));
+        check("peerannounce.plat_roundtrip", "android".equals(parsed.getPlatform()));
+        check("peerannounce.seeds_roundtrip", parsed.getSeeds() == 3);
+        check("peerannounce.endpoint_unchanged", parsed.getBtPort() == 51413 && "1c2d".equals(parsed.getSig()));
+
+        PeerAnnounceMsg bare = PeerAnnounceMsg.Companion.fromJson(Json.INSTANCE.parse(
+                "{\"gid\":\"7Q2F9C4M1XZ8KD3V\",\"dev\":\"7Q2F9C4M1XZ8KD3V\",\"btPort\":51413,"
+                        + "\"ts\":1762381200500,\"sig\":\"1c2d\"}"));
+        check("peerannounce.missing_plat_is_unknown", "unknown".equals(bare.getPlatform()));
+        check("peerannounce.missing_seeds_is_zero", bare.getSeeds() == 0);
+        check("peerannounce.negative_seeds_clamped",
+                PeerAnnounceMsg.Companion.fromJson(Json.INSTANCE.parse(
+                        "{\"gid\":\"7Q2F9C4M1XZ8KD3V\",\"dev\":\"7Q2F9C4M1XZ8KD3V\",\"btPort\":51413,"
+                                + "\"seeds\":-5,\"ts\":1762381200500,\"sig\":\"1c2d\"}")).getSeeds() == 0);
+
+        check("peerannounce.plat_unknown_value_normalized",
+                "unknown".equals(Proto.INSTANCE.normalizePlatform("Linux")));
+        check("peerannounce.plat_windows_normalized",
+                "windows".equals(Proto.INSTANCE.normalizePlatform("Windows")));
+        check("peerannounce.plat_android_normalized",
+                "android".equals(Proto.INSTANCE.normalizePlatform(" Android ")));
+        String detected = Proto.INSTANCE.detectPlatform();
+        check("proto.platform_detected_one_of_three",
+                "android".equals(detected) || "windows".equals(detected) || "unknown".equals(detected));
+
+        // 签名域不含 plat / seeds：改了这两个字段，signBytes 的字节必须一模一样
+        PeerAnnounceMsg a = new PeerAnnounceMsg("7Q2F9C4M1XZ8KD3V", "7Q2F9C4M1XZ8KD3V", 51413, "",
+                1762381200500L, "", "android", 3);
+        PeerAnnounceMsg b = new PeerAnnounceMsg("7Q2F9C4M1XZ8KD3V", "7Q2F9C4M1XZ8KD3V", 51413, "",
+                1762381200500L, "", "windows", 9);
+        boolean sameFields = true;
+        List<byte[]> fa = a.signFields();
+        List<byte[]> fb = b.signFields();
+        if (fa.size() != fb.size()) {
+            sameFields = false;
+        } else {
+            for (int i = 0; i < fa.size(); i++) {
+                if (!Arrays.equals(fa.get(i), fb.get(i))) sameFields = false;
+            }
+        }
+        check("peerannounce.plat_seeds_outside_signature", sameFields);
+        check("peerannounce.sign_fields_count", fa.size() == 4);
+    }
+
+    // ---------------------------------------------------------------- 未读游标（G4）
+
+    /**
+     * 未读数 G4 的记账口径：游标记「上次读到哪条 op」，未读 = 键严格大于游标的可见 op 条数。
+     * 排序键就是协议 §6 的 (lamport, author 字典序, seq)，所以这里连「同 lamport 不同作者」
+     * 的并列情况一起钉住 —— 顺序错一位，未读数就会差一条。
+     */
+    private static void unreadCursor() {
+        OpRecord op1 = new OpRecord("OP1", "F1", "AAAA", 1L, 10L, 1000L, 0, "", "第一条", "", "sig1");
+        OpRecord op2 = new OpRecord("OP2", "F1", "AAAA", 2L, 11L, 2000L, 0, "", "第二条", "OP1", "sig2");
+        OpRecord op3 = new OpRecord("OP3", "F1", "AAAA", 3L, 12L, 3000L, 0, "", "第三条", "OP2", "sig3");
+        List<OpRecord> ops = new ArrayList<>();
+        ops.add(op1);
+        ops.add(op2);
+        ops.add(op3);
+
+        check("unread.no_cursor_counts_all", Unread.INSTANCE.count(ops, null) == 3);
+        check("unread.zero_cursor_counts_all",
+                Unread.INSTANCE.count(ops, ReadCursor.Companion.getZERO()) == 3);
+
+        ReadCursor afterFirst = ReadCursor.Companion.of(op1);
+        check("unread.after_first_has_two", Unread.INSTANCE.count(ops, afterFirst) == 2);
+        check("unread.after_last_is_zero",
+                Unread.INSTANCE.count(ops, ReadCursor.Companion.of(op3)) == 0);
+        check("unread.newest_is_last_op", ReadCursor.Companion.of(op3).equals(Unread.INSTANCE.newest(ops)));
+        check("unread.empty_newest_is_zero",
+                ReadCursor.Companion.getZERO().equals(Unread.INSTANCE.newest(new ArrayList<>())));
+        check("unread.cursor_is_strictly_greater",
+                Unread.INSTANCE.count(ops, ReadCursor.Companion.of(op2)) == 1);
+
+        // 同 lamport、不同作者：作者字典序决定先后，未读数必须跟着这个全序走
+        OpRecord opX = new OpRecord("OPX", "F1", "AAAA", 4L, 20L, 4000L, 0, "", "x", "OP3", "sigx");
+        OpRecord opY = new OpRecord("OPY", "F1", "BBBB", 1L, 20L, 4001L, 0, "", "y", "", "sigy");
+        List<OpRecord> tied = new ArrayList<>();
+        tied.add(opY);
+        tied.add(opX);
+        check("unread.author_tiebreak_smaller_author_first",
+                ReadCursor.Companion.of(opX).compareTo(ReadCursor.Companion.of(opY)) < 0);
+        check("unread.author_tiebreak_leaves_one", Unread.INSTANCE.count(tied, ReadCursor.Companion.of(opX)) == 1);
+
+        // 游标落盘往返：state.json 里读回来的游标必须还能用
+        ReadCursor back = ReadCursor.Companion.fromJson(Json.INSTANCE.parse(Json.INSTANCE.write(afterFirst.toJson())));
+        check("unread.cursor_json_roundtrip", afterFirst.equals(back));
+        check("unread.cursor_roundtrip_still_counts", Unread.INSTANCE.count(ops, back) == 2);
+    }
+
+    // ---------------------------------------------------------------- 做种集合 + 重启续种（缺陷回归 / G2）
+
+    /**
+     * 缺陷回归 + 重启续种，四件事全部走生产代码（SeedingLedger / SeedRestore，不在这里重写一遍逻辑）：
+     *   ① 下载完成 → 做种数从 0 变 1
+     *   ② 休眠 → 变回 0
+     *   ③ 重启恢复（state.json 里的做种集合）→ 仍是 1
+     *   ④ 文件缺失 → 判定为不恢复（降级为休眠），计数保持 0，不抛异常
+     *
+     * 真机现场（docs/m1-device.md §6-6）：一台设备下载完并且正在做种，自报 seeds=0，P6 上显示「做种 0」。
+     * 根因是 seedingFileCount() 只数 addFile 加进去的那一份、下载完成（markCompleted）不进集合 ——
+     * 完成判定与做种集合是两套口径。①③ 就是原来错的那两格。
+     */
+    private static void seedingLedger() {
+        // GroupRuntime.files 的键集：做种数只数清单里还有的那些
+        List<String> manifest = List.of("F1");
+        SeedingLedger ledger = new SeedingLedger();
+        check("seeding.count_zero_when_nothing_seeding", ledger.count(manifest) == 0);
+
+        // ① 下载完成 → 0 变 1
+        check("seeding.enter_on_download_complete", ledger.enter("F1", "/data/downloads/payload.bin"));
+        check("seeding.count_after_complete_is_1", ledger.count(manifest) == 1);
+        check("seeding.is_seeding_after_complete", ledger.isSeeding("F1"));
+        check("seeding.local_path_kept",
+                "/data/downloads/payload.bin".equals(ledger.localPath("F1")));
+        // 幂等：同一份数据重复完成（重连 / 重复事件）不能把做种数算成两份
+        check("seeding.enter_idempotent",
+                !ledger.enter("F1", "/data/downloads/payload.bin") && ledger.count(manifest) == 1);
+        // 只数清单里还有的：集合里有 F2，清单里没有 F2
+        ledger.enter("F2", "/data/downloads/other.bin");
+        check("seeding.count_only_manifest_entries", ledger.count(manifest) == 1);
+        ledger.leave("F2");
+
+        // ② 休眠 → 变回 0
+        check("seeding.leave_on_hibernate", ledger.leave("F1"));
+        check("seeding.count_after_hibernate_is_0", ledger.count(manifest) == 0);
+        check("seeding.leave_unknown_is_noop", !ledger.leave("F1"));
+
+        // ③ 重启恢复：state.json 里落盘的做种集合在新一轮里重建（GroupRuntime.resumeSeeds 的成功分支）
+        ledger.enter("F1", "/data/downloads/payload.bin");
+        List<kotlin.Pair<String, String>> persisted = ledger.entries();
+        check("seeding.persisted_file_id_and_path",
+                persisted.size() == 1
+                        && "F1".equals(persisted.get(0).getFirst())
+                        && "/data/downloads/payload.bin".equals(persisted.get(0).getSecond()));
+        check("seedrestore.decide_resume",
+                SeedRestore.INSTANCE.decide(true, true, true, true) == SeedRestore.Decision.RESUME);
+        SeedingLedger restarted = new SeedingLedger();
+        check("seeding.restore_after_restart",
+                restarted.enter(persisted.get(0).getFirst(), persisted.get(0).getSecond()));
+        check("seeding.count_after_restart_is_1", restarted.count(manifest) == 1);
+
+        // ④ 文件缺失 → 不恢复（降级为休眠）：计数保持 0，不抛异常
+        SeedRestore.Decision missing = SeedRestore.INSTANCE.decide(true, true, false, false);
+        check("seedrestore.file_missing_is_not_resume",
+                missing == SeedRestore.Decision.FILE_MISSING && !missing.getResume());
+        check("seedrestore.file_missing_reason", "file_missing".equals(missing.getReason()));
+        check("seedrestore.size_mismatch",
+                SeedRestore.INSTANCE.decide(true, true, true, false) == SeedRestore.Decision.SIZE_MISMATCH);
+        check("seedrestore.no_entry",
+                SeedRestore.INSTANCE.decide(false, false, true, true) == SeedRestore.Decision.NO_ENTRY);
+        check("seedrestore.no_torrent",
+                SeedRestore.INSTANCE.decide(true, false, true, true) == SeedRestore.Decision.NO_TORRENT);
+        SeedingLedger afterMissing = new SeedingLedger();
+        check("seeding.count_after_missing_file_is_0",
+                afterMissing.count(manifest) == 0 && afterMissing.isEmpty());
     }
 
     private static J field(J value, String key) {

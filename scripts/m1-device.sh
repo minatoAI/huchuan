@@ -12,12 +12,17 @@
 #
 # 手机侧（app.huchuan）：
 #   P0 自检 → P1 用户名 → P5 只输后 8 位加入 → P3 SAF 选文件做种 → P4 评论/激活/休眠
+#   → 退回 P2 看未读角标 → 进群进文件后角标消失 → P6 成员平台
 # 桌面侧（app/tools/peer/DesktopPeer.java）：
 #   建群 → 等手机加入 → 下载手机共享的文件并比对 SHA-256 → 评论 → 等手机回评论
-#   → 共享 N 个压力文件做种
+#   → 延迟补一条评论（给未读角标用）→ 共享 N 个压力文件做种
 #
 # 断言：邀请码 16 位 / 只输 8 位加入 / 两端 SHA-256 相同 / 评论双向可见 /
-#       dht_nodes=0 / crash 缓冲区 0 条 / 无 Scudo abort。
+#       P2 未读角标出现且进群进文件后消失 / P6 成员平台 / dht_nodes=0 /
+#       crash 缓冲区 0 条 / 无 Scudo abort /
+#       做种计数：对端下载完成转做种后 P6 那一行是「做种 共享数+1」（不是停在共享数）/
+#       重启续种：force-stop 冷启动后 seed_resumed + seed_resume_done resumed=n、
+#       P3 状态仍是「做种中」、P4 激活开关仍为开、P6 本机做种数与重启前一致。
 # 证据：artifacts/m1-device/（截图、ui-dump、logcat、peer 日志、拉回的文件与哈希）
 #
 # 最后一行打印 PASS / FAIL，退出码 0 / 1。
@@ -33,6 +38,12 @@ ACTIVITY=".MainActivity"
 
 STRESS_ROUNDS="${M1_STRESS_ROUNDS:-3}"
 STRESS_MIB="${M1_STRESS_MIB:-128}"
+# 群名两端要一致：桌面端建群用它，手机 P2 上的群行也是它（脚本靠点这行进群）。
+GROUP_NAME="${M1_GROUP_NAME:-真机验收群}"
+# 桌面端在成员表里的名字：java 侧用 name= 传同一个值，P6 的断言靠它在成员行里定位「对端」。
+PEER_NAME="${M1_PEER_NAME:-桌面电脑}"
+# 桌面端补发评论的延迟：从「收到手机回的那条评论」开始算，留出手机返回 P2 的时间。
+ECHO_DELAY_MS="${M1_ECHO_DELAY_MS:-25000}"
 QUICK=0
 
 while [ $# -gt 0 ]; do
@@ -40,7 +51,7 @@ while [ $# -gt 0 ]; do
     --quick) QUICK=1 ;;
     --rounds) shift; STRESS_ROUNDS="${1:-3}" ;;
     --mib) shift; STRESS_MIB="${1:-128}" ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "FATAL: 未知参数 $1" >&2; exit 2 ;;
   esac
   shift
@@ -203,14 +214,19 @@ screenshot() {
   return 0
 }
 
-uidump() {
+# ui-dump 的 XML 落盘路径（路径打给调用方，同时留一份进 artifacts/m1-device/ui-dumps/）。
+# P4 激活开关的 checked 只在 XML 里（devkit 的 --texts 只吐 text/desc），所以要把路径拿出来。
+uidump_path() {
   local name="$1" path
   path="$(artifact_path dks ui-dump --name "$name")"
   if [ -n "$path" ] && [ -f "$path" ]; then
     cp "$path" "$ART/ui-dumps/$(basename "$path")"
   fi
+  printf '%s' "$path"
   return 0
 }
+
+uidump() { uidump_path "$1" >/dev/null; }
 
 # 回到 P3。软键盘开着时第一次返回只会收键盘，所以按到「添加文件」出现为止。
 back_to_group() {
@@ -221,6 +237,53 @@ back_to_group() {
     sleep 1
   done
   return 1
+}
+
+# 回到 P2：「搜索群组」是首页搜索框的占位文案，别的页面没有。
+back_to_home() {
+  local i
+  for i in 1 2 3 4 5; do
+    if see_text "搜索群组" 4000; then return 0; fi
+    sh_ input keyevent KEYCODE_BACK >/dev/null 2>&1
+    sleep 1
+  done
+  return 1
+}
+
+# P2 群行右侧的未读角标文案（spec §3 P2：「{n} 条新消息」）；没有角标时输出空串。
+badge_text() {
+  dks ui-dump --texts 2>/dev/null | grep -o '[0-9]\+ 条新消息' | head -1
+}
+
+# P6 上某个成员那一行的「做种 n」。
+#
+# 参数：$1 = 成员名（headline 文字），$2 = ui-dump --texts 的输出（不给就现抓一次）。
+# 一张 P6 上每个成员占两行文字：name 在高处、supporting 里的「做种 n」紧随其下，
+# 相邻成员之间隔一整行。NODE 行带 center=y，所以按「y 最近的一对」配对，
+# 不依赖成员排序，也不会把「做种 0」错配到上一个成员头上。
+# 找不到该成员（或被 dedupe 掉）时输出空串，由调用方判 FAIL。
+member_seeding() {
+  local who="$1" texts="${2:-}"
+  if [ -z "$texts" ]; then texts="$(dks ui-dump --texts 2>/dev/null)"; fi
+  printf '%s\n' "$texts" | awk -v who="$who" '
+    function value_of(l) { v = l; sub(/^.* value=/, "", v); sub(/ bounds=.*$/, "", v); gsub(/^"|"$/, "", v); return v }
+    function y_of(l,   c) {
+      if (match(l, /center=[0-9]+,[0-9]+/)) { c = substr(l, RSTART, RLENGTH); sub(/^center=[0-9]+,/, "", c); return c + 0 }
+      return -1
+    }
+    /^NODE/ {
+      v = value_of($0); y = y_of($0)
+      if (v == who) { ny[++nn] = y }
+      else if (v ~ /^做种 [0-9]+$/) { m = v; sub(/^做种 /, "", m); sn++; sy[sn] = y; sv[sn] = m + 0 }
+    }
+    END {
+      bestd = 1e9; got = 0
+      for (i = 1; i <= nn; i++) for (j = 1; j <= sn; j++) {
+        d = sy[j] - ny[i]; if (d < 0) d = -d
+        if (d < 100 && d < bestd) { bestd = d; best = sv[j]; got = 1 }
+      }
+      if (got) print best; else print ""
+    }'
 }
 
 # 前台窗口是不是我们的应用
@@ -293,7 +356,7 @@ trap cleanup EXIT
 
 # ------------------------------------------------------------------ 1. 构建
 
-step "1/9 构建"
+step "1/11 构建"
 ( cd "$ROOT" && ./gradlew --console=plain -q :app:assembleDebug :core:jar :core:m1Deps :core:m1Native ) \
   || die "gradle 构建失败"
 APK="$ROOT/app/build/outputs/apk/debug/app-debug.apk"
@@ -321,7 +384,7 @@ chk "apk.selfbuilt_arm64_so" "$([ "$SO_SHA" = "$WANT_SHA" ] && echo 1 || echo 0)
 
 # ------------------------------------------------------------------ 2. 素材
 
-step "2/9 素材与设备准备"
+step "2/11 素材与设备准备"
 PAYLOAD="$ART/payload/m1-payload-32m.bin"
 if [ ! -f "$PAYLOAD" ] || [ "$(stat -c %s "$PAYLOAD" 2>/dev/null)" != "33554432" ]; then
   head -c 33554432 /dev/urandom > "$PAYLOAD" || die "生成 32 MiB 素材失败"
@@ -351,7 +414,7 @@ sh_ wm dismiss-keyguard >/dev/null 2>&1
 
 # ------------------------------------------------------------------ 3. 清场
 
-step "3/9 清场并安装"
+step "3/11 清场并安装"
 # 只清掉本脚本自己的对端（按命令行里的 DesktopPeer 认），不碰机器上别人的 java 进程。
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { $_.CommandLine -like '*DesktopPeer*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >/dev/null 2>&1
 sh_ am force-stop "$PKG" >/dev/null 2>&1
@@ -365,7 +428,7 @@ sh_ "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sd
 
 # ------------------------------------------------------------------ 4. 桌面对端
 
-step "4/9 启动桌面对端"
+step "4/11 启动桌面对端"
 PHONE_IP="$(sh_ "ip -4 addr show wlan0" | grep -o 'inet [0-9.]*' | head -1 | awk '{print $2}')"
 [ -n "$PHONE_IP" ] || die "手机没有 wlan0 IPv4"
 PC_IP="$(node -e '
@@ -400,8 +463,9 @@ if [ "${#STRESS_FILES[@]}" -gt 1 ]; then
 fi
 
 java -Dlibtorrent4j.jni.path="$PEER_NATIVE" -Dfile.encoding=UTF-8 -cp "$PEER_CP" DesktopPeer host \
-  data="$(w "$PEER_DATA")" work="$(w "$ART/desktop")" name="桌面电脑" msg_port=47100 bt_port=51413 \
-  share="$PEER_SHARE" "$PEER_THROTTLE" hold=2400 \
+  data="$(w "$PEER_DATA")" work="$(w "$ART/desktop")" name="$PEER_NAME" msg_port=47100 bt_port=51413 \
+  group_name="$GROUP_NAME" share="$PEER_SHARE" "$PEER_THROTTLE" hold=2400 \
+  echo="from-pc-2" echo_delay_ms="$ECHO_DELAY_MS" \
   > "$PEER_LOG" 2>&1 &
 PEER_PID=$!
 
@@ -433,7 +497,7 @@ fi
 
 # ------------------------------------------------------------------ 5. 启动应用
 
-step "5/9 启动应用并过 P0/P1"
+step "5/11 启动应用并过 P0/P1"
 sh_ am start -n "$PKG/$ACTIVITY" --es huchuan.debug.manual "$PC_IP:$MSG_PORT" 2>&1 | tail -1
 if ! wait_log "app_kernel_ready" 40000; then
   applog | tail -20
@@ -466,7 +530,7 @@ sleep 1
 
 # ------------------------------------------------------------------ 6. 只输后 8 位加入
 
-step "6/9 P5 只输后 8 位加入"
+step "6/11 P5 只输后 8 位加入"
 if ! see_text "邀请码后 8 位" 25000; then
   screenshot "p5-missing"
   die "没进 P5（新群组页）"
@@ -503,7 +567,7 @@ screenshot "p3-group"
 
 # ------------------------------------------------------------------ 7. SAF 共享文件
 
-step "7/9 P3 SAF 选文件 → 做种"
+step "7/11 P3 SAF 选文件 → 做种"
 PAYLOAD_NAME="$(basename "$PAYLOAD")"
 
 # SAF 抽屉有动画：点完「显示根目录」要等抽屉真的展开再点「下载」，
@@ -576,7 +640,7 @@ chk "share.copy_matches_payload" "$([ "$SEED_SHA" = "$PAYLOAD_SHA" ] && echo 1 |
 
 # ------------------------------------------------------------------ 8. 桌面下载 + 评论双向
 
-step "8/9 桌面下载与评论双向"
+step "8/11 桌面下载与评论双向"
 if ! wait_log_peer "PEER download_done" 300000; then
   tail -30 "$PEER_LOG"
   die "桌面端没下载完"
@@ -606,13 +670,74 @@ fi
 chk "comment.android_to_pc" 1 "from-mix-1"
 screenshot "p4-both-comments"
 
-# ------------------------------------------------------------------ 9. 崩溃压力
+# ------------------------------------------------------------------ 9. 未读角标（G4）
+
+step "9/11 未读角标：P2 出数，进群/进文件清零"
+
+# 未读角标只在 P2 上看得到，所以先退回首页；桌面端在这之后才补发评论（echo。
+# 手机不在群组页上时收到的新评论，正是 P2 该显示未读的那种。
+back_to_home || die "回不到 P2（未读角标要停在首页看）"
+if ! wait_log "body=from-pc-2" 180000; then
+  screenshot "p2-no-echo"
+  applog | tail -20
+  die "桌面端没补发评论（echo=from-pc-2，延迟 ${ECHO_DELAY_MS}ms）"
+fi
+if ! see_text "条新消息" 30000; then
+  screenshot "p2-no-badge"
+  uidump "p2-no-badge"
+  die "P2 群行没出现未读角标"
+fi
+BADGE="$(badge_text)"
+BADGE_N="$(printf '%s' "$BADGE" | grep -o '[0-9]*' | head -1)"
+chk "unread.badge_on_p2" "$([ "${BADGE_N:-0}" -ge 1 ] && echo 1 || echo 0)" "${BADGE:-none}"
+screenshot "p2-unread"
+
+# 进群：P3 一进来就 markGroupRead，整群未读清零（spec 的「{n} 条新消息」随之消失）。
+tap "$GROUP_NAME"
+if ! see_text "添加文件" 25000; then
+  screenshot "p3-after-badge"
+  uidump "p3-after-badge"
+  die "点群行没进 P3"
+fi
+CLEARED_GROUP="$(log_field "ui_mark_read scope=group" cleared)"
+chk "unread.marked_on_group_open" "$([ "${CLEARED_GROUP:-0}" -ge 1 ] && echo 1 || echo 0)" "cleared=$CLEARED_GROUP"
+
+# 进文件：P4 打开就 markFileRead，这条文件的游标推到最后一条可见 op。
+if ! see_text "$PAYLOAD_NAME" 20000; then
+  screenshot "p3-no-file"
+  die "P3 上没有 $PAYLOAD_NAME"
+fi
+tap "$PAYLOAD_NAME" exact
+if ! see_text "写评论" 25000; then
+  screenshot "p4-after-badge"
+  uidump "p4-after-badge"
+  die "点文件行没进 P4"
+fi
+MARK_FILE="$(applog | grep -F 'ui_mark_read scope=file' | tail -1)"
+chk "unread.marked_on_file_open" "$(printf '%s' "$MARK_FILE" | grep -q "file_id=$FILE_ID" && echo 1 || echo 0)" "file_id=$FILE_ID"
+
+# 回 P2：角标必须消失。这里的「消失」是内核未读归零的结果，不是界面自己记的账。
+back_to_home || die "回不到 P2"
+if see_text "条新消息" 4000; then
+  screenshot "p2-badge-stuck"
+  uidump "p2-badge-stuck"
+  die "进群与进文件后 P2 角标没消失"
+fi
+LAST_UNREAD="$(log_field "ui_unread" unread)"
+chk "unread.badge_cleared" "$([ "${LAST_UNREAD:-1}" = "0" ] && echo 1 || echo 0)" "kernel unread=$LAST_UNREAD"
+screenshot "p2-read"
+
+# 压力测试的起点是 P3（文件行在这里）。
+tap "$GROUP_NAME"
+see_text "添加文件" 25000 || die "回不到 P3（压力测试起点）"
+
+# ------------------------------------------------------------------ 10. 崩溃压力
 
 if [ "$QUICK" = "1" ]; then
-  step "9/9 崩溃压力（--quick 跳过）"
+  step "10/11 崩溃压力（--quick 跳过）"
   warn "跳过压力测试"
 else
-  step "9/9 崩溃压力 ${STRESS_ROUNDS} x ${STRESS_MIB} MiB（第 2 轮中途取消一次）"
+  step "10/11 崩溃压力 ${STRESS_ROUNDS} x ${STRESS_MIB} MiB（第 2 轮中途取消一次）"
   back_to_group || die "回不到 P3（软键盘/返回栈异常）"
 
   ROUND=1
@@ -692,13 +817,143 @@ else
   done
 fi
 
-# ------------------------------------------------------------------ 10. 断言与证据
+# ------------------------------------------------------------------ 11. 做种计数与重启续种（G2）
 
-step "证据与断言"
-screenshot "final-p4"
+step "11/11 做种计数（P6）与重启续种"
+
+# 对端自报的做种数（协议 §10 peer.announce.seeds）= 它共享出去的文件数 + 下载完成转做种的那个。
+# 缺陷现场（docs/m1-device.md §6-6）：下载完成不进做种集合，对端自报停在共享数，
+# 于是它明明在给本机做种，P6 上却写「做种 0」。这里断言的是 +1 之后的绝对值。
+PEER_DEV="$(grep -o 'device_id=[A-Z0-9]*' "$PEER_LOG" 2>/dev/null | head -1 | cut -d= -f2)"
+PEER_SHARED="$(grep -o 'shared_count n=[0-9]*' "$PEER_LOG" 2>/dev/null | head -1 | cut -d= -f2)"
+PEER_SHARED="${PEER_SHARED:-0}"
+PEER_SEEDS_WANT=$((PEER_SHARED + 1))
+PEER_SEEDS_FIRST="$(applog | grep -F "peer_announce dev=$PEER_DEV" | grep -o 'seeds=[0-9]*' | head -1 | cut -d= -f2)"
+PEER_SEEDS_LAST="$(applog | grep -F "peer_announce dev=$PEER_DEV" | grep -o 'seeds=[0-9]*' | tail -1 | cut -d= -f2)"
+
+back_to_group || die "回不到 P3（做种计数检查起点）"
+screenshot "final-p3"
 tap "成员（2 人）" >/dev/null 2>&1 || true
+if ! see_text "邀请码" 20000; then
+  screenshot "p6-missing"
+  uidump "p6-missing"
+  die "进不了 P6"
+fi
 sleep 1
 screenshot "final-members"
+P6_TEXTS="$(dks ui-dump --texts 2>/dev/null)"
+
+# P6 的平台列来自 MemberRecord（协议 §10 peer.announce.plat）：本机 android、桌面 windows。
+P6_OK=0
+if printf '%s' "$P6_TEXTS" | grep -q 'value=Android' && printf '%s' "$P6_TEXTS" | grep -q 'value=Windows'; then P6_OK=1; fi
+chk "p6.member_platform" "$P6_OK" "Android + Windows"
+P6_SEEDS="$(printf '%s' "$P6_TEXTS" | grep -c '做种 ' || true)"
+chk "p6.seeding_counts" "$([ "${P6_SEEDS:-0}" -ge 2 ] && echo 1 || echo 0)" "$P6_SEEDS 行"
+
+# (a) 对端那一行：下载完成之后必须比「只有共享文件」时多 1（quick 模式下就是从 0 变 1）。
+PEER_ROW="$(member_seeding "$PEER_NAME" "$P6_TEXTS")"
+chk "p6.peer_seeding_after_download" "$([ -n "$PEER_ROW" ] && [ "$PEER_ROW" = "$PEER_SEEDS_WANT" ] && echo 1 || echo 0)" \
+  "对端[$PEER_NAME]行=做种 ${PEER_ROW:-?}，期望 $PEER_SEEDS_WANT（共享 $PEER_SHARED + 下载完成 1）"
+chk "peer_announce.seeds_after_download" "$([ -n "$PEER_SEEDS_LAST" ] && [ "$PEER_SEEDS_LAST" = "$PEER_SEEDS_WANT" ] && echo 1 || echo 0)" \
+  "对端自报 seeds 首次 ${PEER_SEEDS_FIRST:-?} → 末次 ${PEER_SEEDS_LAST:-?}"
+
+SELF_SEEDS_BEFORE="$(member_seeding "$MODEL" "$P6_TEXTS")"
+chk "p6.self_seeding_row" "$([ -n "$SELF_SEEDS_BEFORE" ] && [ "$SELF_SEEDS_BEFORE" -ge 1 ] 2>/dev/null && echo 1 || echo 0)" \
+  "本机[$MODEL]行=做种 ${SELF_SEEDS_BEFORE:-?}"
+
+# ---------------------------------------------------------------- (b) 杀掉进程后冷启动
+# force-stop 是真的把进程杀掉：不跑收尾、不再写一次 state.json。
+# 重启续种只能靠上一份 state.json，于是「进程死掉」这件事本身就是被测对象。
+KERNEL_READY_BEFORE="$(count_log "app_kernel_ready")"
+RESUME_DONE_BEFORE="$(count_log "seed_resume_done")"
+APP_PID_BEFORE="$(sh_ pidof "$PKG" | tr -d '\r')"
+sh_ am force-stop "$PKG" >/dev/null 2>&1
+sleep 2
+APP_PID_AFTER="$(sh_ pidof "$PKG" | tr -d '\r')"
+chk "restart.process_killed" "$([ -n "$APP_PID_BEFORE" ] && [ -z "$APP_PID_AFTER" ] && echo 1 || echo 0)" \
+  "pid ${APP_PID_BEFORE:-?} → ${APP_PID_AFTER:-无}"
+[ -z "$APP_PID_AFTER" ] || die "force-stop 之后进程还在，这不是冷启动"
+
+sh_ am start -n "$PKG/$ACTIVITY" --es huchuan.debug.manual "$PC_IP:$MSG_PORT" 2>&1 | tail -1
+if ! wait_log_count "app_kernel_ready" $((KERNEL_READY_BEFORE + 1)) 90000; then
+  screenshot "restart-kernel-failed"
+  applog | tail -20
+  die "冷启动后内核没起来"
+fi
+if ! wait_log_count "seed_resume_done" $((RESUME_DONE_BEFORE + 1)) 60000; then
+  screenshot "restart-no-resume"
+  applog | grep -E "seed_|state_loaded" | tail -20
+  die "冷启动后没有 seed_resume_done"
+fi
+RESUMED="$(log_field "seed_resume_done" resumed)"
+SKIPPED="$(log_field "seed_resume_done" skipped)"
+chk "restart.seed_resume_done" "$([ "${RESUMED:-0}" -ge 1 ] 2>/dev/null && [ "${SKIPPED:-1}" = "0" ] && echo 1 || echo 0)" \
+  "seed_resume_done resumed=${RESUMED:-?} skipped=${SKIPPED:-?}"
+chk "restart.seed_resumed_logged" "$(applog | grep -F 'seed_resumed' | grep -qF "file_id=$FILE_ID" && echo 1 || echo 0)" \
+  "seed_resumed file_id=$FILE_ID"
+
+# force-stop 不会收起输入法，冷启动时键盘可能还盖着半屏；先按 ESC 收掉，截图才是干净的一页。
+sh_ input keyevent 111 >/dev/null 2>&1 || true
+sleep 1
+
+# 进群：用户名已经存过，P0 自检过完会直接落到 P2；点群行进 P3。
+if ! see_text "搜索群组" 120000; then
+  screenshot "restart-p2-missing"
+  uidump "restart-p2-missing"
+  die "冷启动后没进 P2"
+fi
+screenshot "restart-p2"
+tap "$GROUP_NAME"
+if ! see_text "添加文件" 30000; then
+  screenshot "restart-p3-missing"
+  uidump "restart-p3-missing"
+  die "冷启动后进不了 P3"
+fi
+sleep 1
+screenshot "restart-p3"
+P3_TEXTS="$(dks ui-dump --texts 2>/dev/null)"
+chk "restart.p3_chip_seeding" "$(printf '%s' "$P3_TEXTS" | grep -q 'value=做种中' && echo 1 || echo 0)" \
+  "P3 状态仍是做种中（读 localRole，不再靠盘上有没有文件推测）"
+
+# P4 的开关同理由内核状态驱动：做种中 → 开。UI 上 Switch 的 checked 只有 XML 里有。
+if ! see_text "$PAYLOAD_NAME" 20000; then
+  screenshot "restart-p3-no-file"
+  die "重启后 P3 上没有 $PAYLOAD_NAME"
+fi
+tap "$PAYLOAD_NAME" exact
+if ! see_text "写评论" 25000; then
+  screenshot "restart-p4-missing"
+  uidump "restart-p4-missing"
+  die "重启后点文件行进不了 P4"
+fi
+P4_XML="$(uidump_path "restart-p4")"
+P4_SWITCH=""
+if [ -n "$P4_XML" ] && [ -f "$P4_XML" ]; then
+  P4_SWITCH="$(tr '<' '\n' < "$P4_XML" | grep -o 'checkable="true" checked="[a-z]*"' | head -1 | sed 's/.*checked="//;s/"//')"
+fi
+chk "restart.p4_switch_on" "$([ "$P4_SWITCH" = "true" ] && echo 1 || echo 0)" "P4 激活开关 checked=${P4_SWITCH:-none}"
+screenshot "restart-p4"
+
+# 回 P6：本机那一行的做种数与重启前一致（quick 模式下就是 1）。
+back_to_group || die "回不到 P3（重启后续种检查）"
+tap "成员（2 人）" >/dev/null 2>&1 || true
+if ! see_text "邀请码" 20000; then
+  screenshot "restart-p6-missing"
+  uidump "restart-p6-missing"
+  die "重启后进不了 P6"
+fi
+sleep 1
+screenshot "restart-members"
+P6_TEXTS_AFTER="$(dks ui-dump --texts 2>/dev/null)"
+SELF_SEEDS_AFTER="$(member_seeding "$MODEL" "$P6_TEXTS_AFTER")"
+chk "restart.self_seeding_kept" "$([ -n "$SELF_SEEDS_AFTER" ] && [ "$SELF_SEEDS_AFTER" = "$SELF_SEEDS_BEFORE" ] && echo 1 || echo 0)" \
+  "本机做种数 重启前 ${SELF_SEEDS_BEFORE:-?} → 重启后 ${SELF_SEEDS_AFTER:-?}"
+
+# ------------------------------------------------------------------ 12. 断言与证据
+
+step "证据与断言"
+back_to_group || warn "回不到 P3（最后一屏可能不是 P3）"
+screenshot "final-p3"
 
 applog > "$ART/logs/app-logcat.log"
 "$ADB" -s "$SERIAL" logcat -d -v brief > "$ART/logs/full-logcat.log" 2>/dev/null
@@ -743,7 +998,7 @@ say "peer      : $PEER_LOG"
 say "screenshots: $ART/screenshots/"
 say "pulled    : $ART/pulled/"
 say "关键日志行："
-grep -hE "event=(app_kernel_ready|join_input|join_via|group_joined|share_import|file_seeding|download_start|file_stopped|ui_file_completed|ui_op_received)" \
+grep -hE "event=(app_kernel_ready|join_input|join_via|group_joined|share_import|file_seeding|download_start|file_stopped|seed_resumed|seed_resume_done|ui_file_completed|ui_op_received)" \
   "$ART/logs/app-logcat.log" 2>/dev/null | sed 's/^/  /' | head -30
 say "桌面关键行："
 grep -hE "PEER (ready|peer_joined|file_seen|download_done|comment_sent|op_received|reply_seen|share )" \

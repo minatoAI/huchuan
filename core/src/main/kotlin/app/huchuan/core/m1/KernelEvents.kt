@@ -24,6 +24,14 @@ abstract class KernelEvents {
 
     /** 收到并入库一条他人的评论。 */
     open fun opReceived(group: GroupRuntime, op: OpRecord) {}
+
+    /**
+     * 群被移出本机（退群 / 解散，缺口 G1 的 [M1Kernel.removeGroup]）。
+     *
+     * 回调发生在链接已关闭、密钥已抹掉、本地库已重写之后；[group] 只在这次回调里可用，
+     * 宿主不要留着它去做网络操作。幂等：同一个群只会回调一次。
+     */
+    open fun groupRemoved(group: GroupRuntime) {}
 }
 
 /** 加入流程的共享状态：一次 joinByTail8 只对应一个，候选之间逐个重试。 */

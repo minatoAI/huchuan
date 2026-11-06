@@ -80,6 +80,22 @@ class OpLog(
         return list.filter { it.kind != 2 && !hidden.contains(it.opId) }
     }
 
+    /**
+     * 所有文件各自可见的 op，一次排序搞定（未读总数用；逐个文件调 [visible] 会把整份日志重排 N 遍）。
+     * 墓碑（kind=2）与被墓碑指向的 op 都不出现，口径与 [visible] 完全一致。
+     */
+    fun visibleByFile(): Map<String, List<OpRecord>> = synchronized(lock) {
+        val list = all()
+        val hidden = HashSet<String>()
+        for (op in list) if (op.kind == 2 && op.parent.isNotEmpty()) hidden.add(op.parent)
+        val out = LinkedHashMap<String, MutableList<OpRecord>>()
+        for (op in list) {
+            if (op.kind == 2 || hidden.contains(op.opId)) continue
+            out.getOrPut(op.fileId) { ArrayList() }.add(op)
+        }
+        out
+    }
+
     fun byId(opId: String): OpRecord? = synchronized(lock) { ops[opId] }
 
     fun maxSeqOf(author: String): Long = synchronized(lock) {
@@ -171,5 +187,66 @@ class OpLog(
     companion object {
         const val PENDING_TTL_MS = 10L * 60 * 1000
         const val MAX_PENDING_PER_AUTHOR = 512
+    }
+}
+
+/**
+ * 「上次读到哪条 op」的游标（未读数 G4 的记账口径）。
+ *
+ * 键就是协议 §6 的唯一排序口径 (lamport, author 字典序, seq)，不是自增计数也不是时间戳：
+ * 用键比较，重连补齐、乱序到达、同一条 op 重复广播都不会把未读数算错，也不需要为每条 op
+ * 单独记「读过没读过」。
+ *
+ * 方向：游标指向「最后一条读过的 op」。unread = 当前可见 op 里键**严格大于**游标的条数。
+ * [ZERO] 表示「一条都没读过」，此时全部 op 都是未读。
+ */
+data class ReadCursor(val lamport: Long, val author: String, val seq: Long) : Comparable<ReadCursor> {
+
+    override fun compareTo(other: ReadCursor): Int {
+        if (lamport != other.lamport) return lamport.compareTo(other.lamport)
+        val byAuthor = author.compareTo(other.author)
+        if (byAuthor != 0) return byAuthor
+        return seq.compareTo(other.seq)
+    }
+
+    fun toJson(): J.Obj = jobj(
+        "lamport" to jnum(lamport),
+        "author" to jstr(author),
+        "seq" to jnum(seq),
+    )
+
+    companion object {
+        val ZERO = ReadCursor(0L, "", 0L)
+
+        fun of(op: OpRecord): ReadCursor = ReadCursor(op.lamport, op.author, op.seq)
+
+        fun fromJson(o: J): ReadCursor = ReadCursor(
+            lamport = o.num("lamport") ?: 0L,
+            author = o.str("author") ?: "",
+            seq = o.num("seq") ?: 0L,
+        )
+
+        fun max(a: ReadCursor, b: ReadCursor): ReadCursor = if (a >= b) a else b
+    }
+}
+
+/** 未读数的纯函数实现：输入是某个文件的可见 op 列表与该文件的读游标，与存储/网络无关。 */
+object Unread {
+
+    /** 键严格大于 [cursor] 的 op 条数；cursor 为 null 等于「一条都没读过」。 */
+    fun count(ops: List<OpRecord>, cursor: ReadCursor?): Int {
+        if (cursor == null || cursor == ReadCursor.ZERO) return ops.size
+        var unread = 0
+        for (op in ops) {
+            if (ReadCursor.of(op) > cursor) unread++
+        }
+        return unread
+    }
+
+    /** 清零用：把游标推到这批 op 里最新的那一条。空列表返回 [ReadCursor.ZERO]。 */
+    fun newest(ops: List<OpRecord>): ReadCursor {
+        var newest = ReadCursor.ZERO
+        for (op in ops) newest = ReadCursor.max(newest, ReadCursor.of(op))
+        return newest
     }
 }
