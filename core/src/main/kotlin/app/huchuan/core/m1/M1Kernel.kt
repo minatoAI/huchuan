@@ -346,6 +346,19 @@ class M1Kernel @JvmOverloads constructor(
     internal fun publicCachedTorrent(fileId: String): File? =
         if (this::publicBt.isInitialized) publicBt.cachedTorrent(fileId) else null
 
+    /**
+     * 公开会话里某个 torrent 的 .torrent 字节（发布 / 磁力导入都会落到
+     * `<data>/public/meta/<infohash>.torrent`）。没有缓存或读失败返回 null。
+     *
+     * 诊断与验收读口：发布之后用它解析 TorrentInfo，断言 private=0、infohash 与磁力一致，
+     * 不必去翻 `<data>/public/meta` 的具体路径。
+     */
+    fun publicTorrentBytes(fileId: String): ByteArray? = try {
+        publicCachedTorrent(fileId)?.readBytes()
+    } catch (e: Throwable) {
+        null
+    }
+
     /** 公开会话的落盘目录（`<data>/public/data`）；会话还没建好时按同一约定算。 */
     internal fun publicDataDir(): File =
         if (this::publicBt.isInitialized) publicBt.dataDir else File(File(dataDir, PUBLIC_DIR), "data")
@@ -484,6 +497,255 @@ class M1Kernel @JvmOverloads constructor(
             ),
         )
         return result.copy(entry = entry)
+    }
+
+    /**
+     * 「公开到群外」（public-swarm §6.1）：把一个本机正在做种的私有文件**另建**为 private=0 的
+     * v1 公开种子，加入公开会话并广播一条新的 public 条目。原私有条目原样保留 —— 两条 infohash
+     * 不同（private 位写在 info 字典里，BEP 27），所以这是新建种子，不是改标记。
+     *
+     * 校验（失败全部走 [PublicPublishResult.reason]，不抛异常）：
+     *  - 群存在、fileId 在本群清单里，且是本机还没公开过的私有条目；
+     *  - 本机做种集合里有它的落盘路径，文件在、大小与条目一致（「本机有完整文件」）；
+     *  - 公开会话能起来并接受这个种子。
+     *
+     * 幂等：同一个私有 fileId 第二次调用直接返回已有的公开条目，不重新建种、不重复广播。
+     * 建好的 .torrent 会写进 `<data>/public/meta/<pub_infohash>.torrent`，重启续种直接用它。
+     */
+    @JvmOverloads
+    fun publishPublic(
+        groupId: String,
+        fileId: String,
+        opts: PublicPublishOptions = PublicPublishOptions(),
+    ): PublicPublishResult {
+        val group = group(groupId)
+            ?: return publishFailure(groupId, fileId, PublicPublishResult.NO_GROUP)
+        val entry = group.file(fileId)
+            ?: return publishFailure(groupId, fileId, PublicPublishResult.NO_FILE)
+
+        // 幂等快路径：原始私有 id 已经发布过；也接受把公开条目的 fileId 传进来（重试 / 宿主幂等调用）。
+        val existing = group.publishedEntryOf(fileId)
+            ?: if (entry.scope == FileScope.PUBLIC && group.sourceOfPublic(fileId) != null) {
+                group.file(fileId)
+            } else {
+                null
+            }
+        if (existing != null && existing.scope == FileScope.PUBLIC) {
+            // 宿主可能拿公开 id 重试：回显原私有 id，日志与结果都按「私有 → 公开」这一对来写。
+            val sourceId = group.sourceOfPublic(existing.fileId) ?: fileId
+            group.broadcastPeerAnnounce(null)
+            events.log(
+                "public_publish",
+                mapOf(
+                    "gid" to groupId,
+                    "file_id" to sourceId,
+                    "pub_infohash" to existing.fileId,
+                    "name" to existing.name,
+                    "size" to existing.size.toString(),
+                    "piece_size" to existing.pieceSize.toString(),
+                    "magnet" to existing.magnet,
+                    "reused" to "true",
+                ),
+            )
+            return PublicPublishResult(
+                ok = true,
+                fileId = existing.fileId,
+                privateFileId = sourceId,
+                reason = PublicPublishResult.OK,
+                message = "",
+                entry = existing,
+                magnet = existing.magnet,
+            )
+        }
+        if (entry.scope == FileScope.PUBLIC) {
+            return publishFailure(groupId, fileId, PublicPublishResult.ALREADY_PUBLIC)
+        }
+
+        // 「本机有完整文件」：做种集合记着路径（本机共享 / 下载完成都进集合），会话里还有落盘路径兜底。
+        // 刚下完、完成巡查还没把它挪进做种集合的那 200 ms 里，isComplete 已经是真 —— 也放行。
+        val role = group.localRole(fileId)
+        val complete = when (role) {
+            GroupRuntime.LocalRole.SEEDING -> true
+            GroupRuntime.LocalRole.DOWNLOADING -> group.isComplete(fileId)
+            else -> false
+        }
+        if (!complete) {
+            val reason = if (role == GroupRuntime.LocalRole.DOWNLOADING) {
+                PublicPublishResult.INCOMPLETE
+            } else {
+                PublicPublishResult.NOT_SEEDING
+            }
+            return publishFailure(groupId, fileId, reason)
+        }
+        val localSeedPath = group.localSeedPath(fileId)
+        val localFile = if (localSeedPath.isNotEmpty()) {
+            File(localSeedPath)
+        } else {
+            group.savedFile(fileId)
+        } ?: return publishFailure(groupId, fileId, PublicPublishResult.LOCAL_FILE_MISSING)
+        if (!localFile.isFile) {
+            return publishFailure(groupId, fileId, PublicPublishResult.LOCAL_FILE_MISSING)
+        }
+        if (localFile.length() != entry.size) {
+            return publishFailure(groupId, fileId, PublicPublishResult.SIZE_MISMATCH)
+        }
+
+        // 内容不变，只把 private 位翻成 0：piece size 规则与私有建种共用 TorrentBuild / BtSession.pieceSizeFor。
+        val built = try {
+            TorrentBuild.v1(localFile, privateTorrent = false, comment = "huchuan public v1")
+        } catch (e: Throwable) {
+            events.log(
+                "public_publish_error",
+                mapOf("gid" to groupId, "file_id" to fileId, "error" to e.toString()),
+            )
+            return publishFailure(groupId, fileId, PublicPublishResult.BUILD_FAILED)
+        }
+        if (built.fileId == entry.fileId) {
+            return publishFailure(groupId, fileId, PublicPublishResult.HASH_COLLISION, built.fileId)
+        }
+
+        val pub = ensurePublicSession()
+            ?: return publishFailure(groupId, fileId, PublicPublishResult.SESSION_ERROR, built.fileId)
+        val saveDir = localFile.parentFile ?: pub.dataDir
+        // SEED_MODE：刚建完种，数据已知完好（私有侧刚校验 / 共享过），免掉 libtorrent 的二次全量哈希（§6.1）。
+        // TorrentInfo 构造与加种都不许把异常抛给宿主：公开会话失败只是一个结果码（内核其余功能照旧）。
+        val added = try {
+            pub.addTorrent(org.libtorrent4j.TorrentInfo(built.torrentBytes), saveDir, true)
+        } catch (e: Throwable) {
+            events.log(
+                "public_publish_error",
+                mapOf(
+                    "gid" to groupId,
+                    "file_id" to fileId,
+                    "pub_infohash" to built.fileId,
+                    "error" to e.toString(),
+                ),
+            )
+            false
+        }
+        if (!added) {
+            // 会话是这一次 ensure 起来的，加种失败后不该留下一个空转的 DHT 会话（按需启停，§7.1）。
+            maybeStopPublicSession()
+            return publishFailure(groupId, fileId, PublicPublishResult.SESSION_ERROR, built.fileId)
+        }
+        val cachePath = pub.cacheTorrent(built.fileId, built.torrentBytes)
+
+        val name = opts.name.trim().takeIf { it.isNotEmpty() } ?: entry.name.ifEmpty { built.name }
+        val magnet = Proto.magnet(built.fileId, name, built.size)
+        val publicEntry = group.addPublicEntry(
+            fileId = built.fileId,
+            magnet = magnet,
+            name = name,
+            size = built.size,
+            pieceSize = built.pieceSize,
+        )
+        // addPublicEntry 只在「同 infohash 已是私有条目」（裁决 5：只留 private）时 DROP；正常情况下
+        // 不会发生（private 位已经让两个 infohash 不同）。真发生了就把刚加的公开 torrent 摘掉。
+        if (publicEntry.scope != FileScope.PUBLIC || publicEntry.fileId != built.fileId) {
+            pub.removeTorrent(built.fileId)
+            maybeStopPublicSession()
+            return publishFailure(groupId, fileId, PublicPublishResult.HASH_COLLISION, built.fileId)
+        }
+
+        group.markPublicSeed(built.fileId, localFile.absolutePath)
+        group.rememberPublished(entry.fileId, built.fileId)
+        group.broadcastPeerAnnounce(null)
+        saveState()
+        events.log(
+            "public_publish",
+            mapOf(
+                "gid" to groupId,
+                "file_id" to entry.fileId,
+                "pub_infohash" to built.fileId,
+                "name" to name,
+                "size" to built.size.toString(),
+                "piece_size" to built.pieceSize.toString(),
+                "magnet" to magnet,
+                "torrent_path" to cachePath,
+                "torrents" to pub.torrentCount().toString(),
+                "reused" to "false",
+            ),
+        )
+        return PublicPublishResult(
+            ok = true,
+            fileId = built.fileId,
+            privateFileId = entry.fileId,
+            reason = PublicPublishResult.OK,
+            message = "",
+            entry = publicEntry,
+            magnet = publicEntry.magnet.ifEmpty { magnet },
+        )
+    }
+
+    /**
+     * 取消「公开到群外」：停掉公开会话里的该 torrent、把公开条目从本机清单移除（本地隐藏），
+     * 不广播删除、不删磁盘文件（public-swarm §5.2 的移除语义）。私有条目不受影响。
+     *
+     * [fileId] 既可以是公开条目的 infohash，也可以是当初 [publishPublic] 传入的私有 fileId。
+     * 返回 true = 这次真的移除了公开条目；群 / 条目不存在、或传的是私有条目时返回 false。
+     */
+    fun unpublishPublic(groupId: String, fileId: String): Boolean {
+        val group = group(groupId) ?: run {
+            events.log(
+                "public_unpublish_rejected",
+                mapOf("gid" to groupId, "file_id" to fileId, "reason" to "no_group"),
+            )
+            return false
+        }
+        val entry = group.publicEntryOf(fileId) ?: run {
+            events.log(
+                "public_unpublish_rejected",
+                mapOf("gid" to groupId, "file_id" to fileId, "reason" to "not_public"),
+            )
+            return false
+        }
+        if (entry.scope != FileScope.PUBLIC) {
+            events.log(
+                "public_unpublish_rejected",
+                mapOf("gid" to groupId, "file_id" to fileId, "reason" to "not_public"),
+            )
+            return false
+        }
+        val wasActive = group.localRole(entry.fileId) != GroupRuntime.LocalRole.NONE
+        // 无条件摘一次：公开条目可能在「激活」之前就挂在会话里找源，不摘的话移除之后还在后台跑。
+        group.stopFile(entry.fileId)
+        val removed = group.hideLocally(entry.fileId) != null
+        saveState()
+        events.log(
+            "public_unpublish",
+            mapOf(
+                "gid" to groupId,
+                "file_id" to entry.fileId,
+                "pub_infohash" to entry.fileId,
+                "was_active" to wasActive.toString(),
+                "removed" to removed.toString(),
+            ),
+        )
+        return removed
+    }
+
+    /** 失败结果 + 一条可 grep 的 `public_publish_rejected` 日志（永不上抛）。 */
+    private fun publishFailure(
+        groupId: String,
+        fileId: String,
+        reason: String,
+        pubInfohash: String = "",
+    ): PublicPublishResult {
+        val fields = LinkedHashMap<String, String>()
+        fields["gid"] = groupId
+        fields["file_id"] = fileId
+        if (pubInfohash.isNotEmpty()) fields["pub_infohash"] = pubInfohash
+        fields["reason"] = reason
+        events.log("public_publish_rejected", fields)
+        return PublicPublishResult(
+            ok = false,
+            fileId = fileId,
+            privateFileId = fileId,
+            reason = reason,
+            message = PublicPublishResult.messageFor(reason),
+            entry = null,
+            magnet = "",
+        )
     }
 
     /** 起公开会话（幂等）。失败只记日志、返回 null —— 公开功能缺席，其余内核功能照旧。 */
@@ -1099,9 +1361,20 @@ class M1Kernel @JvmOverloads constructor(
                     val dev = mo.str("dev") ?: continue
                     rt.addMember(dev, mo.str("name") ?: "", mo.num("nameSeq") ?: 0L, mo.str("pub") ?: "")
                 }
+                // 本地移除（public-swarm §5.2）：隐藏集合必须先于 files 恢复，否则被移除的条目会先入库、
+                // 再被隐藏标记「晾」在清单里（restoreFile 只对后恢复的条目生效）。
+                for (h in o.arr("hidden") ?: emptyList()) {
+                    val hs = h as? J.Str ?: continue
+                    rt.restoreHidden(hs.value)
+                }
                 for (f in o.arr("files") ?: emptyList()) {
                     val fo = f as? J.Obj ?: continue
                     try { rt.restoreFile(FileEntry.fromJson(fo)) } catch (_: Exception) {}
+                }
+                // 「私有 → 公开」发布映射（幂等 / 取消公开）：必须在 files 之后，映射指向的条目要先存在。
+                for (p in o.arr("published") ?: emptyList()) {
+                    val po = p as? J.Obj ?: continue
+                    rt.restorePublished(po.str("fileId") ?: "", po.str("publicFileId") ?: "")
                 }
                 for (op in o.arr("ops") ?: emptyList()) {
                     val oo = op as? J.Obj ?: continue

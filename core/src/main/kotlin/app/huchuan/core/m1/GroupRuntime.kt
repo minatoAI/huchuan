@@ -77,6 +77,22 @@ class GroupRuntime internal constructor(
     internal val seeding = SeedingLedger()
 
     /**
+     * 本机隐藏的条目（public-swarm §5.2 的「移除」）：只从本机列表消失，不广播、不删磁盘文件。
+     *
+     * `file.add` / `file.list` 再送来同一 fileId 时一律丢弃，否则对端下一轮同步就会把「移除」
+     * 原地复活。隐藏标记跟着群落盘（state.json 的 hidden），重启后仍然隐藏。
+     */
+    internal val hidden = LinkedHashSet<String>()
+
+    /**
+     * 原始私有 fileId → 「公开到群外」新建出来的公开条目 fileId。
+     *
+     * 公开种子是另一个 infohash（private 位在 info 字典里，BEP 27），光看条目无法知道它由谁发布；
+     * 这张表负责幂等（同一私有文件重复发布返回同一条）与「按私有 id 取消公开」。跟着群落盘。
+     */
+    internal val publishedTo = LinkedHashMap<String, String>()
+
+    /**
      * 重启续种的待办：state.json 里记着「上次在做种」的条目（fileId → 本地路径），
      * 等 BT 会话起来后由 [resumeSeeds] 逐条判定，判定通过才进 [seeding]。
      */
@@ -164,6 +180,86 @@ class GroupRuntime internal constructor(
 
     fun file(fileId: String): FileEntry? = synchronized(lock) { files[fileId] }
 
+    /**
+     * 直接按公开条目 id，或按原始私有 id 经发布映射找到的公开条目。
+     *
+     * 「公开到群外」的幂等与取消公开都以它为入口：映射指向的条目被隐藏 / 删除后，映射就地清掉。
+     */
+    internal fun publicEntryOf(fileId: String): FileEntry? = synchronized(lock) {
+        val direct = files[fileId]
+        if (direct != null && direct.scope == FileScope.PUBLIC) return@synchronized direct
+        val pubId = publishedTo[fileId] ?: return@synchronized null
+        val entry = files[pubId]
+        if (entry == null || entry.scope != FileScope.PUBLIC) {
+            publishedTo.remove(fileId)
+            null
+        } else {
+            entry
+        }
+    }
+
+    /** 由某个公开条目反查它的私有来源 fileId；不是本机发布过的公开条目返回 null。 */
+    internal fun sourceOfPublic(publicFileId: String): String? = synchronized(lock) {
+        publishedTo.entries.firstOrNull { it.value == publicFileId }?.key
+    }
+
+    /** 原始私有 fileId 已经发布过，且公开条目还在：返回它（幂等快路径）。 */
+    internal fun publishedEntryOf(privateFileId: String): FileEntry? = synchronized(lock) {
+        val pubId = publishedTo[privateFileId] ?: return@synchronized null
+        val entry = files[pubId]
+        if (entry == null || entry.scope != FileScope.PUBLIC) {
+            publishedTo.remove(privateFileId)
+            null
+        } else {
+            entry
+        }
+    }
+
+    /** 记下「这个私有文件已经公开成哪一条」。 */
+    internal fun rememberPublished(privateFileId: String, publicFileId: String) {
+        if (privateFileId.isEmpty() || publicFileId.isEmpty()) return
+        synchronized(lock) { publishedTo[privateFileId] = publicFileId }
+    }
+
+    /** 本机做种集合里记的落盘路径；不在集合里返回 ""。 */
+    internal fun localSeedPath(fileId: String): String = seeding.localPath(fileId)
+
+    /** 「公开到群外」加种成功之后：公开条目也进本地任务表与做种集合。 */
+    internal fun markPublicSeed(fileId: String, localPath: String) {
+        synchronized(lock) {
+            localTasks.add(fileId)
+            seeding.enter(fileId, localPath)
+            connectedEndpoints.add("seed:" + fileId)
+        }
+    }
+
+    /**
+     * 本地移除（public-swarm §5.2）：条目从本机清单消失、标记为隐藏，磁盘文件不动。
+     * 返回被移除的条目；本来就不在清单里返回 null。
+     */
+    internal fun hideLocally(fileId: String): FileEntry? = synchronized(lock) {
+        val removed = files.remove(fileId)
+        hidden.add(fileId)
+        publishedTo.entries.removeIf { it.value == fileId }
+        readCursors.remove(fileId)
+        completed.remove(fileId)
+        unhealthySeeds.remove(fileId)
+        dials.keys.removeIf { it.startsWith(fileId + "@") }
+        removed
+    }
+
+    /** 载入 state.json 时用：先恢复隐藏集合，再恢复条目（隐藏条目不入库）。 */
+    internal fun restoreHidden(fileId: String) {
+        if (fileId.isEmpty()) return
+        synchronized(lock) { hidden.add(fileId) }
+    }
+
+    /** 载入 state.json 时用。 */
+    internal fun restorePublished(privateFileId: String, publicFileId: String) {
+        if (privateFileId.isEmpty() || publicFileId.isEmpty()) return
+        synchronized(lock) { publishedTo[privateFileId] = publicFileId }
+    }
+
     fun ops(fileId: String?): List<OpRecord> =
         if (fileId == null) oplog.all() else oplog.ofFile(fileId)
 
@@ -202,6 +298,8 @@ class GroupRuntime internal constructor(
         kernel.bt.addSeed(seeded, file.parentFile ?: file.absoluteFile.parentFile, superSeeding)
         synchronized(lock) {
             files[entry.fileId] = signed
+            // 本机主动共享 = 明确的「要它出现在列表里」：旧隐藏标记就地撤销（隐藏只针对本地移除过的同 id）。
+            hidden.remove(entry.fileId)
             localTasks.add(entry.fileId)
             // 共享成功就在做种了：做种集合的唯一来源只有这一处「进」的入口之一（见 SeedingLedger）。
             seeding.enter(entry.fileId, file.absolutePath)
@@ -282,6 +380,8 @@ class GroupRuntime internal constructor(
         val sig = kernel.identity.sign(Domains.FILE, entry.signFields())
         val signed = entry.copy(sig = sig)
         val merged = synchronized(lock) {
+            // 本机主动入库 = 明确的「要它出现在列表里」：撤销同 id 的本地隐藏（重新导入 / 重新发布）。
+            hidden.remove(fileId)
             val result = FileEntryMerge.merge(files[fileId], signed)
             result.entry?.let { files[fileId] = it }
             result
@@ -900,6 +1000,10 @@ class GroupRuntime internal constructor(
             )
             return false
         }
+        // 本地移除过的条目（public-swarm §5.2）：对端再来同一条也不入库，否则「移除」下一轮同步就复活。
+        if (synchronized(lock) { hidden.contains(entry.fileId) }) {
+            return false
+        }
         // 去重口径只有一个实现（FileEntryMerge）：同一 infohash 同时存在 private 与 public 时只留 private。
         val merged = synchronized(lock) {
             val result = FileEntryMerge.merge(files[entry.fileId], entry)
@@ -920,7 +1024,10 @@ class GroupRuntime internal constructor(
     }
 
     internal fun restoreFile(entry: FileEntry) {
-        synchronized(lock) { files[entry.fileId] = entry }
+        synchronized(lock) {
+            // 隐藏集合先于条目恢复（见 M1Kernel.loadState）：移除过的条目重启后也不该复活。
+            if (!hidden.contains(entry.fileId)) files[entry.fileId] = entry
+        }
     }
 
     internal fun restoreOp(op: OpRecord) {
@@ -1248,6 +1355,14 @@ class GroupRuntime internal constructor(
             kernel.events.log("file_add_bad_sig", mapOf("file_id" to entry.fileId))
             return false
         }
+        // 本地移除过的条目（public-swarm §5.2）：广播再来同一条也不入库，否则「移除」会被下一帧复活。
+        if (synchronized(lock) { hidden.contains(entry.fileId) }) {
+            kernel.events.log(
+                "file_add_hidden",
+                mapOf("group_id" to groupId, "file_id" to entry.fileId),
+            )
+            return false
+        }
         // 签名跟着条目一起存：之后转发 file.list 要原样带上它（协议 §7）。
         val stored = entry.copy(sig = sig)
         // 去重口径与 file.list 完全同一处（public-swarm §1.1：同一 infohash 只留 private 那一行）。
@@ -1381,6 +1496,13 @@ class GroupRuntime internal constructor(
                 )
             }),
             "files" to jarr(files.values.map { it.toJson() }),
+            // 本地移除（public-swarm §5.2）：隐藏的 fileId 与「私有 → 公开」发布映射都必须跟着库走。
+            // 少了 hidden，重启后 file.list 会把移除过的公开条目原地复活；少了 published，
+            // 重启后重复点「公开到群外」会再建一次种（幂等失效）。
+            "hidden" to jarr(hidden.map { jstr(it) }),
+            "published" to jarr(publishedTo.map { (fileId, publicFileId) ->
+                jobj("fileId" to jstr(fileId), "publicFileId" to jstr(publicFileId))
+            }),
             "ops" to jarr(oplog.all().map { it.toJson() }),
             "lamport" to jnum(oplog.lamport),
             // 做种集合（缺口 G2 重启续种）：fileId + 本地路径。条目本身在 files 里，这里只记

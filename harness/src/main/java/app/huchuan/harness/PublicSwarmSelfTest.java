@@ -12,6 +12,7 @@ import app.huchuan.core.m1.Json;
 import app.huchuan.core.m1.MagnetLink;
 import app.huchuan.core.m1.PublicBtSession;
 import app.huchuan.core.m1.PublicMagnetResult;
+import app.huchuan.core.m1.PublicPublishResult;
 import app.huchuan.core.m1.SessionRoute;
 
 import org.libtorrent4j.TorrentBuilder;
@@ -35,7 +36,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BiConsumer;
 
 /**
- * 公开种子社区（public-swarm）的内核自检。五组断言，每组都有一个能把它打红的现实缺陷：
+ * 公开种子社区（public-swarm）的内核自检。六组断言，每组都有一个能把它打红的现实缺陷：
  *
  *   1. 会话参数（[sessions]）：公开会话 DHT 开、LSD 关、uTP 开、端口 >= 6881；私有会话 DHT 关。
  *      打红方式：把 PublicBtSession 的 settings 改成和私有会话一样，或者把端口起点改成 51413。
@@ -48,6 +49,9 @@ import java.util.function.BiConsumer;
  *   5. 去重与零迁移（[entries]）：同一 infohash 两种 scope 到达时只留 private，正反两种顺序各一遍；
  *      旧 JSON（没有 scope 字段）读回来是 private，写出时带 scope。打红方式：把 scope 当必填字段，
  *      或者去掉「public 让位 private」那一条。
+ *   6. 公开到群外（[publish]）：私有文件另建 private=0 的新种子（infohash 与私有不同）、磁力 btih
+ *      对齐新 infohash、公开条目出现而私有条目保留、重复调用幂等、unpublish 只移除公开条目。
+ *      打红方式：把 TorrentBuild 的 private 参数传 true，或者让重复调用再建一个 torrent。
  */
 final class PublicSwarmSelfTest {
 
@@ -113,6 +117,7 @@ final class PublicSwarmSelfTest {
             }
         }
         entries(check);
+        publish(check);
         deleteTree(root);
         // 正向证据（可 grep）：这一组断言了几条、红了几条。RESULT=PASS 与它必须同时成立。
         System.out.println("selftest.public checks=" + COUNTS[0] + " failures=" + COUNTS[1]);
@@ -524,6 +529,205 @@ final class PublicSwarmSelfTest {
                         + "\"sig\":\"sig\",\"scope\":\"public\"}"));
         check.accept("public.entry_json_reads_public", publicRestored.getScope() == FileScope.PUBLIC
                 && publicRestored.isPublic() && publicRestored.getSize() == 0L);
+    }
+
+    // ---------------------------------------------------------------- 6. 公开到群外
+
+    /**
+     * `kernel.publishPublic` / `unpublishPublic` 的端到端路径（真起内核 + 真建群 + 真文件）。
+     *
+     * 证伪点：把 TorrentBuild 的 private 参数写成 true —— 新种子的 infohash 会与私有相同，
+     * 磁力 btih / 两条条目 / 公开会话计数一起变红（实测 19 条红）；让幂等快路径失效 ——
+     * 第二次调用的 reused 标志 / 条目数会红；unpublish 改成删磁盘文件 —— file_kept 那条红；
+     * hidden / published 不落盘 —— 两次重启后的三条断言红。
+     */
+    private static void publish(BiConsumer<String, Boolean> check) {
+        File dir = new File(System.getProperty("java.io.tmpdir"), "huchuan-selftest-pubpublish-" + System.nanoTime());
+        dir.mkdirs();
+        List<String> events = new CopyOnWriteArrayList<>();
+        Map<String, String> lastPublish = new ConcurrentHashMap<>();
+        Map<String, String> lastRejected = new ConcurrentHashMap<>();
+        Map<String, String> lastUnpublish = new ConcurrentHashMap<>();
+        M1Kernel kernel = null;
+        try {
+            File payload = new File(dir, "publish-payload.bin");
+            writeRandom(payload, 512 * 1024);
+            KernelEvents sink = new KernelEvents() {
+                @Override
+                public void log(String event, Map<String, String> fields) {
+                    events.add(event);
+                    if ("public_publish".equals(event)) {
+                        lastPublish.putAll(fields);
+                    } else if ("public_publish_rejected".equals(event)) {
+                        lastRejected.putAll(fields);
+                    } else if ("public_unpublish".equals(event)) {
+                        lastUnpublish.putAll(fields);
+                    }
+                }
+            };
+            kernel = new M1Kernel(new File(dir, "data"), "publish-selftest", 47380, 53413, sink);
+            kernel.start();
+            GroupRuntime group = kernel.createGroup("公开到群外自检群");
+            FileEntry priv = group.addFile(payload);
+
+            // 纯函数：每个失败码都有中文文案、都不换行、彼此不同。
+            Set<String> messages = new HashSet<>();
+            boolean allNonEmpty = true;
+            for (String reason : PublicPublishResult.failureReasons()) {
+                String message = PublicPublishResult.messageFor(reason);
+                if (message.isEmpty() || message.indexOf('\n') >= 0) {
+                    allNonEmpty = false;
+                }
+                messages.add(message);
+            }
+            check.accept("public.publish_failure_messages_all_present (" + messages.size() + ")", allNonEmpty);
+            check.accept("public.publish_failure_messages_distinct (" + messages.size() + ")",
+                    messages.size() == PublicPublishResult.failureReasons().length);
+
+            // 失败码：群不存在 / 文件不在群里。都必须是返回值，不抛异常。
+            String gid = group.getGroupId();
+            PublicPublishResult noGroup = kernel.publishPublic("no-such-group", priv.getFileId());
+            check.accept("public.publish_no_group (" + noGroup.getReason() + ")",
+                    PublicPublishResult.NO_GROUP.equals(noGroup.getReason())
+                            && PublicPublishResult.messageFor(noGroup.getReason()).equals(noGroup.getMessage()));
+            PublicPublishResult noFile = kernel.publishPublic(gid, fakeInfoHash(77));
+            check.accept("public.publish_no_file (" + noFile.getReason() + ")",
+                    PublicPublishResult.NO_FILE.equals(noFile.getReason())
+                            && PublicPublishResult.messageFor(noFile.getReason()).equals(noFile.getMessage())
+                            && "no_file".equals(lastRejected.get("reason"))
+                            && events.contains("public_publish_rejected"));
+
+            // 成功：新公开种子 = 新 infohash + 公开会话在做种 + 一条 public 条目。
+            PublicPublishResult first = kernel.publishPublic(gid, priv.getFileId());
+            String pubId = first.getFileId();
+            check.accept("public.publish_ok (" + first.getReason() + ")",
+                    first.getOk() && first.getMessage().isEmpty());
+            check.accept("public.publish_new_infohash", !pubId.isEmpty() && !pubId.equals(priv.getFileId()));
+            MagnetLink magnet = MagnetLink.parse(first.getMagnet());
+            check.accept("public.publish_magnet_btih (magnet=" + first.getMagnet() + ")",
+                    magnet != null && pubId.equals(magnet.getFileId()));
+            check.accept("public.publish_entry_public",
+                    first.getEntry() != null
+                            && first.getEntry().getFileId().equals(pubId)
+                            && first.getEntry().getScope() == FileScope.PUBLIC
+                            && !first.getEntry().getMagnet().isEmpty()
+                            && first.getEntry().getTorrent().isEmpty());
+            check.accept("public.publish_entry_in_group",
+                    group.file(pubId) != null
+                            && group.file(pubId).getScope() == FileScope.PUBLIC);
+            check.accept("public.publish_private_kept",
+                    group.file(priv.getFileId()) != null
+                            && group.file(priv.getFileId()).getScope() == FileScope.PRIVATE
+                            && !group.file(priv.getFileId()).getTorrent().isEmpty());
+            check.accept("public.publish_public_session (torrents=" + kernel.publicTorrentCount() + ")",
+                    kernel.getPublicSessionRunning() && kernel.publicTorrentCount() == 1);
+            check.accept("public.publish_private_session_untouched (torrents=" + kernel.privateTorrentCount() + ")",
+                    kernel.privateTorrentCount() == 1);
+
+            // 新种子本身：private=false、v1、infohash 与目录 / 磁力一致。
+            byte[] pubBytes = kernel.publicTorrentBytes(pubId);
+            check.accept("public.publish_torrent_cached", pubBytes != null && pubBytes.length > 0);
+            TorrentInfo pubInfo = pubBytes == null ? null : new TorrentInfo(pubBytes);
+            check.accept("public.publish_torrent_not_private", pubInfo != null && !pubInfo.isPrivate());
+            check.accept("public.publish_torrent_v1", pubInfo != null && pubInfo.hasV1() && !pubInfo.hasV2());
+            check.accept("public.publish_torrent_hash_matches",
+                    pubInfo != null && pubId.equals(pubInfo.infoHash().toString()));
+            check.accept("public.publish_torrent_size",
+                    pubInfo != null && pubInfo.totalSize() == payload.length());
+
+            // 日志口径：file_id 是原私有条目，pub_infohash 是新公开种子。
+            check.accept("public.publish_log_fields",
+                    priv.getFileId().equals(lastPublish.get("file_id"))
+                            && pubId.equals(lastPublish.get("pub_infohash")));
+            System.out.println("selftest.info public.publish file_id=" + priv.getFileId()
+                    + " pub_infohash=" + pubId
+                    + " magnet=" + first.getMagnet()
+                    + " torrents=" + kernel.publicTorrentCount());
+
+            // 幂等：同一私有 fileId 第二次返回同一条公开条目，不新增条目 / torrent。
+            int filesBefore = group.files().size();
+            int torrentsBefore = kernel.publicTorrentCount();
+            PublicPublishResult again = kernel.publishPublic(gid, priv.getFileId());
+            check.accept("public.publish_idempotent",
+                    again.getOk()
+                            && pubId.equals(again.getFileId())
+                            && group.files().size() == filesBefore
+                            && kernel.publicTorrentCount() == torrentsBefore
+                            && "true".equals(lastPublish.get("reused")));
+            // 把公开条目的 id 传进来同样是幂等的（宿主重试可能拿的是新 id）。
+            PublicPublishResult byPublicId = kernel.publishPublic(gid, pubId);
+            check.accept("public.publish_idempotent_by_public_id",
+                    byPublicId.getOk() && pubId.equals(byPublicId.getFileId())
+                            && kernel.publicTorrentCount() == torrentsBefore);
+
+            // unpublish：公开条目消失、公开 torrent 停掉、私有条目与磁盘文件都不受影响。
+            boolean removed = kernel.unpublishPublic(gid, pubId);
+            check.accept("public.unpublish_removed", removed);
+            check.accept("public.unpublish_entry_gone", group.file(pubId) == null);
+            check.accept("public.unpublish_private_kept",
+                    group.file(priv.getFileId()) != null
+                            && group.file(priv.getFileId()).getScope() == FileScope.PRIVATE
+                            && group.localRole(priv.getFileId()) == GroupRuntime.LocalRole.SEEDING);
+            check.accept("public.unpublish_torrent_stopped",
+                    kernel.publicTorrentCount() == 0 && !kernel.getPublicSessionRunning());
+            check.accept("public.unpublish_file_kept", payload.isFile());
+            check.accept("public.unpublish_log_fields", pubId.equals(lastUnpublish.get("pub_infohash")));
+
+            // 重新发布：隐藏标记不能把同一个文件永久挡住（重新发布仍是同一个公开 infohash）。
+            PublicPublishResult republished = kernel.publishPublic(gid, priv.getFileId());
+            check.accept("public.publish_after_unpublish",
+                    republished.getOk()
+                            && pubId.equals(republished.getFileId())
+                            && group.file(pubId) != null
+                            && kernel.publicTorrentCount() == 1);
+            // 取消公开也接受原始私有 id（经发布映射反查），并且只移除公开条目。
+            check.accept("public.unpublish_by_private_id",
+                    kernel.unpublishPublic(gid, priv.getFileId())
+                            && group.file(pubId) == null
+                            && group.file(priv.getFileId()) != null);
+
+            // 重启后 hidden 仍在：被移除的公开条目不能从 state.json 或对端 file.list 复活。
+            kernel.close();
+            kernel = new M1Kernel(new File(dir, "data"), "publish-selftest", 47380, 53413, sink);
+            kernel.start();
+            GroupRuntime restarted = kernel.group(gid);
+            check.accept("public.publish_restart_hidden_persisted",
+                    restarted != null
+                            && restarted.file(pubId) == null
+                            && restarted.file(priv.getFileId()) != null);
+            // 重新发布：隐藏标记自动撤销，且因为 public infohash 是内容确定的，拿回同一个 pubId。
+            PublicPublishResult afterRestart = kernel.publishPublic(gid, priv.getFileId());
+            check.accept("public.publish_restart_republish",
+                    afterRestart.getOk()
+                            && pubId.equals(afterRestart.getFileId())
+                            && restarted.file(pubId) != null
+                            && kernel.publicTorrentCount() == 1);
+
+            // 再重启一次：published 映射落盘，重复发布走幂等快路径（resumeSeeds 已把公开种挂回来）。
+            kernel.close();
+            kernel = new M1Kernel(new File(dir, "data"), "publish-selftest", 47380, 53413, sink);
+            kernel.start();
+            PublicPublishResult idempotentAfterRestart = kernel.publishPublic(gid, priv.getFileId());
+            check.accept("public.publish_restart_idempotent",
+                    idempotentAfterRestart.getOk()
+                            && pubId.equals(idempotentAfterRestart.getFileId())
+                            && "true".equals(lastPublish.get("reused"))
+                            && kernel.publicTorrentCount() == 1
+                            && kernel.group(gid) != null
+                            && kernel.group(gid).file(priv.getFileId()) != null);
+        } catch (Throwable t) {
+            check.accept("public.publish_exception (" + t + ")", false);
+            t.printStackTrace(System.out);
+        } finally {
+            if (kernel != null) {
+                try {
+                    kernel.close();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            deleteTree(dir);
+        }
     }
 
     // ---------------------------------------------------------------- 工具

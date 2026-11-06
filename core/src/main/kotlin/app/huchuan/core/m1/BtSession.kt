@@ -225,29 +225,13 @@ class BtSession(
      * 建完重新解析一遍再断言，不信任「我设置了」。
      */
     fun createPrivateTorrent(file: File): SeededTorrent {
-        val pieceSize = pieceSizeFor(file.length())
-        val builder = TorrentBuilder()
-            .path(file)
-            .creator("huchuan/1")
-            .comment("huchuan private v1")
-            .setPrivate(true)
-            .flags(TorrentBuilder.V1_ONLY)
-            .pieceSize(pieceSize)
-        check(builder.trackers().isEmpty()) { "builder must not add trackers" }
-        check(builder.nodes().isEmpty()) { "builder must not add DHT nodes" }
-        check(builder.urlSeeds().isEmpty()) { "builder must not add url seeds" }
-        val built = builder.generate()
-        val bytes = built.entry().bencode()
-        val ti = TorrentInfo(bytes)
-        check(ti.isPrivate) { "torrent must be private" }
-        check(ti.totalSize() == file.length()) { "torrent size mismatch" }
-        check(ti.hasV1() && !ti.hasV2()) { "torrent must be v1-only" }
+        val built = TorrentBuild.v1(file, privateTorrent = true, comment = "huchuan private v1")
         return SeededTorrent(
-            fileId = ti.infoHash().toString(),
-            name = ti.name(),
-            size = ti.totalSize(),
-            pieceSize = ti.pieceLength(),
-            torrentBytes = bytes,
+            fileId = built.fileId,
+            name = built.name,
+            size = built.size,
+            pieceSize = built.pieceSize,
+            torrentBytes = built.torrentBytes,
         )
     }
 
@@ -793,5 +777,54 @@ class BtSession(
             while (size / piece > 8192) piece *= 2
             return piece
         }
+    }
+}
+
+/**
+ * v1 种子的唯一构建入口：私有（private=1）与公开（private=0）只差 private 位与注释。
+ *
+ * piece size 规则复用 [BtSession.pieceSizeFor]（协议 §4），不在这里另立一份；
+ * 建完重新解析一遍再断言，不信任「我设置了」—— private 位写错会直接变成隐私事故，
+ * 所以两个方向都必须 check，而不是只在私有侧 check。
+ */
+internal object TorrentBuild {
+
+    class Built(
+        val fileId: String,
+        val name: String,
+        val size: Long,
+        val pieceSize: Int,
+        val torrentBytes: ByteArray,
+    )
+
+    fun v1(file: File, privateTorrent: Boolean, comment: String): Built {
+        val pieceSize = BtSession.pieceSizeFor(file.length())
+        val builder = TorrentBuilder()
+            .path(file)
+            .creator("huchuan/1")
+            .comment(comment)
+            .setPrivate(privateTorrent)
+            .flags(TorrentBuilder.V1_ONLY)
+            .pieceSize(pieceSize)
+        check(builder.trackers().isEmpty()) { "builder must not add trackers" }
+        check(builder.nodes().isEmpty()) { "builder must not add DHT nodes" }
+        check(builder.urlSeeds().isEmpty()) { "builder must not add url seeds" }
+        val built = builder.generate()
+        val bytes = built.entry().bencode()
+        val ti = TorrentInfo(bytes)
+        if (privateTorrent) {
+            check(ti.isPrivate) { "torrent must be private" }
+        } else {
+            check(!ti.isPrivate) { "public torrent must not carry the private flag" }
+        }
+        check(ti.totalSize() == file.length()) { "torrent size mismatch" }
+        check(ti.hasV1() && !ti.hasV2()) { "torrent must be v1-only" }
+        return Built(
+            fileId = ti.infoHash().toString(),
+            name = ti.name(),
+            size = ti.totalSize(),
+            pieceSize = ti.pieceLength(),
+            torrentBytes = bytes,
+        )
     }
 }

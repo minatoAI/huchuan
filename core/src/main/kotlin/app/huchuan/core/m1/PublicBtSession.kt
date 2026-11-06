@@ -598,6 +598,14 @@ class PublicBtSession(
     }
 
     /**
+     * 把一份已经建好的 .torrent 写进 `<data>/public/meta/<infohash>.torrent`，返回路径（失败为 ""）。
+     *
+     * 「公开到群外」与磁力导入共用同一份缓存：发布路径也把种子落盘，重启续种时
+     * [M1Kernel.resumeSeeds] 才能按缓存直接挂回公开会话，不再重拉元数据。
+     */
+    fun cacheTorrent(fileId: String, bytes: ByteArray): String = writeTorrentCache(fileId, bytes)
+
+    /**
      * 后台补元数据到手（磁力导入早超时、torrent 还留在会话里继续找源的那条路）：
      * 落 .torrent 缓存、把任务名按 info 字典修正、通知内核回填条目。告警线程上不碰网络，只碰文件。
      */

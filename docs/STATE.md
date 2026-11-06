@@ -51,10 +51,12 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 
 ## 在飞
 
-- PUB-CORE 内核公开种子会话
-- NOTIFY 群级通知三档
+- PUBLISH 内核「公开到群外」（publishPublic/unpublishPublic）
+- WINPUB Windows Web UI 接公开种子
 
 ## 已完成
+- 崩溃修复 → AlertType 表补洞（真机 filled=105,106,107）+ 公开会话收紧 mask；6 分钟存活、无 FATAL
+- 模拟器评估 → 装好但缺 WHPX/AEHD，需管理员+重启；x86_64 镜像含 ARM 翻译层，但局域网发现过不了 slirp
 - OSS 开源材料 → LICENSE(MIT) + THIRD_PARTY_NOTICES(13 项逐个核实) + README(76 行)
 - TV tracker 接线完整验收 → 47/47 PASS（3m40s）；确认此前 21/2 是单独跑 phase b 的假失败
 - TEAMVERIFY 组队通告真机验证 → MIX 上 9/9 PASS：P3「组队 2 人」、P4「正在组队 · 2 人」、100% 后消失、logcat teammates_changed count=1
