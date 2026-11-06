@@ -1179,9 +1179,17 @@ step "12/12 组队通告（0 态）与限速（P4 单文件 / P7 全局）"
 
 # 组队的两条 0 态断言在 step 9 已经拍过（P3 无 chip、P4 无「正在组队」）。这里补一条日志级的否定证据：
 # 整个流程里内核从没报过 teammates_changed count≥1 —— 队友数只在真的有人互连时才变，界面不靠定时器刷。
-TEAM_EVENTS="$(applog | grep -o 'teammates_changed count=[0-9]*' | grep -vc 'count=0' | tr -d ' ')"
+#
+# 判据必须锚定 event= 再取 count。日志行是
+#   event=teammates_changed group_id=… file_id=… count=1 peers=2
+# 中间隔着 group_id / file_id，写成 grep -o 'teammates_changed count=' 永远匹配不到，
+# 这条断言就成了恒真（2026-11-06 修）。可证伪性用两份真实日志对拍过：
+#   artifacts/m1-device/logs/app-logcat.log   （0 态：队友从没出现）→ 0 条 → PASS
+#   artifacts/team-verify/logs/app-logcat.log （队友 1 人，m2-team-verify.sh 留证）→ 1 条 → FAIL
+TEAM_EVENTS="$(applog | grep -F 'event=teammates_changed' | grep -o 'count=[0-9]*' \
+  | cut -d= -f2 | awk '$1+0 > 0 {n++} END {print n+0}')"
 chk "team.no_teammate_events" "$([ "${TEAM_EVENTS:-0}" = "0" ] && echo 1 || echo 0)" \
-  "teammates_changed count>0：${TEAM_EVENTS:-0} 条"
+  "event=teammates_changed 里 count>0 的条数：${TEAM_EVENTS:-0}"
 
 # ① 先把用得到的两份素材共享进群：torrent 先进会话，限速才有「对已存在的 torrent 也生效」可验。
 back_to_group || die "回不到 P3（限速验收起点）"

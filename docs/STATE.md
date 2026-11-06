@@ -47,10 +47,13 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 
 ## 在飞
 
-- APP-A 组队通告（P3/P4）与限速接线（全局 + 单文件）
-- APP-A 组队通告与限速接线（进行中）
+- A1 Android 接跨网发现配置（worktree，OPPO）
+- A3 Windows 接跨网发现（worktree，重试中）
+- PUB 公开种子社区设计（已交付，待并入）
 
 ## 已完成
+- TEAMVERIFY 组队通告真机验证 → MIX 上 9/9 PASS：P3「组队 2 人」、P4「正在组队 · 2 人」、100% 后消失、logcat teammates_changed count=1
+- PUB 公开种子社区设计 → docs/design/public-swarm.md（240 行，独立 PublicBtSession，六条已拍）
 - WORKER Cloudflare 服务 → 已部署 https://huchuan-relay.autoai233.workers.dev（40/40 本地测试；线上 GET 经代理验证 /health 与 bencode 失败路径；正向注册+announce 因本机 workers.dev 被 DNS 污染/SNI 拦截未能实测）
 - CORETEAM 拨号缺陷与 E0 → hasPeers 短路修复（C1 向 C2 上传 183 MiB）、duplicate_link 竞态修复（mutant 自证）、kernel.teammates 读口、E0 D=1.1394 → 不做显式分片
 - SUPERSEED 对照 → super-seeding 能消掉重复上传（D 1.09→1.00），但 T_all 只改善 3.1%、小文件慢 59%、污染队友数 → 不默认开启

@@ -261,7 +261,7 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 | `no_anr` | 没有 `ANR in app.huchuan` |
 | `team.p3_no_chip_at_0` | 0 队友时 P3 文件行不出现「组队」字样（ui-dump --texts 取全屏文本） |
 | `team.p4_no_line_at_0` | 0 队友时 P4 不出现「正在组队」 |
-| `team.no_teammate_events` | 整个流程里没有任何 `teammates_changed count>0`（0 是常态，界面不靠定时器） |
+| `team.no_teammate_events` | 整个流程里没有任何 `teammates_changed` 的 count>0（0 是常态，界面不靠定时器）。判据必须先锚 `event=teammates_changed` 再取 `count`：日志行中间还夹着 group_id / file_id，写 `grep -o 'teammates_changed count='` 会恒真（2026-11-06 修） |
 | `limit.file_set_1024` | P4 单文件限速输入 1024 → `file_upload_limit ... kbps=1024 applied=true`（applied = 该 torrent 已在会话里） |
 | `limit.file_1024_enforced` | 桌面端下载该 32 MiB 的**稳态**速率 ≤ 1229 KB/s（标称 1024 留 20% 余量；下限 100 只证明在传） |
 | `limit.file_cleared` | 清空输入框 → `file_upload_limit ... kbps=0 applied=true`（0 = 不限，真的把 handle 上的限制清掉） |
@@ -308,12 +308,13 @@ artifacts/m1-device/
    脚本因此单独断言 `join.mdns_discovered`（看 `lan=`），不拿 `join_via` 当唯一依据。
    本机同时有 Wi-Fi（192.168.31.218）和 VPN（172.30.236.122/32）两张网卡，
    `LanDiscovery` 会优先绑「私有 IPv4 且不是 /32 点对点」的那张，并把解析到的每个地址都出成候选。
-4. **组队通告只验了 0 态**（单台手机跑不出队友 ≥ 1）：M1 的验收链路永远是「一端做种、一端下载」，
-   而 spec §306 明确做种者不计入队友；--quick 又跳过手机自己下载的压力轮。所以
-   P3 chip / P4「正在组队 · n 人」的**0 态（不显示）**有真机断言，
-   **n ≥ 1 的展示只有代码路径与口径，没有真机证据**。
-   要补：两台手机同时对同一文件处于「部分」，或再起一个**也在下载**的对端（第二个桌面 peer 即可）。
-   这是本轮唯一没能在真机上验到的界面行为，别把它当成已验。
+4. **组队通告 n ≥ 1 已验（真机）**（2026-11-06，编号沿用）：M1 的验收链路是「一端做种、一端下载」，
+   做种者不计入队友（spec §306），单台手机上跑不出队友 ≥ 1 —— 所以 P3 chip / P4「正在组队 · n 人」的
+   **0 态（不显示）**仍由本脚本断言，而 **n ≥ 1 的展示由另一套装置验过**，不在 m1-device.sh 里跑：
+   `scripts/m2-team-verify.sh` 起两个桌面对端（S 做种 64 MiB、B 加入并下载同一文件）＋手机同时下载，
+   真机上拍到 P3「组队 2 人」、P4「正在组队 · 2 人」，手机到 100% 后两处都消失，
+   logcat 有 `event=teammates_changed … count=1 peers=2`。证据见 `docs/reports/team-verify.md`
+   与 `artifacts/team-verify/`。别拿本文件的 `team.p3_no_chip_at_0` 当「n ≥ 1 也验过」。
 5. **通知档只存不通知**：M2 才有通知通道。
 6. **「做种 n」对「下完转做种」的设备偏低** —— 已修（2026-11-06）。缺陷现象、修法与现场证据见 §7-4；
    本文件对应的断言是 `p6.peer_seeding_after_download` 与 `peer_announce.seeds_after_download`。
