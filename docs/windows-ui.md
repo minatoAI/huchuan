@@ -93,6 +93,8 @@ windows/scripts/
   dev-server.mjs      开发用静态服务器（node 内置模块，零依赖；只在不想起 daemon 时用）
   capture-ui.ps1      逐页截图取证：离屏截图是门禁，GDI 抓图降级为兜底诊断（纯 ASCII，见 §5 的坑）
   ui-capture-jobs.json 截图任务表：页名 / 路由 / 主题 / 断言文案
+  capture-team-ui.sh  组队通告 + 限速的三张取证图（起三个 daemon，见 §6.1）
+  ui-capture-teammates.json 上面那三张的任务表（同一份 capture-ui.ps1，换 -JobsPath / -IndexName）
   click-navigate.ps1  点击链路冒烟（可选，不进构建门禁）
 scripts/build-windows.sh   构建 + 内嵌 + 起取证 daemon + 截图
 scripts/package-windows.sh 绿色版打包：jlink runtime + exe + jar → dist/Huchuan/（见 docs/daemon-api.md §8）
@@ -144,6 +146,22 @@ WS 只负责说「变了」，不搬数据：收到 `state`（有东西变了）
 
 P3 已经没有输入框了，所以 `Enter` 就是这一页的主操作（见 §8 第 10 行）。
 
+### 3.3 组队与限速：页面读的是哪一份数
+
+两处都容易「显示一个漂亮的假数」，所以来源写死在这里：
+
+| 界面上的 | 数据来源 | 判定 |
+| --- | --- | --- |
+| P3 行内 chip「组队 n 人」 | `file.teammates`（daemon 直读 `kernel.teammates`） | `data.js` 的 `fileInTeam`：队友 ≥ 1 且进度 < 100；n = 队友数 + 1（含本机） |
+| P4「正在组队 · n 人」 | 同上 | 同一个 `fileInTeam`，进度到 100% 的同一拍消失 |
+| P7「内核读回」 | `settings.sessionUploadLimitKbps` / `sessionDownloadLimitKbps` | daemon 下发内核后读回的**会话真值**；0 显示「不限」 |
+| P7 输入框 | `settings.uploadLimitKbps` / `downloadLimitKbps` | 用户设的值，写 `POST /api/settings/limits` |
+| P4 单文件限速读回 | `file.uploadLimitKbps` + `file.uploadLimitInForce` | 已生效 / 已设置；core 没有按 torrent 读回限速的口子（daemon-api 缺口 G9） |
+
+「不限」开关与输入框是同一件事的两面：开关打开 → 两项都按 0 下发（输入框同时置灰，与 Android 一致）；
+输入框里给出非 0 值 → 开关自动关掉（daemon 侧就是这么解释的，见 `docs/daemon-api.md` §3.1）。
+页面不缓存限速：每次重绘都从 `/api/state` 取，所以别人（脚本 / 另一台）改了限速，这里也会跟着变。
+
 ## 4. 内嵌：资源表怎么来的（现在只是兜底）
 
 daemon 起不来时壳回退到 exe 内嵌的那份页面，所以内嵌这条路仍然保留。
@@ -170,6 +188,7 @@ bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 16 �
 bash scripts/build-windows.sh --no-evidence  # 只编译
 bash scripts/build-windows.sh --clean        # 先清 windows/build
 bash scripts/package-windows.sh              # 绿色版：jlink runtime + exe + jar → dist/Huchuan/
+bash windows/scripts/capture-team-ui.sh      # 组队通告 + 限速的三张取证图（三个 daemon，见 §6.1）
 ```
 
 四道关，任一不过脚本退出非 0：
@@ -264,6 +283,27 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 四条 DOM 探针、以及 `离屏截图：第 N 次尝试 …` / `离屏截图完成：…` 两行统计）。
 图本身是 1650×1140（窗口 1100×760 DIP × 150% 缩放，离屏出图按进程 DPI 渲染），不含窗口边框。
 
+### 6.1 组队通告与限速的三张（另一个脚本）
+
+`bash windows/scripts/capture-team-ui.sh` 单独跑一套三进程装置：S（47201）做种、C1（47200）与
+C2（47202）同时下同一个 32 MiB 文件，两个下载者全局限速 128 KB/s，截图截的是 C1。
+
+为什么非要三个进程：spec §306 的队友数只数「真互连、**不是做种者**、且本机仍在『部分』」的成员 ——
+「一端做种、一端下载」永远数出 0。C1 先入群、C2 后入群，S 收到 C2 的 `peer.announce` 后转发给 C1，
+C1 按成员拨号拨通 C2，`teammates` 从 0 变 1，界面上的 n = 队友数 + 1 = 2。
+
+| 文件 | 页 | 状态 | 断言文案 |
+| --- | --- | --- | --- |
+| `p3-team.png` | P3 | 文件正在下、队友 1 人 | 组队 2 人 |
+| `p4-team.png` | P4 | 「正在组队 · 2 人」+ 单文件限速 512 KB/s 已生效 | 正在组队 · 2 人 |
+| `p7-limits.png` | P7 | 全局限速 上行 512 / 下行 128，含内核读回 | 上行 512 KB/s |
+
+断言分两层：`capture-ui.ps1` 那套（页名 + 文案 + 像素）照旧；脚本另外断言 API 侧的事实 ——
+C1 的 `teammates` 变成 1、`teamSize` = 2、`sessionUploadLimitKbps` 读回 512、单文件限速回包
+`uploadLimitInForce=true`，再从 `p4-team.log` / `p7-limits.log` 里 grep「已生效 512 KB/s」
+「内核读回 上行 512 KB/s」。截图与 `teammates-index.json` 落在同一个 `artifacts/windows/ui/`，
+同名 `.log` 是那一页的完整壳日志（含 `DOM 探针(shot)` 原文）。
+
 ## 7. 页面与文案
 
 文案表在 `windows/resources/web/js/app.js` 顶部（`COPY`），逐条对应
@@ -286,13 +326,16 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 | 8 | 复制邀请码 | ClipboardManager + Snackbar | `navigator.clipboard`，失败退回 `execCommand`；「已复制」在行内显示 1.6 秒 |
 | 9 | 主题 | `isSystemInDarkTheme()` | `prefers-color-scheme`；窗口标题栏与 WebView2 首帧底色跟着页面主题走 |
 | 10 | 键盘 | 无 | `Enter` 提交当前页主操作（保存 / 加入 / 发送 / 创建；P3 上是打开文件选择器），`Esc` 关闭抽屉或返回 |
+| 11 | 限速读数 | 下发后只写日志（`global_limit_applied … ok=`），界面显示用户设的值 | P7 多一行「内核读回」、P4 多一行「已生效 / 已设置」，直接把会话里生效的值显示出来 |
 
 ## 9. 当前限制
 
 数据是真的，但下面这些还没到位，页面上的表现都写在括号里：
 
 1. **没有未读数**（首页「N 条新消息」永远不出现）。core 没给 unread 来源，见 daemon-api 缺口 G4。
-2. **没有组队**（「组队 N 人」的 chip 走不到）。缺口 G5。
+2. ~~没有组队~~ **已接**：P3 的「组队 n 人」chip 与 P4 的「正在组队 · n 人」都读 `file.teammates`（内核观测口径，做种者不计入），
+   见 §3.3 与 §6.1。剩下的边界在 core：同一台机器上跑多个成员（`127.0.0.1` 多端口）时
+   「连接 ↔ 成员」只能按 host 退化配对；局域网一台设备一个 IP 的常态下没问题。
 3. **别人的做种数与平台是 0 / 「未知」**，只有本机是真数。缺口 G3。
 4. **群只能建、不能退**。core 没有退出群的 API。缺口 G1。
 5. **评论发出去不能删**。缺口 G6。
@@ -306,13 +349,13 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 
 | 项 | 字节 |
 | --- | --- |
-| `index.html` | 947 |
-| `css/tokens.css` | 2,573 |
-| `css/app.css` | 15,494 |
-| `js/data.js` | 16,476 |
-| `js/app.js` | 40,249 |
-| **页面资源合计** | **75,739**（预算 200 KB） |
-| `Huchuan.exe` | 358,400（WebView2 运行时是系统组件，不在 exe 内） |
-| `daemon.jar` | 8,049,914（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
+| `index.html` | 973 |
+| `css/tokens.css` | 2,672 |
+| `css/app.css` | 16,319 |
+| `js/data.js` | 18,395 |
+| `js/app.js` | 43,245 |
+| **页面资源合计** | **81,604**（预算 200 KB） |
+| `Huchuan.exe` | 385,024（WebView2 运行时是系统组件，不在 exe 内） |
+| `daemon.jar` | 8,107,170（含 core、libtorrent4j 的 x86_64 dll、jmdns、上面这份页面） |
 | `runtime/`（jlink） | 28,186,664（26.88 MiB，模块 `java.base,java.logging,jdk.crypto.ec`） |
-| **`dist/Huchuan` 合计** | **36,594,978**（34.90 MiB，拷走就能跑，目标机不用装 Java） |
+| **`dist/Huchuan` 合计** | **36,678,858**（34.98 MiB，拷走就能跑，目标机不用装 Java） |

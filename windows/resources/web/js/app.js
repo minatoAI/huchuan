@@ -66,6 +66,10 @@ const COPY = {
   p4_reply: function (name) { return '回复 ' + name; },
   p4_upload_limit: '单文件限速',
   p4_source: function (name) { return '来源 ' + name; },
+  // 单文件限速的读回：core 没有「读回某个 torrent 的限速」的口子（daemon-api 缺口 G9），
+  // 所以这里给的是 daemon 记的值 + 此刻是不是真的套在会话里（uploadLimitInForce）。
+  p4_limit_in_force: function (kbps) { return '已生效 ' + kbps + ' ' + COPY.unit_kbps; },
+  p4_limit_saved: function (kbps) { return '已设置 ' + kbps + ' ' + COPY.unit_kbps; },
 
   // P5 新群组
   p5_title: '新群组',
@@ -92,6 +96,9 @@ const COPY = {
   p7_upload: '上行',
   p7_download: '下行',
   p7_unlimited: '不限',
+  // 内核读回：读的是会话里真正生效的值（0 = 不限），不是输入框里那个「用户想要的值」
+  p7_readback: '内核读回',
+  p7_readback_value: function (up, down) { return '上行 ' + up + ' · 下行 ' + down; },
   p7_notification: '通知',
   p7_network_status: '网络状态',
   p7_bubble: '系统气泡',
@@ -171,6 +178,27 @@ function networkLabel() {
 function localName() {
   const device = Store.device();
   return device.userName || device.deviceName;
+}
+
+/** 限速读数的单位口径：0 就是「不限」（core 的约定，界面不再另造一个零值说法）。 */
+function limitRateLabel(kbps) {
+  return kbps > 0 ? kbps + ' ' + COPY.unit_kbps : COPY.p7_unlimited;
+}
+
+/** P7 的内核读回：上行 / 下行各一项，值来自 /api/state 的 settings.session*Kbps。 */
+function globalLimitReadback(device) {
+  return COPY.p7_readback_value(
+    limitRateLabel(device.sessionUploadLimitKbps),
+    limitRateLabel(device.sessionDownloadLimitKbps)
+  );
+}
+
+/** P4 的单文件限速读回：设了值才有「已生效 / 已设置」两种说法，0 就是「不限」。 */
+function fileLimitReadback(file) {
+  if (!(file.uploadLimitKbps > 0)) return COPY.p7_unlimited;
+  return file.uploadLimitInForce
+    ? COPY.p4_limit_in_force(file.uploadLimitKbps)
+    : COPY.p4_limit_saved(file.uploadLimitKbps);
 }
 
 /* -------------------------------------------------------------- 路由 */
@@ -590,6 +618,7 @@ function viewFile() {
               'placeholder="' + COPY.p7_unlimited + '" aria-label="' + COPY.p4_upload_limit + '">' +
             '<span class="unit">' + COPY.unit_kbps + '</span>' +
           '</div>' +
+          '<p class="line" id="upload-limit-readback">' + fileLimitReadback(file) + '</p>' +
         '</section>' +
         '<section class="panel comments-panel">' +
           '<div class="comment-list">' +
@@ -865,6 +894,8 @@ function viewSettings() {
           '<button class="switch" role="switch" data-act="toggle-unlimited" ' +
             'aria-checked="' + device.unlimited + '" aria-label="' + COPY.p7_unlimited + '"></button>' +
         '</div>' +
+        '<div class="kv"><span class="field-label">' + COPY.p7_readback + '</span>' +
+          '<span id="limit-readback">' + globalLimitReadback(device) + '</span></div>' +
 
         '<h2 class="section-title">' + COPY.p7_notification + '</h2>' +
         notifications +

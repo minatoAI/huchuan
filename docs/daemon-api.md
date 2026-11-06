@@ -120,10 +120,15 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
   "device": { "deviceId": "3ACYGKG4Q1Q9R2BP", "deviceName": "WIN11-0715",
               "userName": "我的设备", "displayName": "我的设备" },
   "settings": { "userName": "我的设备", "uploadLimitKbps": 0,
-                "downloadLimitKbps": 0, "unlimited": true },
+                "downloadLimitKbps": 0, "unlimited": true,
+                "sessionUploadLimitKbps": 0, "sessionDownloadLimitKbps": 0 },
   "groups": [ /* 见 3.2 的群对象；每个文件额外带 comments */ ]
 }
 ```
+
+`settings` 里有两组限速数：`uploadLimitKbps` / `downloadLimitKbps` 是**用户设的值**（落盘），
+`sessionUploadLimitKbps` / `sessionDownloadLimitKbps` 是**内核读回值**（会话里真正生效的那个）。
+两者平时相等；不等就说明下发没生效（daemon 日志有 `session_limit_applied … ok=false`）。
 
 **为什么带评论**：Web UI 每次刷新只发一个请求。传输中页面每秒重绘，若再按文件拉评论，
 请求数会跟着文件数涨。`/api/state` 是 UI 的唯一读口，评论就一起给；其余接口（`/api/groups`
@@ -137,6 +142,33 @@ POST { "userName": "我的设备" }          // 字段都可选，给几个改�
 ```
 
 落盘在 `<data-dir>/settings.json`。`userName` 截断到 20 字，限速 0 = 不限。
+这里改到 `uploadLimitKbps` / `downloadLimitKbps` / `unlimited` 时同样会下发内核（见下一条），
+但脚本要断言限速请直接走 `/api/settings/limits`：那条回包里带内核读回值。
+
+#### `GET|POST /api/settings/limits`
+
+全局限速（P7 的那两个输入框 + 「不限」开关）。
+
+```json
+GET  → { "limits": { "uploadLimitKbps": 512, "downloadLimitKbps": 128, "unlimited": false,
+                     "sessionUploadLimitKbps": 512, "sessionDownloadLimitKbps": 128 } }
+
+POST { "uploadKbps": 512, "downloadKbps": 128 }    // KB/s，0 = 不限；字段都可选
+  → { "limits": { …同上… } }
+
+POST { "unlimited": true }                         // 「不限」：两项都按 0 下发
+```
+
+- `session*Kbps` 是**内核读回值**：下发后立刻读会话里生效的限速（libtorrent 的 settings），
+  不是把请求原样回显。读到的和要的不一样时日志有一行 `session_limit_applied … ok=false`。
+- 运行期立即生效：走 libtorrent 的 `applySettings`，已经在传的 torrent 同样受约束；
+  多个文件同时传共用这一份总预算（不是每个 torrent 各给一份）。
+- 单文件限速是另一层（见 3.3 的 `upload-limit`），两层同时存在时每个 torrent 取更小的那个。
+- 显式给了一个非 0 的 `uploadKbps` / `downloadKbps` 就等于「要限速」：`unlimited` 会一起被关掉，
+  不用另发一次。只给 0 则只改值，不动开关。
+- 校验：kbps 必须是 0–2097151 的整数（与 core 的 `saneKbps` 同界），否则 400 `E_BAD_LIMIT`；
+  一项都没给也是 400。
+- 落盘在 `settings.json`，重启后 daemon 建会话时按落盘值重新下发一次（内核不持久化限速）。
 
 #### `POST /api/shutdown`
 
@@ -173,6 +205,9 @@ POST { "userName": "我的设备" }          // 字段都可选，给几个改�
 ```
 
 `seedingCount` 只有本机是真数；`platform` 只有本机写 Windows，别人写「未知」——协议里没广播这两样（缺口 G3）。
+
+`teamSize` 是群级的组队人数（含本机）：取本群**正在组队**的文件里最大的那一队，没有文件在组队就是 0。
+「正在组队」= 本机处于该文件的「部分」且队友 ≥ 1（口径见 3.3 的 `teammates`）。
 
 #### `GET /api/groups`
 
@@ -212,8 +247,9 @@ POST { "userName": "我的设备" }          // 字段都可选，给几个改�
   "name": "travel-photos.zip", "sizeBytes": 4194304, "pieceSize": 65536,
   "addedAt": 1793921122426, "sourceMember": "WIN11-0715", "sourceDev": "3ACYGKG4Q1Q9R2BP",
   "mine": true, "state": "seeding", "role": "seeding",
-  "progressPercent": 100, "complete": true, "seeders": 0, "teammates": 0,
-  "uploadLimitKbps": 0, "downloadRateBps": 0, "uploadRateBps": 0,
+  "progressPercent": 100, "complete": true, "seeders": 0, "teammates": 1,
+  "uploadLimitKbps": 512, "uploadLimitInForce": true,
+  "downloadRateBps": 0, "uploadRateBps": 0,
   "commentCount": 1, "savedPath": "E:\\...\\travel-photos.zip",
   "magnet": "magnet:?xt=urn:btih:...&dn=...&xl=...",
   "comments": [ /* 只有 /api/state 和文件详情里有 */ ]
@@ -224,7 +260,15 @@ POST { "userName": "我的设备" }          // 字段都可选，给几个改�
 - `role`：`seeding` / `downloading` / `none`，是「内核里挂没挂这个文件」。两者在下载刚完成的那几百毫秒里
   可能不同步，daemon 统一按 `complete` 归一。
 - `seeders`：当前连上的 peer 数（协议里没有「全群做种数」这个概念，缺口 G3）。
-- `teammates`：组队人数，M1 恒为 0（缺口 G5）。
+- `teammates`：**队友数**（产品规格 §306 的观测口径），直接来自 `kernel.teammates(gid, fid)`：
+  当前与这个文件的 torrent 真互连、对端**不是做种者**、且本机仍处于「部分」的成员数。
+  做种者不计入；本机到 100%（或没挂进会话）内核直接回 0。界面上的「n 人」= 这个数 + 1（含本机）。
+  它没有对应事件：只随连接实况变化，daemon 每秒的传输采样把它一起算进 tick 签名，
+  所以页面照样能在它变化的那一秒刷新。
+- `uploadLimitKbps`：单文件限速的**设置值**（落盘，激活时套到 torrent 上）。
+- `uploadLimitInForce`：这条限速此刻是不是真在生效 —— 文件挂在会话里、还没到 100%、且设了非 0 值。
+  core 没有「读回某个 torrent 的限速」的口子（缺口 G9），所以这里只能给「设了值 + 会话里挂着」，
+  不给一个假装是内核读数的数字。到 100% 时内核会把 torrent 限速清零，这个字段同时变 false。
 
 #### `GET /api/groups/{gid}/files`
 
@@ -266,7 +310,10 @@ POST { "userName": "我的设备" }          // 字段都可选，给几个改�
 → { "file": 文件对象 }
 ```
 
-单文件限速，落在 `settings.json` 的 `uploadLimits`，激活时自动套用。
+单文件限速（P4 那一行），落在 `settings.json` 的 `uploadLimits`，激活时自动套用（`core` 的
+`GroupRuntime.setUploadLimitKbps` → `torrent_handle::set_upload_limit`，单位 KB/s，0 = 不限）。
+回包里的文件对象带 `uploadLimitKbps`（设的值）与 `uploadLimitInForce`（此刻是否真挂在会话里）；
+core 没有按 torrent 读回限速的口子（缺口 G9），所以不给「内核读数」这种说法。
 
 #### `GET|POST /api/groups/{gid}/files/{fid}/comments`
 
@@ -353,6 +400,13 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 排查时常用的 event：`daemon_ready`、`daemon_config`、`api_*`、`http_request`、`ws_open`/`ws_close`、
 `ws_push`、`join_*`、`file_*`、`seed_restore_*`、`api_error`、`http_conn_error`。
 
+限速相关的两行：
+
+    ts=… event=session_limit_applied up_kbps=512 down_kbps=128 session_up_kbps=512 session_down_kbps=128 unlimited=false ok=true
+    ts=… event=api_limits_set session_up_kbps=512 session_down_kbps=128
+
+`session_*_kbps` 是内核读回值；`ok=false` 表示下发没生效（限速被拒或会话还没起来），脚本可以直接断言它不出现。
+
 ---
 
 ## 6. daemon 侧的实现约定
@@ -380,10 +434,11 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
 | G2 | `reseed(fileId, path)`：按已有条目重新做种 | 用 `addFile(同一个文件)` 覆盖条目（infohash 相同） | 重启恢复做种要重算 hash；文件内容变了会多出一条新条目 |
 | G3 | 成员做种数、成员平台、全群 seeders | 只有本机是真数，别人写 0 / 「未知」 | P6 成员页的数字偏低 |
 | G4 | 未读数（unread） | 恒 0 | 首页「N 条新消息」永远不出现 |
-| G5 | 组队（teammates） | 恒 0 | 「组队 N 人」的 UI 分支走不到 |
+| ~~G5~~ | ~~组队（teammates）~~ **已补**：core 提供 `kernel.teammates(gid, fileId)`，daemon 接进 `file.teammates` / `group.teamSize` | 直接读内核观测值，不自己推算 | 已关闭（口径与边界见 §3.3） |
 | G6 | 评论删除 / 墓碑的对外 API | 只读不删 | 评论发出去就收不回 |
 | G7 | `startDownload(fileId, savePath)` 指定落盘目录 | 下载固定落 `<data-dir>/downloads`；本机共享的文件走「重新做种」分流（§3.3 active、§6.1） | 只影响「下载目录不可选」，不再影响休眠→激活的正确性 |
 | G8 | tracker / 跨网状态查询 | 没有 | 设置页只能显示「网络状态」的粗粒度结论 |
+| G9 | 单文件限速的内核读回（`torrent_handle::upload_limit()`） | 只记 daemon 侧的设置值 + `uploadLimitInForce`（会话里挂着且未完成） | P4 的「已生效」是按「已下发」判的，不是按内核读数判的 |
 
 ---
 
@@ -421,10 +476,10 @@ jlink 参数：`--strip-debug --no-man-pages --no-header-files --compress=2`。
 
 | 项 | 字节 | MiB |
 | --- | ---: | ---: |
-| `Huchuan.exe` | 358,400 | 0.34 |
-| `daemon.jar` | 8,049,914 | 7.68 |
+| `Huchuan.exe` | 385,024 | 0.37 |
+| `daemon.jar` | 8,107,170 | 7.73 |
 | `runtime/` | 28,186,664 | 26.88 |
-| **合计 `dist/Huchuan`** | **36,594,978** | **34.90** |
+| **合计 `dist/Huchuan`** | **36,678,858** | **34.98** |
 
 runtime 预算是 60 MiB，超了脚本直接失败（说明模块挑多了或压缩没开）。
 
@@ -450,9 +505,16 @@ bash scripts/m1-windows.sh          # 双 daemon 全流程，末行 PASS
 
 脚本自己起 A/B 两个 daemon（47200 / 47201），走完建群 → 后 8 位加入 → 共享 32 MiB →
 下载 → SHA-256 比对 → 评论回流 → WS 推送 → Web UI 数据通路，最后打印 `PASS` / `FAIL`。
-共 37 条断言。
+共 47 条断言。
 
-第 37 条验绿色版：用 `cmd` 把 `JAVA_HOME` 清空、`PATH` 只留 `C:\Windows\System32`（复现
+限速与组队这一组（5 条）：B 侧 `POST /api/settings/limits {"uploadKbps":512,"downloadKbps":512}`
+后 `sessionUploadLimitKbps` / `sessionDownloadLimitKbps` 必须读回 512，改成 0 必须读回 0，
+`GET` 与 `POST` 的读数一致，日志里有 `session_limit_applied … ok=true` 且没有 `ok=false`。
+组队 2 条：下载期间 9 次采样 `teammates` 字段都在（读口接上了），且全程为 0 —— 这一轮只有 A 一个
+做种者，按 spec §306 做种者不计入队友。队友 ≥1 的画面取证在 `windows/scripts/capture-team-ui.sh`
+（三个 daemon，S 做种 + C1/C2 同时下载），见 `docs/windows-ui.md` §6.1。
+
+最后一条验绿色版：用 `cmd` 把 `JAVA_HOME` 清空、`PATH` 只留 `C:\Windows\System32`（复现
 「目标机没装 Java」），再启动 `dist/Huchuan/Huchuan.exe`，要求 47290 上的 `/api/health` 通，
 且壳日志里「拉起 daemon」用的 java 是 exe 同级的 `runtime\bin\javaw.exe`。
 `dist/Huchuan` 不存在时脚本会先跑一次 `scripts/package-windows.sh`。

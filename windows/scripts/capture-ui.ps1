@@ -32,6 +32,10 @@ param(
   [Parameter(Mandatory = $true)][string]$JobsPath,
   [int]$TimeoutSec = 45,
   [int]$Attempts = 3,
+  # Name of the per-run evidence index written into OutDir. Defaults to index.json (the
+  # build gate). A second capture run into the same OutDir passes its own name so it does
+  # not clobber the gate's index.
+  [string]$IndexName = 'index.json',
   [switch]$NoGdiFallback
 )
 
@@ -394,7 +398,7 @@ $index = [ordered]@{
   shots      = $results
 }
 $json = $index | ConvertTo-Json -Depth 6
-[System.IO.File]::WriteAllText((Join-Path $OutDir 'index.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
+[System.IO.File]::WriteAllText((Join-Path $OutDir $IndexName), $json, (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Output ('TOTAL ' + $results.Count + ' shots, ' + $failures + ' failed')
 if ($failures -gt 0) { exit 1 }

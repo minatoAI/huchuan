@@ -99,6 +99,8 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         )
         created.start()
         kernel = created
+        // 限速不落内核（libtorrent 的 settings_pack 不持久化），重启后按落盘值重新下发一次。
+        applySessionLimits()
         startTicker()
         if (options.restoreSeeds) restoreSeedsAsync()
         log.event(
@@ -235,6 +237,9 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
                     .append(':').append(g.downloadRateBps(f.fileId))
                     .append(':').append(g.uploadRateBps(f.fileId))
                     .append(':').append(g.peerCount(f.fileId))
+                    // 队友数也会让画面变（P3 的 chip / P4 的「正在组队」整行出现或消失）：
+                    // 进签名以后不用等别的数字变，连接一建立就能推一帧。
+                    .append(':').append(g.teammates(f.fileId))
                     .append(';')
             }
         }
@@ -245,6 +250,52 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         if (percent <= 0) return
         val old = highWater[fileId] ?: 0
         if (percent > old) highWater[fileId] = percent
+    }
+
+    // ------------------------------------------------------------------ 全局限速（P7 / P4）
+
+    /**
+     * 把「全局限速」下发到内核会话，返回**内核读回值**（KB/s：上行 to 下行）。
+     *
+     * 口径与 Android 端 pushSessionLimits 同一套：界面存的是「用户想要的值」，「不限」开关
+     * 打开时两项都按 0 下发；真正生效的是内核 session 级限速 —— 走 libtorrent 的 applySettings，
+     * 运行期立即生效，对已经在传的 torrent 同样有效，多文件同时传也只有一份总预算。
+     * 单文件限速（[GroupRuntime.setUploadLimitKbps]）是另一层，两层同时存在时每个 torrent 取更小的那个。
+     *
+     * 下发完立刻读回会话里生效的值：读到的和要的不一样就在日志里记 ok=false，不假装成功。
+     */
+    fun applySessionLimits(): Pair<Int, Int> {
+        val k = kernel
+        val up = if (settings.unlimited) 0 else settings.uploadLimitKbps.coerceAtLeast(0)
+        val down = if (settings.unlimited) 0 else settings.downloadLimitKbps.coerceAtLeast(0)
+        k?.setSessionUploadLimit(up)
+        k?.setSessionDownloadLimit(down)
+        val readUp = k?.sessionUploadLimitKbps() ?: up
+        val readDown = k?.sessionDownloadLimitKbps() ?: down
+        log.event(
+            "session_limit_applied",
+            mapOf(
+                "up_kbps" to up.toString(),
+                "down_kbps" to down.toString(),
+                "session_up_kbps" to readUp.toString(),
+                "session_down_kbps" to readDown.toString(),
+                "unlimited" to settings.unlimited.toString(),
+                "ok" to (readUp == up && readDown == down).toString(),
+            ),
+        )
+        return readUp to readDown
+    }
+
+    /** 全局限速的完整读数：用户设置 + 内核读回（`session*Kbps` 是会话里真正生效的值）。 */
+    fun limitsJson(): J.Obj {
+        val k = kernel
+        return jobj(
+            "uploadLimitKbps" to jnum(settings.uploadLimitKbps.toLong()),
+            "downloadLimitKbps" to jnum(settings.downloadLimitKbps.toLong()),
+            "unlimited" to jbool(settings.unlimited),
+            "sessionUploadLimitKbps" to jnum((k?.sessionUploadLimitKbps() ?: 0).toLong()),
+            "sessionDownloadLimitKbps" to jnum((k?.sessionDownloadLimitKbps() ?: 0).toLong()),
+        )
     }
 
     // ------------------------------------------------------------------ 快照
@@ -283,12 +334,13 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         )
     }
 
-    fun settingsJson(): J.Obj = jobj(
-        "userName" to jstr(settings.userName),
-        "uploadLimitKbps" to jnum(settings.uploadLimitKbps.toLong()),
-        "downloadLimitKbps" to jnum(settings.downloadLimitKbps.toLong()),
-        "unlimited" to jbool(settings.unlimited),
-    )
+    /** 设置页要的全部：用户名 + 全局限速（含内核读回）。字段只在这里加一次，别处一律调它。 */
+    fun settingsJson(): J.Obj {
+        val fields = LinkedHashMap<String, J>()
+        fields["userName"] = jstr(settings.userName)
+        fields.putAll(limitsJson().fields)
+        return J.Obj(fields)
+    }
 
     /**
      * 群的完整 JSON。
@@ -303,6 +355,12 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         val online = g.onlinePeers().toSet()
         val self = k?.deviceId ?: ""
         val localSeeding = files.count { g.localRole(it.fileId) == GroupRuntime.LocalRole.SEEDING }
+        // 群级组队人数 = 本群正在组队的文件里最大的那一队（含本机）；没有文件在组队就是 0。
+        // 与 P3 行上的 chip 同一口径：本机处于「部分」且队友 ≥ 1 才算在组队。
+        val teamSize = files.fold(0) { acc, entry ->
+            val mates = g.teammates(entry.fileId)
+            if (mates <= 0) acc else maxOf(acc, mates + 1)
+        }
         return jobj(
             "id" to jstr(g.groupId),
             "name" to jstr(g.name),
@@ -313,7 +371,7 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
             "memberCount" to jnum(members.size.toLong()),
             "fileCount" to jnum(files.size.toLong()),
             "seedingCount" to jnum(localSeeding.toLong()),
-            "teamSize" to jnum(0L),
+            "teamSize" to jnum(teamSize.toLong()),
             "unreadCount" to jnum(0L),
             "notificationLevel" to jstr(settings.notificationOf(g.groupId)),
             "onlineCount" to jnum(online.size.toLong()),
@@ -354,6 +412,10 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         }
         val self = kernel?.deviceId ?: ""
         val source = g.memberName(f.addedBy).ifEmpty { if (f.addedBy == self) options.deviceName else f.addedBy.take(8) }
+        // 队友数只有一个来源：内核的观测读口（docs/design/product-spec.md §306）。
+        // 做种者不计入、本机到 100% 或没挂进会话时内核直接回 0，daemon 不自己推算。
+        val teammates = g.teammates(f.fileId)
+        val uploadLimit = settings.uploadLimitOf(f.fileId)
         val base = jobj(
             "id" to jstr(f.fileId),
             "name" to jstr(f.name),
@@ -368,8 +430,11 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
             "progressPercent" to jnum(percent.toLong()),
             "complete" to jbool(complete),
             "seeders" to jnum((if (live) g.peerCount(f.fileId) else 0).toLong()),
-            "teammates" to jnum(0L),
-            "uploadLimitKbps" to jnum(settings.uploadLimitOf(f.fileId).toLong()),
+            "teammates" to jnum(teammates.toLong()),
+            "uploadLimitKbps" to jnum(uploadLimit.toLong()),
+            // 这条单文件限速此刻是不是真在生效：文件挂在会话里、还没到 100%（到 100% 内核会把
+            // torrent 限速清零），而且确实设了值。core 没有按 torrent 读回限速的口子（缺口 G9）。
+            "uploadLimitInForce" to jbool(live && !complete && uploadLimit > 0),
             "downloadRateBps" to jnum(if (live) g.downloadRateBps(f.fileId) else 0L),
             "uploadRateBps" to jnum(if (live) g.uploadRateBps(f.fileId) else 0L),
             "commentCount" to jnum(g.visibleOps(f.fileId).size.toLong()),
