@@ -82,7 +82,8 @@ L1 只做：任务分解、边界设定、验收标准、结果核验、状态�
 - PEX 没有会话级开关（settings_pack 里没有这一项，实测 64 个 bool 全查过），必须 per-torrent flag：0x380000（DISABLE_DHT | DISABLE_LSD | DISABLE_PEX）。
 - 私有种子用 **v1**：v2 没有性能收益（K1 实测 v1/v2 起传与完成时间同分布），兼容面却更窄。
 - 单文件限速 = 一文件一 torrent + setUploadLimit；手动加 peer 走 swig connect_peer（高层 API 没有）。
-- Android：AGP 9.5.1 / Gradle 9.6.0 / JDK 17 / compileSdk 37 / targetSdk 36 / minSdk 26 / Compose BOM 2026.09.00。
+- Android：AGP 9.5.1 / Gradle 9.6.0 / JDK 17 / compileSdk 37 / targetSdk 37 / minSdk 26 / Compose BOM 2026.09.00。
+- API 37 必须声明 ACCESS_LOCAL_NETWORK（运行时权限，系统归在「附近的设备」）。**未授权时不得先起 M1Runtime**——内核一启动就开 mDNS，带错状态活到进程结束，之后授权也不恢复。
 - Windows：C++ Win32 + WebView2（本机 BuildTools 2022 / MSVC 14.44 / Win SDK 10.0.26100 / cmake 3.31.6 / ninja 1.13.2 / WebView2 156.0.4314.58 均已就位，安装成本 0）。
 - 发现层三层：mDNS（局域网）+ 自带 tracker（跨网）+ 手动连接。
 - 评论：签名追加日志 + Lamport 全序 + 墓碑，不上通用 CRDT。
@@ -92,6 +93,8 @@ L1 只做：任务分解、边界设定、验收标准、结果核验、状态�
 
 - **并发目标 2–3 个**，稳定后继续往上探。只有一个 agent 在跑是浪费；限流要靠退避解决，不靠降并发。
 - **文件域冲突用 git worktree 隔离**：`bash scripts/wt.sh new <task>` 建 `.worktrees/<task>` 与分支 `wt/<task>`，把子 agent 的 cwd 指过去；完成后 `bash scripts/wt.sh merge <task>`。只读任务与纯文档任务可以直接用主树。
+- 派 worktree 任务时必须在 prompt 里写明：**每条命令显式带 workdir，或先 cd 到工作树**。子 agent 的 shell 默认 cwd 可能是主树，不写清就会在主树上跑构建。
+- 新 worktree 里 `./gradlew` 会在配置期失败：`artifacts/build-libtorrent/run5-sde1/libtorrent4j.so` 被 gitignore，不在工作树里。派单时要求先 `cp` 一份过去（sha256 97d2663a…）。
 - **429 / upstream overloaded 是上游并发限制**，不是上下文耗尽：子 agent 自带 8 次重试；L1 在失败后等 60–120 秒重派，失败次数越多退避越长（60/120/300 秒）。
 - **试探式加并发**：从 2 起，连续两轮无 429 就加 1；出现 429 退回上一档并延长退避。记录每次的并发档位与结果，别凭感觉。
 - 失败时先看错误码再决定动作：429 等；编译/测试失败改任务；连续两次同样静默失败且无错误码，才怀疑环境。

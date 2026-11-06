@@ -8,6 +8,15 @@
          拿锁要 CHANGE_WIFI_MULTICAST_STATE，读 Wi-Fi 状态要 ACCESS_WIFI_STATE。 -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Android 17（API 37）本地网络保护：targetSdk >= 37 起，mDNS 组播、局域网 TCP/UDP
+         都要运行时权限 android.permission.ACCESS_LOCAL_NETWORK，未授权时流量被拦住，
+         表现是「找不到群」而不是报错。
+         权限名取自 platforms/android-37.0/android.jar 的 android.Manifest.permission
+         （data/api-versions.xml 记 since="37.0"）；OPPO（API 37）pm list permissions -g -d -f
+         报 protectionLevel:dangerous，即标准运行时权限，必须现场请求。
+         API < 37 的系统不认识这条声明，直接忽略；应用侧也只在 API >= 37 请求
+         （见 kernel/LocalNetworkPermission.kt）。 -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
 
     <application
         android:name=".HuchuanApplication"

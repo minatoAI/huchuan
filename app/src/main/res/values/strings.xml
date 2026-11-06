@@ -18,6 +18,8 @@
     <string name="p0_enter">进入</string>
     <string name="p0_failed">检测失败</string>
     <string name="p0_offline">无网络连接</string>
+    <!-- spec §3 P0 状态表「无权限」态（targetSdk 37 起本地网络要运行时权限） -->
+    <string name="p0_no_permission">本地网络未授权</string>
     <string name="p0_booting">启动中</string>
     <string name="p0_checking">正在检测网络</string>
     <string name="p0_item_nat">NAT 类型</string>

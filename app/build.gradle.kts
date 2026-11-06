@@ -29,7 +29,9 @@ android {
     defaultConfig {
         applicationId = "app.huchuan"
         minSdk = 26
-        targetSdk = 36
+        // Android 17（API 37）：本地网络（mDNS / 局域网 TCP-UDP）要运行时权限
+        // android.permission.ACCESS_LOCAL_NETWORK，未授权时被系统静默拦。
+        targetSdk = 37
         versionCode = 1
         versionName = "0.1.0"
 
