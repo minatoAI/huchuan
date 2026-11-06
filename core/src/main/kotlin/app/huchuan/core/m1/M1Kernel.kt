@@ -34,6 +34,14 @@ class M1Kernel @JvmOverloads constructor(
     internal val secretBox: SecretBox = PlaintextSecretBox,
     /** 本机平台（协议 §10 的 peer.announce.plat）：android / windows / unknown。宿主可覆盖。 */
     val platform: String = Proto.detectPlatform(),
+    /**
+     * 跨网发现用的自建 tracker 基址（协议 §3.2），例如 `https://huchuan-relay.example.workers.dev`。
+     *
+     * **空字符串 = 整个功能关闭**：只失去「跨网」这一档，局域网 mDNS 与手动 IP:port 完全照旧，
+     * 不报错、不弹窗、不发任何请求。代码里没有写死的线上地址，绝不替用户默认打开。
+     * 宿主也可以在建好内核之后、[start] 之前用 [setTrackerBaseUrl] 给值（配置读盘晚于建对象的场景）。
+     */
+    trackerBaseUrl: String = "",
 ) : AutoCloseable {
 
     internal lateinit var identity: DeviceIdentity
@@ -53,6 +61,19 @@ class M1Kernel @JvmOverloads constructor(
     private val linkSet: MutableSet<PeerLink> = Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
     internal val lanDiscovery = LanDiscovery()
     internal val joinRate = JoinRateLimiter()
+
+    /**
+     * 跨网发现（协议 §3.2）的装配点。[start] 时按 [trackerBaseUrl] 建；配置为空就一直是 null，
+     * 于是「tracker 这一档静默缺席」，其余发现路径一行都不用改。
+     */
+    private var tracker: TrackerService? = null
+
+    /** tracker 基址（已去掉首尾空白与尾部斜杠）。空串 = 关闭。 */
+    var trackerBaseUrl: String = normalizeTrackerBaseUrl(trackerBaseUrl)
+        private set
+
+    /** 跨网发现是否在工作（配置有值 + 内核已起来 + 服务没关）。宿主 / 诊断页读它。 */
+    val trackerEnabled: Boolean get() = tracker?.enabled == true
 
     private val nonceLru = object : LinkedHashMap<String, Boolean>(256, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?): Boolean = size > 256
@@ -135,6 +156,8 @@ class M1Kernel @JvmOverloads constructor(
         if (restoredGroupIds.isNotEmpty()) {
             reconnecter = PeerReconnector(this).also { it.start() }
         }
+        // 跨网发现（协议 §3.2）：配置为空时这一步什么都不做，只剩局域网与手动 IP:port。
+        startTracker()
         events.log(
             "kernel_started",
             mapOf(
@@ -154,6 +177,8 @@ class M1Kernel @JvmOverloads constructor(
                 "session_up_kbps" to sessionUploadLimitKbps().toString(),
                 "session_down_kbps" to sessionDownloadLimitKbps().toString(),
                 "session_limit_local_scope" to bt.localPeersRateLimited().toString(),
+                "tracker" to if (trackerEnabled) "on" else "off",
+                "tracker_base" to trackerBaseUrl,
             ),
         )
     }
@@ -175,6 +200,8 @@ class M1Kernel @JvmOverloads constructor(
             for (link in g.onlineLinks()) link.close()
         }
         for (link in linkSet.toList()) link.close()
+        try { tracker?.close() } catch (_: Throwable) {}
+        tracker = null
         try { server?.stop() } catch (_: Throwable) {}
         try { lanDiscovery.close() } catch (_: Throwable) {}
         try { if (this::bt.isInitialized) bt.stop() } catch (_: Throwable) {}
@@ -232,6 +259,44 @@ class M1Kernel @JvmOverloads constructor(
     }
 
     internal fun localBtPortLong(): Long = localBtPort().toLong()
+
+    /**
+     * 设置 tracker 基址（只能在内核起来之前调用）。
+     *
+     * 起来之后再改会被忽略并留一条日志：已经在跑的 announcer 手里有「服务端记着的那把 passkey」，
+     * 中途换基址会把这条连续性打断（新地址上要么从头注册，要么报 409），不如明确不支持。
+     */
+    fun setTrackerBaseUrl(url: String) {
+        val normalized = normalizeTrackerBaseUrl(url)
+        if (started) {
+            events.log(
+                "tracker_config_ignored",
+                mapOf("reason" to "kernel_already_started", "base_len" to normalized.length.toString()),
+            )
+            return
+        }
+        trackerBaseUrl = normalized
+    }
+
+    /**
+     * 起跨网发现。配置为空 / 非法时只留一条日志就返回 —— 不抛、不重试、不影响局域网那一档。
+     */
+    private fun startTracker() {
+        val base = trackerBaseUrl
+        if (base.isEmpty()) {
+            events.log("tracker_disabled", mapOf("reason" to "base_url_empty"))
+            return
+        }
+        val service = TrackerService(this, base)
+        if (!service.enabled) {
+            events.log("tracker_disabled", mapOf("reason" to service.configError, "base" to service.baseUrl))
+            return
+        }
+        tracker = service
+        service.start()
+        // 从 state.json 恢复出来的群：立刻注册并 announce，冷启动重连的候选表里就有跨网那一份。
+        for (group in allGroups()) service.watch(group)
+    }
 
     // ------------------------------------------------------------------ 会话级（P7 全局限速）
 
@@ -355,6 +420,8 @@ class M1Kernel @JvmOverloads constructor(
         }
         // ③ 的另一半：退群后不该再被同网段当成该群成员
         try { lanDiscovery.unregister(groupId) } catch (_: Throwable) {}
+        // 跨网那一跳：退群后不再为这个群注册 / announce（close 里会补一条 event=stopped）
+        try { tracker?.forget(groupId) } catch (_: Throwable) {}
         // ③：删群密钥
         val keyWiped = group.wipeKeys()
         // 顺带清掉进度打点缓存里属于这个群的条目，避免长跑进程里越积越多
@@ -405,6 +472,8 @@ class M1Kernel @JvmOverloads constructor(
         registerPub(deviceId, identity.pub64)
         synchronized(stateLock) { groupsById[groupId] = rt }
         if (localMessagePort() > 0) lanDiscovery.register(meta, localMessagePort(), localBtPort())
+        // 跨网发现：建群就把 groupHash20 注册到 tracker（配置为空时 tracker 为 null，这里什么都不发生）
+        tracker?.watch(rt)
         saveState()
         events.log(
             "group_created",
@@ -463,6 +532,8 @@ class M1Kernel @JvmOverloads constructor(
         for (f in msg.files) rt.onFileListEntry(f, null)
         synchronized(stateLock) { groupsById[msg.gid] = rt }
         lanDiscovery.register(meta, localMessagePort(), localBtPort())
+        // 入群同样要登记：新成员不会等到下一次重启才出现在 tracker 上
+        tracker?.watch(rt)
         saveState()
         events.log(
             "group_joined",
@@ -1047,3 +1118,6 @@ class M1Kernel @JvmOverloads constructor(
         const val COMPLETION_TICK_MS = 200L
     }
 }
+
+/** tracker 基址的规范化：去首尾空白与尾部斜杠（`https://x/` 与 `https://x` 是同一个基址）。 */
+internal fun normalizeTrackerBaseUrl(raw: String): String = raw.trim().trimEnd('/')

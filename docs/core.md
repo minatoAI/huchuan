@@ -2,11 +2,12 @@
 
 - 版本：2026-11-06 · 内核 agent · 对应协议 v0（docs/design/protocol.md，唯一事实源）
 - 状态：**M1 全流程在桌面 JVM 上用两个独立进程跑通**（建群 → 后 8 位加入 → 32 MiB 共享/下载/SHA 一致 → 评论 3 s 内入库 → 全程 dht_nodes=0）
-- 本轮（P7 全局限速接线前置）：内核补**会话级（全局）限速** —— `setSessionUploadLimit` / `setSessionDownloadLimit` / `sessionUploadLimitKbps` / `sessionDownloadLimitKbps`，运行期改立刻生效、对会话里**已存在**的 torrent 同样生效；入参 KB/s，内部 ×1024 字节/秒，0 = 不限（口径见 §6）。**踩到的坑**：libtorrent 默认把局域网与回环对端排除在全局限速之外（`upload_rate_limit` 只作用在 global peer class 上），只设那两个值时读数一切正常、局域网上一点没慢（实测 16 MiB loopback：设 2048 KB/s 仍按 31 MB/s 跑完）；内核在建会话时把私网段并进 global peer class 修掉（同一流量压到 ≈1.4 MB/s）。顺带修掉「端口兜底用 0」的缺陷（见 §8-2）。app 侧接线不在本轮
+- 本轮（M1.6 跨网发现）：内核接上自建 tracker（协议 §3.2）—— 建群 / 入群时登记 `groupHash20`，每群一条线程按**服务端下发的 interval**（默认 600 s、下限 300 s）announce；passkey 每小时轮换（`hex(HMAC-SHA256(kGrp, "huchuan/trk1/v1"‖gid‖小时整数))`），换小时先重新注册（带 `prevPasskey` 做连续性证明）再 announce；回来的 peers 进候选表，与 mDNS / 手动地址按 §3.4 合并去重、**优先级最低**（`CandidateMerge`）。配置项 `trackerBaseUrl` 为空 = 整个功能关闭：只失去跨网那一档，局域网照常，不报错、零请求。私有群的 infohash 仍然不进 DHT / PEX / LSD（协议 §8 不变），上报给 tracker 的只有伪 swarm 的 `groupHash20`；日志里 passkey 只留前 4 字符。接口与口径见 §3.5，常量见 §6
+- 上一轮（P7 全局限速接线前置）：内核补**会话级（全局）限速** —— `setSessionUploadLimit` / `setSessionDownloadLimit` / `sessionUploadLimitKbps` / `sessionDownloadLimitKbps`，运行期改立刻生效、对会话里**已存在**的 torrent 同样生效；入参 KB/s，内部 ×1024 字节/秒，0 = 不限（口径见 §6）。**踩到的坑**：libtorrent 默认把局域网与回环对端排除在全局限速之外（`upload_rate_limit` 只作用在 global peer class 上），只设那两个值时读数一切正常、局域网上一点没慢（实测 16 MiB loopback：设 2048 KB/s 仍按 31 MB/s 跑完）；内核在建会话时把私网段并进 global peer class 修掉（同一流量压到 ≈1.4 MB/s）。顺带修掉「端口兜底用 0」的缺陷（见 §8-2）。app 侧接线不在本轮
 - M1.5（上一轮）：三件事 —— ① **修「组队不成立」的缺陷**：`connectSeeders` 原来「有 1 条 peer 就整轮不拨」，单做种者先被连上后多个下载者永不互连；现在按「每成员一次拨号」，幂等去重 + 复用冷启动重连的退避与预算（`MemberDialPolicy`）。② **修「两端同时拨号永远连不上」的缺陷**：被 `duplicate_link` 裁决关掉的一侧原来只会退避重拨；现在认出「同一成员已有活链路」并直接沿用（`settleOnExistingLink`），僵尸链路不再参与裁决。③ **新增队友数观测读口** `kernel.teammates(gid, fileId)`（数据来自 libtorrent 的 peer 列表，无新协议字段、不用 0x53）。E0 实测 `D=1.1394 / T_all=301.7s / peers=2/2` → 结论「只做通告，不做分片」，见 docs/reports/e0-team.md
 - M1.4（上一轮）：补两个内核缺口 —— ① 冷启动后主动重连群成员（mDNS + 落盘的手动地址 + 上次连过的端点，指数退避 1/2/4/8/16/30 s、每群并发 3），完成后暴露 `KernelEvents.peersChanged` 给 P6；② 完成判定不再等 2 s 巡查节拍，libtorrent 的 `torrent_finished_alert` + 200 ms 兜底巡查当场推 `fileCompleted`（实测：事件比「本进程第一次看到 isComplete」只早 51 ms，另一次跑早 135 ms）。见 §3.3
 - M1.3（上一轮）：做种集合与完成判定合成一份来源（`SeedingLedger`），下载完成即进入做种集合，休眠、文件被移走删掉、数据不完整都移出；重启续种（原 G2）按 `state.json` 里的做种集合恢复做种，文件不在或大小不对就降级为休眠并记日志。修掉真机上「下完转做种自报 seeds=0」的缺陷（docs/m1-device.md §6-6）
-- 不在本文件范围：UI 实现细节（app/ 已通过 `M1Runtime` + `M1GroupStore` 接内核，没有 runtime 时回退 `InMemoryGroupStore`）、tracker 跨网（M2）、Android .so
+- 不在本文件范围：UI 实现细节（app/ 已通过 `M1Runtime` + `M1GroupStore` 接内核，没有 runtime 时回退 `InMemoryGroupStore`）、Android .so。跨网发现的**内核侧**本轮已就位（§3.5），但 `app/` / `daemon/` 本轮没有把 `trackerBaseUrl` 从配置读进来（那是下一条接线单），所以默认行为仍是「只有 mDNS + 手动」
 - M1.2 收敛（上一轮）：建群/入群时创建者登记自己的公钥（修掉 `file_list_rejected reason=no_pub`）、成员平台与做种数（G3，协议 §10 的 0x30 补两个可选字段）、每群每文件的未读游标（G4）、幂等的退群 `removeGroup`（G1）；接口签名见 §3.1
 - M1.1 收敛（对应 protocol.md §13 的第 2/3/4 条）：join.ok 用独立签名 domain 且验不过即断开、file.list 每条 entry 原样带 file.add 的原 sig 并按 addedBy 验签、公钥随 join.ok.members 与 member.name 分发；评论时延改本机时钟口径、单帧发送失败不再断整条连接
 
@@ -20,12 +21,12 @@ bash scripts/m1-headless.sh
 
 1. `./gradlew :core:jar :core:m1Deps :core:m1Native`（构建内核 + 拉依赖 + 解出 `libtorrent4j.dll`）
 2. `javac` 编译 harness（`harness/src/main/java`）
-3. 跑字节层自检 `SelfTest`（151 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；本轮新增会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃）
+3. 跑字节层自检 `SelfTest`（219 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃）
 4. 起 A、B 两个 JVM 进程跑 M1 全流程，然后只用 grep 复核日志
 
 产物：`artifacts/m1/log-A.log`、`log-B.log`、`selftest.log`、`a-data/`、`b-data/`（含 `state.json`、`identity.txt`、`downloads/`）。`artifacts/` 不进版本库。
 
-一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **1 分 40 秒左右**（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；本轮自检里新增的 loopback 限速用例固定多花 ~10 s）；脚本的 35 条 CHECK 全 PASS（自检 151 条另计）。
+一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **1 分 40 秒左右**（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；本轮跨网发现里要起两个真内核 + 两个本机 mock tracker，再多花 ~8 s）；脚本的 35 条 CHECK 全 PASS（自检 219 条另计，其中跨网发现一组 68 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
 
 本轮新增的三条硬断言在 harness 里。`scripts/m1-headless.sh` 本轮不动，它仍然只看 harness 的退出码（`process.rc_0_0` / `catchup.process_rc_0_0_0`）：harness 判 FAIL 即整轮 FAIL，脚本输出里也有对应的证据行。
 
@@ -76,7 +77,8 @@ G1/G3/G4 的运行时验证不在这条脚本里（脚本本轮不动），用�
 | `GroupRuntime.kt` | 一个群的运行时：成员表、文件清单、评论、连接、BT 任务、持久化快照；对外就是 GroupRuntime API。含「每成员一次拨号」(`connectSeeders`)、撞车后沿用既存活链路 (`settleOnExistingLink`)、队友数观测 (`teammates`) | §7 §11 |
 | `BtSession.kt` | libtorrent4j 私有会话：建 v1 私有种、加种/做种、swig `connect_peer`、单文件限速、**会话级（P7 全局）限速**（含私网段并进 global peer class）、dht_nodes、做种健康状态 `seedState`、对端列表快照 `peerSnapshot`（队友数与拨号去重的唯一数据源） | §4 §8 |
 | `Seeding.kt` | 「本机在做种的文件」唯一来源 `SeedingLedger`（下载完成进、休眠与文件缺失出、只数清单里还有的）+ 重启续种判定 `SeedRestore` | §7 |
-| `Discovery.kt` | JmDNS `_huchuan._tcp` 注册/浏览；手动 `IP:port` 解析 | §3.1 §3.3 §3.4 |
+| `Discovery.kt` | JmDNS `_huchuan._tcp` 注册/浏览；手动 `IP:port` 解析；四种来源的候选合并去重 `CandidateMerge`（manual/peer 3 > lan 2 > tracker 1，每群 128） | §3.1 §3.3 §3.4 |
+| `Tracker.kt` | 跨网发现（自建 tracker）：`TrackerProtocol`（groupHash20 / passkey / peer_id / 日志打码，纯函数）、`TrackerHttp`（HttpURLConnection，info_hash 按字节 %XX）、`TrackerReply`（BEP 3 bencode 应答）、`GroupTracker`（每群一条线程：注册 → announce → 券商候选 → 按服务端 interval 续）、`TrackerService`（内核装配点：baseUrl 为空就整个不存在） | §3.2 §3.4 |
 | `PeerLink.kt` | 一条消息层连接的全部语义：hello 绑定 → join → sync → 广播 → ping/bye/err | §2.3 §5 §7 §8 |
 | `PeerServer.kt` | 消息层监听（端口顺延）、TLS 握手、每条连接一个线程 | §5 |
 | `KernelEvents.kt` | 宿主事件出口 + 加入状态 + join 限速器 | §8 |
@@ -386,6 +388,55 @@ group.teammates(fileId: String): Int
 
 宿主不需要新事件：P3 的行内 chip / P4 的标题按需调 `kernel.teammates` 即可；文件到 100% 时同一个调用自动回到 0。
 
+### 3.5 跨网发现（tracker，本轮 M1.6）
+
+内核自己就是 tracker 客户端。**默认关**：只有宿主给了 `trackerBaseUrl` 才工作，且代码里没有写死的线上地址。
+
+```kotlin
+// 两种给法的效果一样；都必须在内核起来之前
+val kernel = M1Kernel(dataDir, deviceName, 47100, 51413, events, trackerBaseUrl = "https://<worker 域名>")
+// 或者
+kernel.setTrackerBaseUrl("https://<worker 域名>")   // 起来之后再调 → 忽略并记 tracker_config_ignored
+kernel.start()
+
+kernel.trackerBaseUrl    // 规范化后的基址（尾部斜杠已去掉）；空串 = 关闭
+kernel.trackerEnabled    // 真的在工作（配置有值 + 启动完成 + 没关）
+group.candidates()       // 候选表快照：manual/peer → lan → tracker，已按 §3.4 去重
+```
+
+| 项 | 口径 |
+|---|---|
+| 什么时候注册 | `createGroup` 与 `installJoinedGroup` 各调一次 `TrackerService.watch(group)`；`start()` 时对 `state.json` 恢复出来的群补一次。`removeGroup` 停掉该群并尽力补一条 `event=stopped` |
+| info_hash | `groupHash20 = SHA-256(UTF8("huchuan/gh1/v1") ‖ codeBytes)[0..20]`（协议 §2.2）。**不是文件的 infohash**：文件 swarm 那边 DHT / PEX / LSD 仍然全关（协议 §8），私有群的 infohash 不会出现在任何公网发现面上 |
+| 注册 | `POST {base}/api/tracker/register`，JSON `{infoHash, gid, passkey, prevPasskey?}`（口径以 `worker/README.md` + `worker/src/share.js` 为准） |
+| passkey | `hex(HMAC-SHA256(kGrp, UTF8("huchuan/trk1/v1") ‖ UTF8(gid) ‖ UTF8(小时整数十进制)))`，小时 = `floor(unix 毫秒 / 3600_000)`（UTC，与本地时区无关）。服务端只存它的哈希，从不看原文 |
+| 轮换 | 每小时换值：先重新注册（`prevPasskey` = 服务端记着的那一把）再 announce；注册成功前继续用旧那把 announce。断线跨过整点时按最近 6 小时逐个补连续性证明（`tracker_register_backfilled hours_back=N`）—— worker 只认「上一把」的哈希，这是「先到先得 + 每小时轮换」的固有代价 |
+| announce | `GET {base}/announce?info_hash=<%XX 20 字节>&peer_id=<%XX>&port=<消息层端口>&left=0&compact=1&numwant=32&event=started\|none\|stopped&passkey=<64 hex>`。`info_hash` / `peer_id` 按字节逐个 `%XX`：交给 `URLSearchParams` / `URLEncoder` 会按 UTF-8 解坏二进制 |
+| 端口 | **消息层端口**（`kernel.localMessagePort()`），不是 BT 端口：tracker 上的群级伪 swarm 登记的是「谁能跟我建消息层链路」（协议 §3.2） |
+| interval | 以服务端下发为准，夹在 `[max(min interval, 300), 3600]` 秒；没下发就用 600。下一拍同时不超过「本小时结束 + 1.5 s」，保证轮换赶在整点后第一拍 |
+| peers 去向 | `GroupRuntime.setTrackerCandidates`（整体替换，只活在内存里）→ `reconnectCandidates` → `CandidateMerge`。同键时 manual / peer（3）> lan（2）> tracker（1）；每群上限 128 |
+| 失败姿态 | 不抛、不弹窗、不影响局域网：注册/announce 失败按 30 s 退避重试，日志 `tracker_register_failed` / `tracker_announce_failed` / `tracker_announce_rejected`；服务端回 `bad passkey` 时清掉本地记住的那把，下一拍重新注册 |
+| 打码 | 所有日志与事件里的 passkey 只留前 4 个字符（`TrackerProtocol.mask` → `abcd****`）。验收里有一条硬断言：整轮事件里**不许**出现 passkey 原文 |
+| 关闭时 | baseUrl 为空 / 非法 → `tracker_disabled reason=base_url_empty\|base_url_must_be_http`，不建 `TrackerService`、不发任何请求 |
+
+可 grep 的内核事件（字段名即日志名）：
+
+| 事件 | 什么时候 | 关键字段 |
+|---|---|---|
+| `tracker_disabled` | 配置为空 / 非法 | `reason` |
+| `tracker_service_started` | 服务起来（baseUrl 有值） | `base` |
+| `tracker_started` | 某个群的 announcer 线程起来 | `gid` `base` `info_hash` |
+| `tracker_register` | 注册成功（首次 / 轮换 / 补连续性） | `gid` `passkey_masked` `prev_masked` `created` `rotated` `hour` |
+| `tracker_announce` | announce 成功 | `gid` `peers` `candidates` `interval` `external_ip` `passkey_masked` `event` |
+| `tracker_announce_rejected` | 服务端回 `failure reason` | `reason` `passkey_masked` |
+| `tracker_stopped` | 关内核 / 退群时补的 `event=stopped` | `gid` `passkey_masked` |
+
+验收（harness）：`MockTracker` 用 JDK 自带的 `com.sun.net.httpserver` 起一个本机最小 BEP 3 tracker，
+`TrackerSelfTest` 起真内核断言「注册参数 / announce 参数 / peers 并入候选表 / passkey 打码 / stopped / 空 baseUrl 零请求」。
+**不用线上 Worker 做测试**：本机访问 `*.workers.dev` 被 DNS 污染 / SNI 拦截，而且线上 peer 表不可控、不可重复。
+零请求那一条用 JVM 的 `ProxySelector` 记账（每次 `HttpURLConnection` 都会被问到），所以「没发请求」是可证伪的，
+不是「我没看见」。
+
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。
@@ -405,7 +456,8 @@ group.teammates(fileId: String): Int
 | `huchuan-reconnect` | 冷启动重连的调度（250 ms 一拍）：按退避与并发上限（每群 3）派拨号 | 只对 `start()` 时恢复出来的群工作；有在线链路时立刻把退避归零 |
 | `huchuan-reconnect-lan` | 每 10 s 刷新一次 mDNS 候选（按 gid 归群） | 浏览要 2–3 s，不能挂在拨号节拍上 |
 | `huchuan-reconnect-dial` | 一条候选一个线程：TLS + hello 绑定，等 `isBound` 最多 6 s | 失败只影响这一条候选，退避由调度器统一记 |
-| 调用方线程 | `createGroup`/`addFile`/`comment` 同步执行 | `joinByTail8` 阻塞 |
+| `huchuan-tracker-<gid 前 4>` | 每个群一条：注册（小时轮换）→ announce → 券商候选；睡到「服务端 interval」与「本小时结束」里更早的那个 | 睡得分段（500 ms 一步），内核一关 ≈0.5 s 内退出；只在 `trackerBaseUrl` 非空时存在 |
+| 调用方线程 | `createGroup`/`addFile`/`comment` 同步执行 | `joinByTail8` 阻塞；`kernel.close()` 里会等最多 2 s 把 `event=stopped` 发出去 |
 
 群内状态用 `GroupRuntime` 内部的锁保护；跨群/公钥/持久化用 kernel 的 `stateLock`。
 
@@ -454,6 +506,10 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 | 做种集合（M1.3） | 「本机在做种」只有一份：`addFile` 挂进会话、下载完成（`markCompleted`）、重启续种成功三处进；`stopFile`、文件被移走删掉、校验后缺片、退群四处出。做种数、`peer.announce.seeds`、P3 状态同一个读数 | `SeedingLedger`、`GroupRuntime.seedingFileCount` |
 | 冷启动重连（M1.4） | 只对 `start()` 时从 `state.json` 恢复的群；候选 = 落盘端点 → 手动地址 → mDNS（按 gid 归群）；退避 1/2/4/8/16/30 s（30 s 封顶）、每群并发 3；连上走 hello 绑定，不重新 join | `ReconnectPolicy`、`PeerReconnector`、`GroupRuntime.reconnectCandidates` |
 | 完成推送（M1.4） | `torrent_finished_alert` 入队即判 + 200 ms 兜底巡查；两条路同一个幂等的 `completeFile`，事件在判定当场推，不再等 2 s 巡查。日志 `download_completed source=alert\|sweep\|monitor` | `BtSession.onTorrentFinished`、`M1Kernel.completeFile`、`M1Kernel.COMPLETION_TICK_MS` |
+| 跨网发现的 info_hash（M1.6） | `groupHash20 = SHA-256(UTF8("huchuan/gh1/v1") ‖ codeBytes)[0..20]`（20 字节 `%XX` 进查询串）；**与文件 infohash 无关**，文件 swarm 侧 `0x380000`（DISABLE_DHT\|DISABLE_LSD\|DISABLE_PEX）不变 | `TrackerProtocol.groupHash20`、`TrackerHttp.announce` |
+| 跨网发现的 passkey（M1.6） | `hex(HMAC-SHA256(kGrp, UTF8("huchuan/trk1/v1") ‖ UTF8(gid) ‖ UTF8(小时十进制)))`；小时 = `floor(unix ms / 3600_000)`。拼接是**普通 UTF-8 字节**（与 worker 的 `tokenHashHex` / `passkeyHashHex` 同一口径），不是 signBytes 的长度前缀格式。日志一律 `TrackerProtocol.mask`（前 4 字符） | `TrackerProtocol.passkeyHex`、`Domains.TRACKER` |
+| 跨网发现的节奏（M1.6） | 注册后立刻 announce（`event=started`，之后 `none`）；interval 取服务端下发值夹到 `[max(min interval,300), 3600]`，缺省 600；下一拍不超过「本小时结束 + 1.5 s」；失败 30 s 退避 | `GroupTracker.tick` / `nextDelay` |
+| 候选合并（M1.6） | 四段来源按 §3.4 合并：manual/peer(3) > lan(2) > tracker(1)，同键留高优先级、同级留先出现的，非法端口丢弃，每群 128 | `CandidateMerge`、`GroupRuntime.reconnectCandidates` |
 | 完成事件与日志的顺序（M1.5） | `completeFile` **先写 `download_completed` 日志行、再推 `fileCompleted` 事件**：宿主常在回调里立刻读 `source`，反过来写会出现「事件已到、source 还是空」的窗口（harness 因此把快通道误判成慢通道过一次） | `M1Kernel.completeFile` |
 | 在线成员事件（M1.4） | `KernelEvents.peersChanged(group, dev, online)`：只在连接表变化（`attach` / `detach`）时回调，重连成功同样是一次 `online=true`；宿主据此重读 P6 | `KernelEvents.peersChanged`、`GroupRuntime.attach/detach` |
 | 冷启动重连的落盘 | `state.json` 每群多两个字段：`peerAddrs`（`[{dev, addr}]`，只记本机拨出去并绑定成功的端点）与 `manual`（`[host:port]`，join 时用过的手动地址）。旧库缺这两个字段 → 重连改走 mDNS | `GroupRuntime.toStoreJson`、`M1Kernel.loadState` |
@@ -490,7 +546,10 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 - **完成推送的 200 ms 兜底是真兜底，不是精度声明。** `torrent_finished_alert` 由 libtorrent 在自己的 session tick 里发，实测常被 200 ms 的兜底巡查抢先（`download_completed source=sweep`）。要更准只能等 libtorrent 的 tick 变快，不靠内核调参。
 - **队友数有三个口径边界。** ① 只在「部分」计数：本机 100%（或没挂进会话）立刻回 0；② `peer_info` 只有端点没有成员身份，所以靠「成员的 BT 端点（`peer.announce` 自报）↔ peer 列表端点」配对：本机拨出去的连接能按 host:port 精确配上，对端拨进来的连接只剩临时端口，只能按 host 退化成逐条分配 —— 同一台机器上跑多个成员（`127.0.0.1` 多个端口）时理论上可能配错人，局域网一台设备一个 IP 的常态下没问题；③ 它数的是 BT 连接实况，不是成员表，所以「成员表里有 3 人但只有 1 人连上」会显示 1，这是产品规格 §306 要的观测口径。
 - **撞车断言的证伪边界。** `harness/reconnect-race.sh` 在 loopback 上跑：TCP 是全双工且 EOF 必达，对称竞态本身能收敛，所以「永不 attach」这一症状要真机切断网络（半开连接）才复现。夹具因此把判据做成「撞车兜底必须走到（`race_settled ≥ 1`）+ 撞完 60 s 不抖」，并用 `-Dhuchuan.mutants=no_link_fallback` 反向臂证明它有证伪力；真机上的半开连接路径仍未自动化覆盖。
-- **无 tracker、无跨网。** M1 只有 mDNS + 手动。
+- **跨网只有「拿到端点」这一段，没有可达性那一档。** tracker 给的是「对端在公网上看起来的源地址 + 它自报的消息层端口」：家宽/蜂窝后面那个端口没做映射就打不通（UPnP / NAT-PMP / PCP、STUN 打洞都在 `docs/design/nat-traversal.md` 的分层里，内核没实现）。所以本轮的收口是「mDNS 找不到时还有一份跨网的地址可以试」，不是「跨网一定能连上」。
+- **tracker 的候选只喂给冷启动重连。** 候选并进 `GroupRuntime.candidates()`，实际拨号的是 `PeerReconnector` —— 它按已定的口径只对 `start()` 时从 `state.json` 恢复的群工作（§9 上一条）。运行中新建的群拿到 tracker peers 后不会主动拨号；「链接断了立刻按 tracker 重新拨」要等下一轮把拨号器从重连器里拆出来。
+- **tracker 的 passkey 连续性有上限。** worker 只认「上一把」的哈希（`worker/README.md`「先到先得」），内核在断线跨整点时按最近 6 小时逐个补证明；超过 6 小时没注册、又没有人替这个群轮换过，就只能一直注册失败（`tracker_register_failed`）。这是服务端口径的代价，不是客户端能绕的。
+- **`app/` / `daemon/` 还没接 tracker 配置。** 内核侧 `trackerBaseUrl` / `setTrackerBaseUrl` 已就绪，宿主读配置接线本条不在本轮（边界：只改 `core/`、`harness/`、`docs/core.md`）。
 - **评论的 seq 空洞只标记不补齐**：`pending` 池按 prev 链挂起（512 条/作者、10 min），没有做「按游标回补」的端到端用例。
 - **限速的验收边界**：单文件限速（`setUploadLimitKbps`）只接到 `TorrentHandle`，验收脚本没压测它的数值，真机脚本用 `throttle=1:2048` 间接验过一次；会话级（P7 全局）限速本轮在 SelfTest 里用 loopback 真流量钉住了「限速后确实慢下来（8 MiB / 1024 KB/s ≥ 5 s）」与「私网对端也在限速范围内」，但仍是回环，**跨网（非私网对端走 global class 的那条路）没有实测**；两个类同时限额时单条连接的瞬时速率会抖动（实测 127 KB/s–3.8 MB/s），看均值不看瞬时。
 - **补同步路径没有自动化覆盖**：常规两进程流程里文件靠 file.add 广播到达，`join.ok` 的 files 快照与 `file.list` 只在「加入时的清单为空」或「重连补差」时触发。快照路径用 `-Dm1.shareFirst=1`（A 先共享再等加入）手工跑过；`file.list` 的线上路径还没有用例，条目签名只在 `SelfTest` 里钉了编码与验签。
@@ -506,5 +565,6 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 
 1. 接 UI：P2/P3/P4/P5 换成 `M1Kernel` + `GroupRuntime`，把 `InMemoryGroupStore` 降级成空实现；顺便按 §3.1 接上 G1（退群入口）、G3（成员平台/做种数）、G4（P2 未读角标 + P4 打开即清零）；P6 挂 `KernelEvents.peersChanged` 刷新在线状态（§3.3）。
 2. Android 侧：自编 arm64 .so 换掉 `compileOnly` 的桌面制品，加 MulticastLock，`keySeed` 进 Keystore。
-3. M2：tracker（groupHash20 + passkey）、换码换钥 group.rotate、删除（log.del/file.del）、magnet 路径。
-4. 协议修订：把 §7 剩下没写死的地方（第 1 条的 hello 两阶段、第 5 条的多群 hello）写进协议，否则第三方实现没法互通；§7 的 2/3/4 已按 §10 实现完，protocol.md §13 的第 2/3/4 行可以结案（该表归设计 agent 维护，本轮未改）。
+3. 跨网接线：`daemon/`、`app/` 把 `trackerBaseUrl` 从配置（各自已有的设置落盘处）读出来交给 `M1Kernel`，P7 给一个「跨网发现」开关；然后把拨号器从 `PeerReconnector` 里拆出来，让运行中的群也能按 tracker 的 peers 立刻重拨（本轮只喂候选表）。
+4. M2 剩余：换码换钥 group.rotate、删除（log.del/file.del）、magnet 路径、可达性分层（`docs/design/nat-traversal.md` §8 的阶梯）。
+5. 协议修订：把 §7 剩下没写死的地方（第 1 条的 hello 两阶段、第 5 条的多群 hello）写进协议，否则第三方实现没法互通；§7 的 2/3/4 已按 §10 实现完，protocol.md §13 的第 2/3/4 行可以结案（该表归设计 agent 维护，本轮未改）。
