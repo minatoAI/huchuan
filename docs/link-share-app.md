@@ -15,7 +15,7 @@
 | P9 | `ui/ShareManageScreen.kt` | 文件名 / 剩余有效期 / 被访问 n 次 / 撤销（一次确认） |
 | 入口 | `ui/FileScreen.kt`、`ui/SettingsDrawer.kt`、`HuchuanApp.kt` | P4「…」→「分享链接」；P7「分享管理」 |
 
-- 分享者的信令预算改成「剩余有效期」（core 默认 15 s 是访客口径），否则挂着的分享每 15 s 被判 `connect-failed`；建链兜底交给发送端 30 s watchdog 与接收页 25 s。
+- 分享者等待预算由内核按分享有效期管理（core fbd24a2：等待期不判 `connect-failed`，访客在场时按 15 s 握手预算）；app 侧保留发送端 30 s 通道 watchdog 与接收页 25 s 兜底。
 - 二维码只由 zxing 出 BitMatrix、Compose Canvas 绘制，不调用在线二维码服务。
 - 失败只显示一句话：创建失败在 P8 状态位 +「重试」；信令/传输失败映射成「无法直连 / 传输超时 / 校验不一致 / 访客已离开」，不弹窗。
 
@@ -23,11 +23,12 @@
 
 | 项 | 结果 | 证据 |
 |---|---|---|
-| a 创建分享，二维码与链接出现 | PASS | `p8-share-created.png`（QR + `#s=32F0…` + 7 天后失效 + 等待访客）；QR 解码回同一链接：`qr-decoded.txt` |
+| a 创建分享，二维码与链接出现 | PASS | 最终构建 `p8-core2-waiting.png`（QR + `#s=3Y3A…` + 7 天后失效 + 等待访客）；QR 解码回同一链接：`qr-decoded.txt`（另含早前 32F0… 一例） |
 | b 本地 pages 接收 8 MiB | PASS | `python -m http.server 8765 --directory pages/public` + Edge headless：`result-r3.json`、`browser-r3.png`；bytes=8388608，sha256 与源一致（`baaeea25…`），`sha256Match=true`，落盘档 opfs |
-| b 复跑 | PASS | `result-r1/r2/r4.json` + 最终 APK `result-final.json` 五次全过（含 P9 启动会话后复用同一链接） |
+| b 复跑 | PASS | `result-r1/r2/r4.json` + `result-final.json` + 最终构建 `result-core2.json` 五次复跑全过（含 P9 启动会话后复用同一链接） |
 | c 撤销后新访客 | PASS | P9 撤销 `d1ec0bb8`（`share_revoke` / `link_revoked`）；同一链接再开 → `phase=gated`、`status=链接已失效`：`result-revoke.json`、`browser-revoke.png` |
-| 状态变化可见 | PASS | `p8-sending-37.png` / `p8-sending-62.png` / `p8-sent.png`；`logcat-evidence.txt`：`link_incoming → link_transferring → verify ok=true match=true → link_delivered` |
+| 状态变化可见 | PASS | 最终构建 `p8-core2-sending.png`（25%）→ `p8-core2-sent.png`（已发送）→ `p8-core2-waiting.png`（回到等待访客）；`logcat-evidence.txt`：`link_incoming → link_transferring → verify ok=true match=true → link_delivered` |
+| 访客 bye{done} | PASS | `guest-bye-ui-during.txt`（访客已加入）→ `guest-bye-ui-after.txt`（等待访客）；logcat `link_bye code=done → link_visit_end reason=bye-done state=signaling`，不卡在「已结束」 |
 | P9 列表 | PASS | `p9-share-list.png` / `p9-share-list-final.png`（3 条，被访问 0/1/2 次，均带「7 天后失效」与「撤销」）；P7 入口计数 3 |
 | P4 入口 | PASS | `p4-menu-share-link.png`（「…」→「分享链接」） |
 | 失败一句话 | PASS | 断网创建 → P8 只有「连不上分享服务」+「重试」，无弹窗；恢复网络点重试出新链接：`p8-create-failed.png` |

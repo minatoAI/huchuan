@@ -121,6 +121,12 @@ internal class LinkSession(
             controller.onServerRevoked(record.shareId)
             return
         }
+        if (code == "wait-expired") {
+            // 内核按分享有效期耗尽等待预算：链接到期，不再重连。
+            update(LinkLive(LinkPhase.REVOKED, failure = code))
+            controller.onExpired(record.shareId)
+            return
+        }
         update(LinkLive(LinkPhase.FAILED, failure = code))
         scheduleRestart(nextDelay())
     }
@@ -151,6 +157,13 @@ internal class LinkSession(
             if (phase == LinkPhase.CONNECTING || phase == LinkPhase.FAILED) {
                 update(LinkLive(LinkPhase.WAITING))
             }
+        }
+        // 访客结束/离开：core 在 state 本来就是 SIGNALING 时不会再发 stateChanged
+        // （例如访客 join 后还没 answer 就 bye{done}），所以从 link_visit_end 这个日志口收尾，
+        // 否则 P8 会卡在「访客已加入」。
+        if (event == "link_visit_end") {
+            closeSender()
+            update(LinkLive(LinkPhase.WAITING))
         }
     }
 
@@ -211,14 +224,11 @@ internal class LinkSession(
 
     private fun openSignal() {
         if (closed) return
-        // 分享者要挂着等访客，不能用 core 默认的 15 s 建链预算（那是「访客连上后多久必须配对成功」）。
-        // 这里把预算设成分享剩余有效期：等待期不误判 FAILED；建链阶段的超时由发送端的
-        // 通道 watchdog（LinkSender）与访客页自己的 25 s 兜底。
-        val budget = (record.expiresAt - System.currentTimeMillis())
-            .coerceIn(60_000L, LinkDefaults.TTL_MAX_SEC * 1000L)
-        val timeouts = LinkTimeouts(signalBudgetMs = budget)
+        // 等待预算由内核按分享有效期管理（core fbd24a2）：LinkTimeouts() 默认
+        // guestConnectBudgetMs=15 s、sharerWaitBudgetMs=0（=按 expiresAt 推），
+        // 等待期不判 connect-failed；建链阶段的兜底在发送端 30 s 通道 watchdog。
         val client = try {
-            SignalClient.forSharer(endpoint, identity, OkHttpTransportFactory, this, timeouts)
+            SignalClient.forSharer(endpoint, identity, OkHttpTransportFactory, this, LinkTimeouts())
         } catch (t: Throwable) {
             Log.w(M1Runtime.TAG, "event=link_session_bad share=" + record.shareId.take(8) + " error=" + t)
             update(LinkLive(LinkPhase.FAILED, failure = "bad-endpoint"))

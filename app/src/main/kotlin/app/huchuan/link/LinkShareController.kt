@@ -263,6 +263,12 @@ class LinkShareController(private val runtime: M1Runtime) {
         io.execute { closeSession(shareId) }
     }
 
+    /** 内核按有效期耗尽等待预算（wait-expired）：链接到期，移出 P9 并关会话。 */
+    internal fun onExpired(shareId: String) {
+        refreshShares()
+        io.execute { closeSession(shareId) }
+    }
+
     private fun startSession(record: StoredShare, device: DeviceIdentity, file: File, digest: String) {
         if (!record.active()) return
         synchronized(sessionLock) {

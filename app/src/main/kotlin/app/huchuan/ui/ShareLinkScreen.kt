@@ -292,7 +292,7 @@ fun expiryLabel(expiresAt: Long): String {
 /** 失败码 → 一句话（创建失败与信令失败共用；不弹窗）。 */
 @Composable
 fun linkFailureLabel(code: String): String = when {
-    code == "revoked" -> stringResource(R.string.p8_revoked)
+    code == "revoked" || code == "wait-expired" -> stringResource(R.string.p8_revoked)
     code == "missing-file" -> stringResource(R.string.p8_file_missing)
     code == "file-not-ready" -> stringResource(R.string.p8_file_not_ready)
     code == "file-empty" -> stringResource(R.string.p8_file_empty)
