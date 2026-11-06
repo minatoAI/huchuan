@@ -14,6 +14,50 @@ data class Candidate(val host: String, val port: Int, val source: String) {
 }
 
 /**
+ * 协议 §3.4：三种（现在是四种）来源的候选合并去重。
+ *
+ * 优先级 manual(3) > lan(2) > tracker(1)；「上次连过的端点」（source=peer）与手动地址同级 ——
+ * 两者都是明确指向某台机器的地址，一个是用户给的，一个是对端真的接通过。
+ *
+ * tracker 最低的理由：它只知道「这个群的某个成员在公网上的源地址 + 它自报的端口」，
+ * 端口要经过 NAT 映射才可达，而同一台机器在局域网里会被 mDNS 报成另一个（更可能可达的）地址。
+ * 所以同一个 host:port 同时出现在两个来源里时留高优先级那个，[Candidate.source] 记成赢得者。
+ *
+ * 顺序：按优先级稳定排序（同级保持调用方给的顺序），去重键是 host:port；
+ * 每群上限 [MAX_PER_GROUP]（§3.4 的 128），超出淘汰后进来的 —— 调用方按优先级给，先来的就是高优先级的。
+ */
+object CandidateMerge {
+
+    /** 每群候选上限（协议 §3.4）。 */
+    const val MAX_PER_GROUP = 128
+
+    fun rank(source: String): Int = when (source) {
+        "manual", "peer" -> 3
+        "lan" -> 2
+        "tracker" -> 1
+        else -> 0
+    }
+
+    /**
+     * 合并并去重。[lists] 的每一段是一类来源（彼此重复也不要紧，去重键是 host:port）；
+     * 同键留优先级高的，同级留先出现的。返回的顺序即「该先拨谁」。
+     */
+    fun merge(lists: List<List<Candidate>>): List<Candidate> {
+        val flat = ArrayList<Candidate>()
+        for (list in lists) flat.addAll(list)
+        val ordered = flat.sortedByDescending { rank(it.source) }
+        val out = LinkedHashMap<String, Candidate>()
+        for (candidate in ordered) {
+            if (candidate.host.isEmpty() || candidate.port <= 0 || candidate.port > 65535) continue
+            if (out.containsKey(candidate.key)) continue
+            out[candidate.key] = candidate
+            if (out.size >= MAX_PER_GROUP) break
+        }
+        return out.values.toList()
+    }
+}
+
+/**
  * 一个 DNS-SD 实例（协议 §3.1 的一条广播）与其解析出的全部地址。
  *
  * [open] 是 TXT 的 `r`：是否还开着加入。冷启动重连不看这一位 —— 已经是成员的群，

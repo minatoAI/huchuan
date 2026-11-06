@@ -87,6 +87,14 @@ class GroupRuntime internal constructor(
      */
     internal val manualAddrs = LinkedHashSet<String>()
 
+    /**
+     * tracker 最近一次 announce 回来的端点（协议 §3.2）：别的成员在公网上的 `(源 ip, 消息层端口)`。
+     *
+     * 只活在内存里 —— 它本来就是「刚问过服务端的那份名单」，落盘没有意义，重启后下一拍
+     * announce 会再拿回来。合并进 [reconnectCandidates] 时优先级最低（§3.4）。
+     */
+    private val trackerCandidates = ArrayList<Candidate>()
+
     /** 已连接的 BT 端点（做种侧标记用）。 */
     internal val connectedEndpoints = HashSet<String>()
 
@@ -870,15 +878,15 @@ class GroupRuntime internal constructor(
     }
 
     /**
-     * 冷启动重连的候选，按优先级：上次连过的端点 → 手动地址 → 传入的 mDNS 候选。
+     * 冷启动重连的候选，按优先级（协议 §3.4）：上次连过的端点 → 手动地址 → mDNS 候选 → tracker。
      *
-     * 按 host:port 去重，先出现的来源赢（同一个地址既在手动地址里又有 mDNS 时，记 manual，
-     * 口径同协议 §3.4）。本机自己的地址不发出去：本机不可能连自己。
+     * 合并去重整个交给 [CandidateMerge]：同一 host:port 只留优先级最高的那个来源，
+     * 每群上限 128。本机自己的端点不发出去 —— 本机不可能连自己。
      */
     internal fun reconnectCandidates(lan: List<Candidate>): List<Candidate> {
-        val out = LinkedHashMap<String, Candidate>()
         val saved = ArrayList<Candidate>()
         val manual = ArrayList<Candidate>()
+        val tracked = ArrayList<Candidate>()
         synchronized(lock) {
             for ((dev, addr) in peerAddrs) {
                 if (dev == kernel.deviceId) continue
@@ -889,12 +897,24 @@ class GroupRuntime internal constructor(
                 val c = ManualCandidate.parse(addr) ?: continue
                 manual.add(c.copy(source = "manual"))
             }
+            tracked.addAll(trackerCandidates)
         }
-        for (c in saved) if (!out.containsKey(c.key)) out[c.key] = c
-        for (c in manual) if (!out.containsKey(c.key)) out[c.key] = c
-        for (c in lan) if (!out.containsKey(c.key)) out[c.key] = c
-        return out.values.toList()
+        return CandidateMerge.merge(listOf(saved, manual, lan, tracked))
     }
+
+    /**
+     * tracker 的 announce 结果 —— 整体替换，不做增量：服务端每次给的就是「现在这个群里还在的人」，
+     * 上一轮里已经消失的端点留着只会让重连去拨空地址。
+     */
+    internal fun setTrackerCandidates(list: List<Candidate>) {
+        synchronized(lock) {
+            trackerCandidates.clear()
+            trackerCandidates.addAll(list)
+        }
+    }
+
+    /** 当前候选表快照（mDNS 的实时结果不在这里，由重连线程自己合）。P7 诊断与验收读它。 */
+    fun candidates(): List<Candidate> = reconnectCandidates(emptyList())
 
     internal fun linkFor(dev: String): PeerLink? = synchronized(lock) { links[dev] }
 
@@ -1178,6 +1198,7 @@ class GroupRuntime internal constructor(
             // 退群之后这些端点既不该再被拨，也不该留在 state.json 里
             peerAddrs.clear()
             manualAddrs.clear()
+            trackerCandidates.clear()
             ids
         }
         var stopped = 0

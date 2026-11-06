@@ -67,6 +67,7 @@ public final class SelfTest {
             reconnectPolicy();
             memberDialPolicy();
             sessionRateLimits();
+            tracker();
             signBytes();
             json();
             framing();
@@ -84,6 +85,15 @@ public final class SelfTest {
         }
         System.out.println("RESULT=FAIL");
         System.exit(1);
+    }
+
+    /**
+     * 跨网发现（自建 tracker）：groupHash20 / passkey 公式、注册与 announce 参数、peer 并入候选表、
+     * baseUrl 为空时零请求。装置是一个本机最小 BEP 3 tracker（[MockTracker]），
+     * 断言全在 [TrackerSelfTest] 里，避免把一个已经很长的字节层自检撑爆。
+     */
+    private static void tracker() {
+        TrackerSelfTest.run(SelfTest::check);
     }
 
     private static void check(String name, boolean ok) {
