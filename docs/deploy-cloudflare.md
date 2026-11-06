@@ -172,7 +172,8 @@ P7 状态行写「仅局域网」，「…」里没有「分享链接」；P7 �
 ```
 pages/
   wrangler.toml              Pages 项目配置，services 绑定就这一段
-  public/index.html          根路径一个极简页，避免 / 落到 404
+  public/_redirects          / 与 /r/* 重写（200）到 /recv/，支持 /r/<token> 与 /#s=<token> 两种链接形状
+  public/recv/               浏览器接收页（边收边落盘：FSA → OPFS → 内存档 128 MiB 上限）
   public/404.html            没有 404 页时 Pages 会把未匹配路径回成 200 + index.html；加了这个才回真 404
   functions/health.js        /health        → env.RELAY.fetch(request)
   functions/announce.js      /announce      → 同上
