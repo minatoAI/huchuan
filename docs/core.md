@@ -772,6 +772,28 @@ magnet 的 `btih` 与新 infohash 一致；public 条目出现（scope=public、
 被移除的公开条目仍然不在清单、私有条目还在；重新发布拿回同一个 pubId；再重启一次，`published` 映射
 让重复发布走幂等快路径（`reused=true`）。失败码文案齐全且互不相同、`no_group` / `no_file` 两条真实走通。
 
+### 3.10 端到端验收：公开磁力下载（本轮 e2e-public）
+
+`bash scripts/e2e-public.sh` 一条命令跑两个独立 JVM，最后一行 `PASS` / `FAIL`（本机实测 17 s，含增量构建；冷构建约 1–2 min）：
+
+- **A3**：建群 → 共享 32 MiB 私有文件 → `publishPublic` → 等 B3；
+- **B3**：只用后 8 位加入 → 从 `join.ok` 拿到 `scope=public` 的磁力条目（无内联 .torrent）→
+  `startDownload`（生产路径，内部 `PublicBtSession.addMagnet`）→ 按 `peer.announce.pubBtPort`
+  拨 A3 的公开会话 → BEP 9 取元数据 → 下载 → SHA-256 → 评论回 A3。
+
+断言钉住五件事：① B 的条目 `scope=public` / 有 magnet / 无内联种子，A 的 private 条目仍在做种；
+② B 的 `bt_connect_peer` / `download_start` 全是 `sess=pub`，私有会话里没有这个 torrent（`status=missing`）；
+③ B 激活前 `<data>/public/meta/<infohash>.torrent` 不存在，元数据到达时刻晚于 A 的 `public_publish`
+   且晚于 B 加入，缓存 mtime 也晚于 A 发布；④ B 的 `payload_downloaded` 与 A 的公开会话
+   `payload_uploaded` 都 ≥ 32 MiB；⑤ 两端日志值与脚本独立复算的 SHA-256 一致。
+
+`addPublicMagnet` 对已在群清单里的 infohash 按 §3.6 返回 `duplicate`，所以群成员下载公开条目的
+生产路径是 `startDownload`（内部同一条磁力路径）；harness 同时断言这条 duplicate 口径。
+
+反证：`E2E_MUTANT=publish_private bash scripts/e2e-public.sh` 把建种的 private 位翻回 1
+（core 里的默认关闭测试钩子 `-Dhuchuan.mutants=publish_private`），发布必然失败，脚本必须 `FAIL`。
+证据：`artifacts/e2e-public/log-A3.log` / `log-B3.log`；断言表见 `docs/reports/e2e-public.md`。
+
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。

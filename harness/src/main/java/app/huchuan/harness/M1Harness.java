@@ -1,10 +1,13 @@
 package app.huchuan.harness;
 
+import app.huchuan.core.FileScope;
 import app.huchuan.core.m1.FileEntry;
 import app.huchuan.core.m1.GroupRuntime;
 import app.huchuan.core.m1.KernelEvents;
 import app.huchuan.core.m1.M1Kernel;
 import app.huchuan.core.m1.OpRecord;
+import app.huchuan.core.m1.PublicMagnetResult;
+import app.huchuan.core.m1.PublicPublishResult;
 
 import java.io.BufferedInputStream;
 import java.io.File;
@@ -23,6 +26,8 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * M1 无头夹具：两个独立 JVM 进程（A / B）跑完整流程。
@@ -45,6 +50,11 @@ import java.util.concurrent.TimeUnit;
  *       等 B2 离线 → 在没人收广播的时刻共享第 N+1 条 → 等 B2 重连收工
  *   B2  只拿后 8 位加入（phase=1）或带着本地库重连（phase=2），把「广播来的」与「file.list
  *       补来的」分开计数：内核在广播路径打 file_add、在补差路径打 file_list_entry。
+ *
+ * 第三组角色跑公开种子的端到端验收（scripts/e2e-public.sh）：
+ *   A3  建群 → 共享 32 MiB 私有文件 → publishPublic → 等 B3 的 SHA 评论
+ *   B3  只用后 8 位加入 → 拿 scope=public 的磁力条目 → 激活 → 元数据从 A3 的公开会话过来 →
+ *       下载 → SHA-256 → 评论回 A3
  */
 public final class M1Harness {
 
@@ -131,6 +141,10 @@ public final class M1Harness {
                 runCatchupHost(workDir, dataDir, msgPort, btPort, opts);
             } else if ("B2".equals(role)) {
                 runCatchupJoin(workDir, dataDir, msgPort, btPort, opts);
+            } else if ("A3".equals(role)) {
+                runPublishHost(workDir, dataDir, msgPort, btPort, opts);
+            } else if ("B3".equals(role)) {
+                runPublicMagnetJoin(workDir, dataDir, msgPort, btPort, opts);
             } else {
                 System.err.println("bad role: " + role);
                 System.exit(2);
@@ -797,6 +811,308 @@ public final class M1Harness {
         }
     }
 
+    // ------------------------------------------------------------------ A3 / B3：公开磁力端到端
+
+    /**
+     * A3：公开到群外（publishPublic）→ 等 B3 用纯磁力把同一份内容从**公开会话**下完。
+     *
+     * 与 A/B 那组的差别：这里下载方拿到的是一条 scope=public 的条目（只有 magnet、没有内联
+     * .torrent），数据必须从 A3 的 PublicBtSession 走 BEP 9 元数据 + 公开 swarm 传过去。
+     * 判据全部落在日志上：A3 的 public_publish 时刻、B3 的 public_metadata_arrived 时刻、
+     * B3 的 bt_connect_peer/download_start 的 sess=pub、两端的 SHA-256。
+     *
+     * 证伪点（scripts/e2e-public.sh 的 E2E_MUTANT=publish_private）：把 publishPublic 建种时的
+     * private 位翻回 1，公开会话按 BEP 27 拒种，A3 的 public_publish_done 变成 ok=false，
+     * 场景当场 FAIL。
+     */
+    static void runPublishHost(Path workDir, Path dataDir, int msgPort, int btPort, Map<String, String> opts)
+            throws Exception {
+        String name = opts.getOrDefault("name", "A3_的笔记本");
+        String groupName = opts.getOrDefault("group_name", "公开磁力验收群");
+        RunLog.out("M1 A3 run_begin role=A3 run_id=" + RunLog.runId()
+                + " mutant=" + mutantName()
+                + " work_dir=" + clean(workDir.toString())
+                + " data_dir=" + clean(dataDir.toString()));
+
+        PubEvents events = new PubEvents("A3");
+        M1Kernel kernel = new M1Kernel(dataDir.toFile(), name, msgPort, btPort, events);
+        kernel.start();
+        RunLog.out("M1 A3 bt_probe " + Probe.of(kernel).sessionLine());
+        RunLog.out("M1 A3 net_ports msg_port=" + kernel.localMessagePort()
+                + " bt_port=" + kernel.localBtPort());
+
+        try {
+            GroupRuntime group = kernel.createGroup(groupName);
+            String code = group.getInviteCode();
+            RunLog.out("M1 A3 invite_code=" + code);
+            RunLog.out("M1 A3 invite_tail8=" + code.substring(8));
+            RunLog.out("M1 A3 group_id=" + group.getGroupId() + " fp=" + group.getFingerprint());
+
+            FileEntry priv = sharePayload("A3", group, workDir);
+            RunLog.out("M1 A3 private_entry file_id=" + priv.getFileId()
+                    + " scope=" + priv.getScope().getWire()
+                    + " inline_torrent=" + (priv.getTorrent().isEmpty() ? "no" : "yes"));
+
+            PublicPublishResult pub = kernel.publishPublic(group.getGroupId(), priv.getFileId());
+            long publishDoneAt = System.currentTimeMillis();
+            RunLog.out("M1 A3 public_publish_done ok=" + pub.getOk()
+                    + " reason=" + pub.getReason()
+                    + " private_file_id=" + priv.getFileId()
+                    + " pub_infohash=" + pub.getFileId()
+                    + " magnet=" + clean(pub.getMagnet())
+                    + " ts=" + publishDoneAt
+                    + " public_port=" + kernel.publicSessionPort()
+                    + " public_torrents=" + kernel.publicTorrentCount());
+            if (!pub.getOk()) {
+                fail("A3", "publish_failed reason=" + pub.getReason());
+                return;
+            }
+            FileEntry pubEntry = group.file(pub.getFileId());
+            FileEntry privEntry = group.file(priv.getFileId());
+            RunLog.out("M1 A3 files_state files=" + group.files().size()
+                    + " private_file_id=" + (privEntry == null ? "none" : privEntry.getFileId())
+                    + " private_scope=" + scopeOf(privEntry)
+                    + " private_seeding=" + (group.localRole(priv.getFileId()) == GroupRuntime.LocalRole.SEEDING)
+                    + " public_file_id=" + (pubEntry == null ? "none" : pubEntry.getFileId())
+                    + " public_scope=" + scopeOf(pubEntry)
+                    + " public_magnet=" + (pubEntry != null && !pubEntry.getMagnet().isEmpty() ? "yes" : "no")
+                    + " public_inline_torrent=" + (pubEntry != null && !pubEntry.getTorrent().isEmpty() ? "yes" : "no"));
+
+            if (!events.memberJoined.await(JOIN_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                fail("A3", "member_join_timeout");
+                return;
+            }
+            RunLog.out("M1 A3 member_joined dev=" + events.lastMemberDev
+                    + " name=" + clean(events.lastMemberName)
+                    + " ts=" + System.currentTimeMillis());
+
+            if (!events.opReceived.await(WAIT_MS, TimeUnit.MILLISECONDS)) {
+                fail("A3", "b_report_timeout");
+                return;
+            }
+            RunLog.out("M1 A3 b_report body=" + clean(events.lastOpBody)
+                    + " ts=" + System.currentTimeMillis());
+            // B 已经发完评论，数据面不可能还在传大块；给上传计数 500 ms 落地时间。
+            Thread.sleep(500);
+            RunLog.out("M1 A3 public_probe " + Probe.ofPublic(kernel).torrentLine(pub.getFileId()));
+            RunLog.out("M1 A3 private_probe " + Probe.of(kernel).torrentLine(priv.getFileId()));
+            RunLog.out("M1 A3 sessions private_torrents=" + kernel.privateTorrentCount()
+                    + " public_torrents=" + kernel.publicTorrentCount()
+                    + " public_port=" + kernel.publicSessionPort());
+            RunLog.out("M1 A3 flow_done");
+            stopSampler();
+            kernel.close();
+            RunLog.out("RESULT=PASS");
+            System.exit(0);
+        } finally {
+            stopSampler();
+        }
+    }
+
+    /**
+     * B3：只用后 8 位加入 → 从 A3 的公开条目拿到 magnet → 激活公开条目 → 等元数据从 A3 的
+     * 公开会话过来 → 下载 → SHA-256。
+     *
+     * 关键口径：
+     *  - **不调 addPublicMagnet 来下载**：该 API 对「群清单里已经有的 infohash」按 §3.6 判
+     *    duplicate，群成员下载公开条目的生产路径是 GroupRuntime.startDownload（内部走
+     *    PublicBtSession.addMagnet，同一条磁力路径）。这里先调一次 addPublicMagnet 断言
+     *    duplicate，再走生产路径。
+     *  - 元数据必须晚于 A3 的 public_publish，且 B3 在激活前没有 <data>/public/meta/<infohash>.torrent
+     *    —— 证明元数据是刚通过公开 swarm 从 A3 取来的，不是本地缓存。
+     *  - 传输面只认 sess=pub 的 bt_connect_peer / download_start；B3 的私有会话里不能有这个 torrent。
+     */
+    static void runPublicMagnetJoin(Path workDir, Path dataDir, int msgPort, int btPort, Map<String, String> opts)
+            throws Exception {
+        String tail8 = opts.get("tail8");
+        if (tail8 == null || tail8.length() != 8) {
+            fail("B3", "missing_tail8");
+            return;
+        }
+        List<String> manual = new ArrayList<>();
+        for (String part : opts.getOrDefault("manual", "").split(",")) {
+            if (!part.trim().isEmpty()) {
+                manual.add(part.trim());
+            }
+        }
+        String name = opts.getOrDefault("name", "B3_的台式机");
+        RunLog.out("M1 B3 run_begin role=B3 run_id=" + RunLog.runId()
+                + " mutant=" + mutantName()
+                + " work_dir=" + clean(workDir.toString())
+                + " data_dir=" + clean(dataDir.toString()));
+
+        PubEvents events = new PubEvents("B3");
+        M1Kernel kernel = new M1Kernel(dataDir.toFile(), name, msgPort, btPort, events);
+        kernel.start();
+        RunLog.out("M1 B3 bt_probe " + Probe.of(kernel).sessionLine());
+        RunLog.out("M1 B3 net_ports msg_port=" + kernel.localMessagePort()
+                + " bt_port=" + kernel.localBtPort());
+
+        try {
+            RunLog.out("M1 B3 join_input tail8=" + tail8 + " manual=" + String.join(",", manual));
+            GroupRuntime group = kernel.joinByTail8(tail8, manual, Math.min(90_000L, WAIT_MS));
+            if (group == null) {
+                fail("B3", "join_failed");
+                return;
+            }
+            long joinedAt = System.currentTimeMillis();
+            RunLog.out("M1 B3 joined gid=" + group.getGroupId()
+                    + " fp=" + group.getFingerprint()
+                    + " members=" + group.members().size()
+                    + " files=" + group.files().size()
+                    + " ts=" + joinedAt);
+
+            FileEntry pub = waitForPublicEntry(group, WAIT_MS);
+            if (pub == null) {
+                fail("B3", "public_entry_not_seen");
+                return;
+            }
+            String pubId = pub.getFileId();
+            int privCount = 0;
+            int pubCount = 0;
+            for (FileEntry e : group.files()) {
+                if (e.getScope() == FileScope.PUBLIC) {
+                    pubCount++;
+                } else {
+                    privCount++;
+                }
+            }
+            RunLog.out("M1 B3 public_entry_seen file_id=" + pubId
+                    + " name=" + clean(pub.getName())
+                    + " size=" + pub.getSize()
+                    + " scope=" + pub.getScope().getWire()
+                    + " magnet=" + (pub.getMagnet().isEmpty() ? "no" : "yes")
+                    + " inline_torrent=" + (pub.getTorrent().isEmpty() ? "no" : "yes")
+                    + " ts=" + System.currentTimeMillis());
+            RunLog.out("M1 B3 entries files=" + group.files().size()
+                    + " private=" + privCount + " public=" + pubCount);
+            if (!pub.getMagnet().startsWith("magnet:?xt=urn:btih:" + pubId)) {
+                fail("B3", "bad_magnet");
+                return;
+            }
+            File meta = new File(new File(new File(dataDir.toFile(), "public"), "meta"), pubId + ".torrent");
+            RunLog.out("M1 B3 pre_metadata_cache exists=" + meta.isFile()
+                    + " path=" + clean(meta.getAbsolutePath()));
+
+            // addPublicMagnet 对已在群清单里的 infohash 按 §3.6 判 duplicate：这是 API 口径，
+            // 也说明群成员下载公开条目必须走 startDownload（内部同一条 PublicBtSession.addMagnet）。
+            PublicMagnetResult dup = kernel.addPublicMagnet(group.getGroupId(), pub.getMagnet(), null, 1000);
+            RunLog.out("M1 B3 add_public_magnet_probe ok=" + dup.getOk()
+                    + " reason=" + dup.getReason() + " expect=duplicate");
+
+            long portDeadline = System.currentTimeMillis() + 30_000L;
+            while (events.aPubBtPort.get() <= 0 && System.currentTimeMillis() < portDeadline) {
+                Thread.sleep(100);
+            }
+            RunLog.out("M1 B3 a_pub_bt_port port=" + events.aPubBtPort.get()
+                    + " announces=" + events.pubPortAnnounces.get());
+
+            boolean started = group.startDownload(pubId);
+            RunLog.out("M1 B3 activation ok=" + started + " file_id=" + pubId
+                    + " ts=" + System.currentTimeMillis());
+            if (!started) {
+                fail("B3", "download_not_started");
+                return;
+            }
+
+            long deadline = System.currentTimeMillis() + WAIT_MS;
+            while (events.metadataAt.get() == 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(100);
+            }
+            FileEntry afterMeta = group.file(pubId);
+            RunLog.out("M1 B3 metadata_arrived ts=" + events.metadataAt.get()
+                    + " size=" + (afterMeta == null ? -1 : afterMeta.getSize())
+                    + " piece_size=" + (afterMeta == null ? -1 : afterMeta.getPieceSize())
+                    + " cache_exists=" + meta.isFile()
+                    + " cache_mtime=" + meta.lastModified());
+            if (events.metadataAt.get() == 0) {
+                RunLog.out("M1 B3 transfer_stats " + Probe.ofPublic(kernel).torrentLine(pubId));
+                fail("B3", "metadata_timeout");
+                return;
+            }
+
+            long dlStart = System.currentTimeMillis();
+            int lastPct = -1;
+            int maxPeers = 0;
+            boolean complete = false;
+            while (System.currentTimeMillis() < deadline) {
+                int peers = group.peerCount(pubId);
+                if (peers > maxPeers) {
+                    maxPeers = peers;
+                }
+                int pct = (int) (group.progress(pubId) * 100.0);
+                if (pct != lastPct) {
+                    RunLog.out("M1 B3 progress pct=" + pct);
+                    lastPct = pct;
+                }
+                if (group.isComplete(pubId)) {
+                    complete = true;
+                    break;
+                }
+                Thread.sleep(100);
+            }
+            RunLog.out("M1 B3 transfer_peers max=" + maxPeers
+                    + " elapsed_ms=" + (System.currentTimeMillis() - dlStart));
+            if (!complete) {
+                RunLog.out("M1 B3 transfer_stats " + Probe.ofPublic(kernel).torrentLine(pubId));
+                fail("B3", "download_timeout");
+                return;
+            }
+            File saved = group.savedFile(pubId);
+            if (saved == null || !saved.isFile()) {
+                RunLog.out("M1 B3 transfer_stats " + Probe.ofPublic(kernel).torrentLine(pubId));
+                fail("B3", "download_file_missing");
+                return;
+            }
+            String sha = sha256(saved);
+            RunLog.out("M1 B3 download_done file_id=" + pubId
+                    + " bytes=" + saved.length()
+                    + " sha256=" + sha
+                    + " saved_path=" + clean(saved.getAbsolutePath())
+                    + " elapsed_ms=" + (System.currentTimeMillis() - dlStart));
+            RunLog.out("M1 B3 transfer_stats " + Probe.ofPublic(kernel).torrentLine(pubId));
+            RunLog.out("M1 B3 private_probe " + Probe.of(kernel).torrentLine(pubId));
+            RunLog.out("M1 B3 sessions private_torrents=" + kernel.privateTorrentCount()
+                    + " public_torrents=" + kernel.publicTorrentCount()
+                    + " public_port=" + kernel.publicSessionPort());
+            RunLog.out("M1 B3 counters pub_dials=" + events.pubDials.get()
+                    + " priv_dials=" + events.privDials.get()
+                    + " pub_downloads=" + events.pubDownloads.get()
+                    + " priv_downloads=" + events.privDownloads.get());
+
+            OpRecord op = group.comment(pubId, "e2e-public sha256=" + sha, null);
+            RunLog.out("M1 B3 comment_sent op_id=" + op.getOpId()
+                    + " body=" + clean(op.getBody())
+                    + " ts=" + System.currentTimeMillis());
+            Thread.sleep(500);
+            RunLog.out("M1 B3 flow_done");
+            stopSampler();
+            kernel.close();
+            RunLog.out("RESULT=PASS");
+            System.exit(0);
+        } finally {
+            stopSampler();
+        }
+    }
+
+    /** 等 B3 清单里出现第一条 scope=public 的条目（join.ok 快照 / file.add 两条路都算）。 */
+    static FileEntry waitForPublicEntry(GroupRuntime group, long timeoutMs) throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            for (FileEntry entry : group.files()) {
+                if (entry.getScope() == FileScope.PUBLIC) {
+                    return entry;
+                }
+            }
+            Thread.sleep(100);
+        }
+        return null;
+    }
+
+    static String scopeOf(FileEntry entry) {
+        return entry == null ? "none" : entry.getScope().getWire();
+    }
+
     /** 造一条「签名对不上」的条目：fileId 与 name 都改过，sig 仍是被顶替那条 file.add 的原签名。 */
     static FileEntry poisonedEntry(GroupRuntime group, FileEntry base) {
         String poisonId = "";
@@ -950,6 +1266,11 @@ public final class M1Harness {
 
     /** 生成/复用 32 MiB 载荷 → 建 v1 私有种 → 共享（做种并广播 file.add）。 */
     static FileEntry sharePayload(GroupRuntime group, Path workDir) throws Exception {
+        return sharePayload("A", group, workDir);
+    }
+
+    /** 同一段共享逻辑，日志角色可换（A3 公开磁力验收用）。 */
+    static FileEntry sharePayload(String role, GroupRuntime group, Path workDir) throws Exception {
         Path shareDir = workDir.resolve("share");
         Files.createDirectories(shareDir);
         File payload = shareDir.resolve("payload-32m.bin").toFile();
@@ -957,10 +1278,10 @@ public final class M1Harness {
             createRandomFile(payload, FILE_SIZE);
         }
         String sha = sha256(payload);
-        RunLog.out("M1 A file_sha256=" + sha + " file_bytes=" + payload.length());
+        RunLog.out("M1 " + role + " file_sha256=" + sha + " file_bytes=" + payload.length());
 
         FileEntry entry = group.addFile(payload);
-        RunLog.out("M1 A file_shared file_id=" + entry.getFileId()
+        RunLog.out("M1 " + role + " file_shared file_id=" + entry.getFileId()
                 + " name=" + clean(entry.getName())
                 + " size=" + entry.getSize()
                 + " piece_size=" + entry.getPieceSize());
@@ -1345,6 +1666,110 @@ public final class M1Harness {
                     "recv_at", String.valueOf(recvAt),
                     "body", op.getBody()));
             COMMENT_RECEIVED.countDown();
+        }
+    }
+
+    // ------------------------------------------------------------------ 公开磁力验收的事件出口
+
+    /**
+     * A3/B3 专用的事件出口：在既有 Events 之外补三样东西 ——
+     *  1. 每一行带 `ts=<本机毫秒>`：元数据到达与 A3 发布完成的先后顺序只按本机时钟比；
+     *  2. 只数 `bt_connect_peer` / `download_start` 的 sess=pub|priv：传输面走哪套会话是断言本身；
+     *  3. peer.announce 里 A3 的 pubBtPort：B3 的公开拨号目标。
+     *
+     * 不改 Events 的输出格式：scripts/m1-headless.sh 的 grep 口径保持原样。
+     */
+    static final class PubEvents extends KernelEvents {
+        private final String role;
+        final CountDownLatch memberJoined = new CountDownLatch(1);
+        final CountDownLatch opReceived = new CountDownLatch(1);
+        final AtomicLong metadataAt = new AtomicLong(0);
+        final AtomicInteger pubDials = new AtomicInteger();
+        final AtomicInteger privDials = new AtomicInteger();
+        final AtomicInteger pubDownloads = new AtomicInteger();
+        final AtomicInteger privDownloads = new AtomicInteger();
+        final AtomicInteger pubPortAnnounces = new AtomicInteger();
+        final AtomicInteger aPubBtPort = new AtomicInteger(0);
+        volatile String lastMemberDev = "";
+        volatile String lastMemberName = "";
+        volatile String lastOpBody = "";
+        volatile long fileCompletedAt = 0L;
+
+        PubEvents(String role) {
+            this.role = role;
+        }
+
+        @Override
+        public void log(String event, Map<String, String> fields) {
+            long now = System.currentTimeMillis();
+            if ("public_metadata_arrived".equals(event)
+                    || "pub_magnet_metadata_received".equals(event)) {
+                metadataAt.compareAndSet(0L, now);
+            } else if ("bt_connect_peer".equals(event)) {
+                String sess = fields.getOrDefault("sess", "");
+                if ("pub".equals(sess)) {
+                    pubDials.incrementAndGet();
+                } else if ("priv".equals(sess)) {
+                    privDials.incrementAndGet();
+                }
+            } else if ("download_start".equals(event)) {
+                String sess = fields.getOrDefault("sess", "");
+                if ("pub".equals(sess)) {
+                    pubDownloads.incrementAndGet();
+                } else if ("priv".equals(sess)) {
+                    privDownloads.incrementAndGet();
+                }
+            } else if ("peer_announce".equals(event)) {
+                int port = parseIntOr(fields.get("pub_bt_port"), 0);
+                if (port > 0) {
+                    aPubBtPort.set(port);
+                    pubPortAnnounces.incrementAndGet();
+                }
+            }
+            StringBuilder sb = new StringBuilder("M1 ");
+            sb.append(role).append(' ').append(event);
+            for (Map.Entry<String, String> e : fields.entrySet()) {
+                String v = e.getValue();
+                if (v == null || v.isEmpty()) {
+                    continue;
+                }
+                sb.append(' ').append(e.getKey()).append('=').append(clean(v));
+            }
+            sb.append(" ts=").append(now);
+            System.out.println(sb);
+            System.out.flush();
+        }
+
+        @Override
+        public void memberJoined(GroupRuntime group, String deviceId, String name) {
+            lastMemberDev = deviceId == null ? "" : deviceId;
+            lastMemberName = name == null ? "" : name;
+            log("member_joined", Map.of("dev", lastMemberDev, "name", lastMemberName));
+            memberJoined.countDown();
+        }
+
+        @Override
+        public void fileAdded(GroupRuntime group, FileEntry entry) {
+            log("file_add_event", Map.of(
+                    "file_id", entry.getFileId(),
+                    "scope", entry.getScope().getWire(),
+                    "size", String.valueOf(entry.getSize())));
+        }
+
+        @Override
+        public void fileCompleted(GroupRuntime group, FileEntry entry) {
+            log("file_completed", Map.of("file_id", entry.getFileId()));
+        }
+
+        @Override
+        public void opReceived(GroupRuntime group, OpRecord op) {
+            lastOpBody = op.getBody() == null ? "" : op.getBody();
+            log("op_received", Map.of(
+                    "op_id", op.getOpId(),
+                    "author", op.getAuthor(),
+                    "seq", String.valueOf(op.getSeq()),
+                    "body", lastOpBody));
+            opReceived.countDown();
         }
     }
 }

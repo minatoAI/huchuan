@@ -591,8 +591,13 @@ class M1Kernel @JvmOverloads constructor(
         }
 
         // 内容不变，只把 private 位翻成 0：piece size 规则与私有建种共用 TorrentBuild / BtSession.pieceSizeFor。
+        // 反向验收钩子（-Dhuchuan.mutants=publish_private，默认关）：把 private 位翻回 1。
+        // 公开会话按 BEP 27 拒种 / 同 infohash 撞私有行，发布必然失败 —— scripts/e2e-public.sh 的变异跑必须红。
+        val forcePrivate = System.getProperty("huchuan.mutants", "")
+            .split(",")
+            .any { it.trim() == "publish_private" }
         val built = try {
-            TorrentBuild.v1(localFile, privateTorrent = false, comment = "huchuan public v1")
+            TorrentBuild.v1(localFile, privateTorrent = forcePrivate, comment = "huchuan public v1")
         } catch (e: Throwable) {
             events.log(
                 "public_publish_error",

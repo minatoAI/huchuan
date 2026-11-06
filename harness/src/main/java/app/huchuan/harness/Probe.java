@@ -36,10 +36,19 @@ final class Probe {
     }
 
     static Probe of(Object kernel) {
+        return ofField(kernel, "bt");
+    }
+
+    /** 同一套读口，换到公开会话（M1Kernel.publicBt）：公开条目的字节计数只能从这里读。 */
+    static Probe ofPublic(Object kernel) {
+        return ofField(kernel, "publicBt");
+    }
+
+    private static Probe ofField(Object kernel, String fieldName) {
         try {
-            Object bt = field(kernel, "bt");
+            Object bt = field(kernel, fieldName);
             if (bt == null) {
-                return new Probe(null, null, null, null, "M1Kernel.bt is null (kernel not started?)");
+                return new Probe(null, null, null, null, "M1Kernel." + fieldName + " is null (kernel not started?)");
             }
             SessionManager manager = (SessionManager) field(bt, "manager");
             Object tasks = field(bt, "tasks");
