@@ -86,6 +86,13 @@
     <string name="p4_offline">离线，等待上线</string>
     <!-- 公开条目的本地移除（public-swarm §5.2：只从本机列表消失，不广播、不删文件） -->
     <string name="p4_remove">移除</string>
+    <!-- 公开到群外（public-swarm §6.1）：私有条目的顶栏「…」菜单一项；公开条目多一项取消公开。
+         「发布中」占的是状态 chip 那一格（建种要对整个文件全量哈希，可能跑很久）。 -->
+    <string name="p4_more">…</string>
+    <string name="p4_more_desc">更多</string>
+    <string name="p4_publish_public">公开到群外</string>
+    <string name="p4_publishing">发布中</string>
+    <string name="p4_unpublish">取消公开</string>
 
     <!-- P5 新群组 -->
     <string name="p5_title">新群组</string>

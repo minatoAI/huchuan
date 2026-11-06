@@ -14,6 +14,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -36,6 +37,7 @@ import app.huchuan.core.NetworkReport
 import app.huchuan.core.NetworkStatus
 import app.huchuan.kernel.M1Runtime
 import app.huchuan.kernel.MagnetImport
+import app.huchuan.kernel.PublicPublish
 import app.huchuan.notify.NotifyPermission
 import app.huchuan.notify.NotifyRoute
 import app.huchuan.ui.FileScreen
@@ -268,6 +270,52 @@ class HuchuanState(
      */
     suspend fun removeLocalFile(groupId: String, fileId: String) {
         withContext(Dispatchers.IO) { runtime?.removeLocalFile(groupId, fileId) }
+        touch()
+    }
+
+    // ------------------------------------------------------------------ 公开到群外（P4）
+
+    /** 正在「公开到群外」的 fileId：建种要对整个源文件做一次全量哈希，10 GB 级不可能是瞬间。 */
+    private val publishingIds = mutableStateOf<Set<String>>(emptySet())
+
+    /** 上一次发布失败时内核给的中文（成功 / 没试过时没有这个 key）。 */
+    private val publishMessages = mutableStateOf<Map<String, String>>(emptyMap())
+
+    fun isPublishing(fileId: String): Boolean = publishingIds.value.contains(fileId)
+
+    fun publishMessage(fileId: String): String = publishMessages.value[fileId].orEmpty()
+
+    /**
+     * P4「公开到群外」：新建一条公开种子（原私有条目不动）。
+     *
+     * 三条界面口径：① [isPublishing] 期间 P4 的状态位显示「发布中」；② 失败只把内核那句中文
+     * 交给界面显示在正文里，不弹窗；③ 幂等 —— 连点 / 重试不会起第二个任务，内核同一私有 id
+     * 第二次也直接回同一条公开条目，不会多出一条。
+     */
+    suspend fun publishPublic(groupId: String, fileId: String) {
+        if (isPublishing(fileId)) return
+        publishingIds.value = publishingIds.value + fileId
+        publishMessages.value = publishMessages.value - fileId
+        val outcome = try {
+            withContext(Dispatchers.IO) {
+                runtime?.publishPublic(groupId, fileId)
+                    ?: PublicPublish(ok = false, reason = "", message = "", fileId = fileId)
+            }
+        } finally {
+            publishingIds.value = publishingIds.value - fileId
+        }
+        if (!outcome.ok && outcome.message.isNotEmpty()) {
+            publishMessages.value = publishMessages.value + (fileId to outcome.message)
+        }
+        touch()
+    }
+
+    /**
+     * P4「取消公开」：停种 + 把公开条目从本机清单移除，不广播、不删磁盘文件。
+     * 完成之后这个条目就不在 [groupOrNull] 里了，P4 自己按「文件没了」退回 P3（私有条目还在）。
+     */
+    suspend fun unpublishPublic(groupId: String, fileId: String) {
+        withContext(Dispatchers.IO) { runtime?.unpublishPublic(groupId, fileId) }
         touch()
     }
 

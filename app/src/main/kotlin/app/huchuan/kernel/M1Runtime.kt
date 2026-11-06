@@ -42,6 +42,22 @@ data class MagnetImport(
 )
 
 /**
+ * 「公开到群外」的界面口径：成功与否 + 内核的失败 reason + 一句中文（成功时为空）+ 条目 id。
+ *
+ * [fileId] 成功时是**新建的公开条目**的 infohash（与传入的私有 fileId 不同），失败时回显私有 id。
+ * 界面不认内核的 [app.huchuan.core.m1.PublicPublishResult]，只认这四项。
+ */
+data class PublicPublish(
+    val ok: Boolean,
+    /** 内核的 reason："" 成功，其余见 PublicPublishResult 的常量。 */
+    val reason: String,
+    /** 内核给的一句中文，直接显示，界面不改写。 */
+    val message: String,
+    /** 公开条目 fileId（成功时是新 infohash）；失败时是传入的私有 fileId。 */
+    val fileId: String,
+)
+
+/**
  * Android 侧的 M1 内核宿主：进程内嵌内核 + 组播锁 + 日志出口 + SAF 导入。
  *
  * 生命周期跟 Application 走（整个进程只起一个内核）；界面通过 [store] 读数据。
@@ -393,6 +409,47 @@ class M1Runtime(context: Context) {
                 " file_kept=" + (group.savedFile(fileId)?.isFile == true),
         )
         requestUiRefresh()
+    }
+
+    /**
+     * P4「公开到群外」（public-swarm §6.1 / docs/core.md §3.9）：把本机正在做种的私有文件
+     * **另建**一条 private=0 的公开种子，原私有条目不动。
+     *
+     * 内核这一句要对源文件做一次**全量哈希**（10 GB 级会跑几十秒到几分钟），调用方必须已经在
+     * 工作线程上（HuchuanState.publishPublic 走 withContext(IO)）。内核永不抛异常，十个失败码
+     * 各带一句中文，这里原样交给界面显示在正文里，不弹窗。
+     *
+     * 幂等由内核保证：同一私有 fileId 第二次调用直接回同一条公开条目（reused=true），不重复广播。
+     */
+    fun publishPublic(groupId: String, fileId: String): PublicPublish {
+        val result = kernel.publishPublic(groupId, fileId)
+        Log.i(
+            TAG,
+            "event=ui_publish_public group_id=" + groupId +
+                " file_id=" + fileId +
+                " ok=" + result.ok +
+                " reason=" + result.reason.ifEmpty { "ok" } +
+                " pub_file_id=" + result.fileId +
+                " message=" + (if (result.message.isEmpty()) "-" else clean(result.message)),
+        )
+        requestUiRefresh()
+        return PublicPublish(result.ok, result.reason, result.message, result.fileId)
+    }
+
+    /**
+     * P4「取消公开」：停种 + 把公开条目从本机清单移除（内核 hideLocally），不广播、不删磁盘；
+     * 私有条目不受影响。同样要碰会话与 state.json，调用方已在工作线程上。
+     */
+    fun unpublishPublic(groupId: String, fileId: String): Boolean {
+        val removed = kernel.unpublishPublic(groupId, fileId)
+        Log.i(
+            TAG,
+            "event=ui_unpublish_public group_id=" + groupId +
+                " file_id=" + fileId +
+                " removed=" + removed,
+        )
+        requestUiRefresh()
+        return removed
     }
 
     fun isCompleted(fileId: String): Boolean = completed.contains(fileId)

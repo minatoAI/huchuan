@@ -3,8 +3,10 @@ package app.huchuan.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.util.Log
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,6 +20,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -48,6 +52,7 @@ import app.huchuan.R
 import app.huchuan.core.Comment
 import app.huchuan.core.FileScope
 import app.huchuan.core.FileState
+import app.huchuan.kernel.M1Runtime
 import app.huchuan.ui.theme.brandSwitchColors
 import kotlinx.coroutines.launch
 
@@ -85,6 +90,22 @@ fun FileScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val copiedLabel = stringResource(R.string.p6_copied)
 
+    // 顶栏「…」：私有条目一项「公开到群外」，公开条目一项「取消公开」（public-swarm §6.1）。
+    // 发布期间菜单项置灰 —— 状态位已经写着「发布中」，这里不再多给一个入口。
+    var menuOpen by remember(fileId) { mutableStateOf(false) }
+    val publishing = state.isPublishing(file.id)
+    val publishMessage = state.publishMessage(file.id)
+    val moreLabel = stringResource(R.string.p4_more_desc)
+
+    // 状态位真的换过一遍的证据：8 MiB 的发布只有一两百毫秒，截图抓不住，日志抓得住。
+    LaunchedEffect(publishing, file.id) {
+        Log.i(
+            M1Runtime.TAG,
+            "event=ui_p4_publishing file_id=" + file.id +
+                " state=" + (if (publishing) "on" else "off"),
+        )
+    }
+
     PageScaffold(
         title = file.name,
         // 「移除」只对公开条目出现（public-swarm §5.2）：私有条目行为不变。
@@ -94,6 +115,35 @@ fun FileScreen(
                     onClick = { scope.launch { state.removeLocalFile(groupId, file.id) } },
                 ) {
                     Text(stringResource(R.string.p4_remove))
+                }
+            }
+            Box {
+                TextButton(
+                    onClick = { menuOpen = true },
+                    modifier = Modifier.semantics { contentDescription = moreLabel },
+                ) {
+                    Text(stringResource(R.string.p4_more))
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    if (file.scope == FileScope.PRIVATE) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.p4_publish_public)) },
+                            enabled = !publishing,
+                            onClick = {
+                                menuOpen = false
+                                // 建种要离开界面线程：内核要对整个文件做一次全量哈希。
+                                scope.launch { state.publishPublic(groupId, file.id) }
+                            },
+                        )
+                    } else {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.p4_unpublish)) },
+                            onClick = {
+                                menuOpen = false
+                                scope.launch { state.unpublishPublic(groupId, file.id) }
+                            },
+                        )
+                    }
                 }
             }
         },
@@ -135,10 +185,15 @@ fun FileScreen(
                 if (file.scope == FileScope.PUBLIC) {
                     StateChip(text = stringResource(R.string.p3_scope_public), highlighted = false)
                 }
-                StateChip(
-                    text = fileStateLabel(file),
-                    highlighted = file.state != FileState.SLEEPING,
-                )
+                // 状态位只有一格：发布期间写「发布中」，做完就回到原来的状态文案。
+                if (publishing) {
+                    StateChip(text = stringResource(R.string.p4_publishing), highlighted = true)
+                } else {
+                    StateChip(
+                        text = fileStateLabel(file),
+                        highlighted = file.state != FileState.SLEEPING,
+                    )
+                }
                 // 元数据没到手时没有尺寸可写：左上的状态 chip 已经是「等待来源」，
                 // 这里不再重复一遍（public-swarm §3.1：不是 0 B）。
                 if (!file.awaitingSource()) {
@@ -152,6 +207,15 @@ fun FileScreen(
                     text = stringResource(R.string.p4_source, file.sourceMember),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            // 发布失败：内核那句中文原样贴在正文里一行，不弹窗、不给「重试」按钮（§3.1 / §3.9）。
+            if (publishMessage.isNotEmpty()) {
+                Text(
+                    text = publishMessage,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
                 )
             }
 

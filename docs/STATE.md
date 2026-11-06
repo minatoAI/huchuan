@@ -51,10 +51,12 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 
 ## 在飞
 
-- PUBLISH 内核「公开到群外」（publishPublic/unpublishPublic）
-- WINPUB Windows Web UI 接公开种子
+- E2E 公开种子端到端双进程验收
+- APPPUB Android P4「公开到群外」
 
 ## 已完成
+- PUBLISH 公开到群外 → 另建 private=0 v1 种子并做种、magnet、幂等、可取消；自检 376 条，反向变异 19 条红
+- WINPUB Windows 公开种子 UI → 离屏 19 张 + CDP 真实点击链路断言
 - 崩溃修复 → AlertType 表补洞（真机 filled=105,106,107）+ 公开会话收紧 mask；6 分钟存活、无 FATAL
 - 模拟器评估 → 装好但缺 WHPX/AEHD，需管理员+重启；x86_64 镜像含 ARM 翻译层，但局域网发现过不了 slirp
 - OSS 开源材料 → LICENSE(MIT) + THIRD_PARTY_NOTICES(13 项逐个核实) + README(76 行)
