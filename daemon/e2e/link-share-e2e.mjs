@@ -241,6 +241,8 @@ async function main() {
   log("file " + FILE + " size " + size + " sha256 " + sourceSha);
   result.source = { size, sha256: sourceSha };
 
+  /** 分享对象：主流程用、finally 里的撤销也用；创建失败时保持 null。 */
+  let share = null;
   const health = await apiJson("GET", "/api/health");
   if (health.status !== 200) throw new Error("daemon /api/health 不通：" + health.status + " " + health.text.slice(0, 200));
   log("daemon " + health.text.slice(0, 160));
@@ -303,7 +305,6 @@ async function main() {
   let browser = null;
   let cdp = null;
   let state = null;
-  let share = null;
   try {
     browser = await launchBrowser(debugPort, userData);
     cdp = await connectCdp(debugPort);
@@ -362,8 +363,16 @@ async function main() {
 
     // 5. 日志证据
     let logLine = "";
-    if (DAEMON_LOG && existsSync(DAEMON_LOG)) {
-      const text = readFileSync(DAEMON_LOG, "utf8");
+    if (DAEMON_LOG) {
+      // 页面回到 done 的那一刻，daemon 可能还在写这一行（状态先行、日志随后）。给它 5 s，别抢跑。
+      let text = "";
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        if (existsSync(DAEMON_LOG)) {
+          text = readFileSync(DAEMON_LOG, "utf8");
+          if (text.includes("event=link_transfer_done bytes=")) break;
+        }
+        await sleep(250);
+      }
       // 只认真正的传输行（ws_push 的 event 字段里也有这串字，靠后面的 bytes= 区分）
       const line = text.split(/\r?\n/).filter((row) => row.includes("event=link_transfer_done bytes=")).pop() || "";
       const joinLine = text.split(/\r?\n/).filter((row) => row.includes("event=link_visitor_join")).pop() || "";

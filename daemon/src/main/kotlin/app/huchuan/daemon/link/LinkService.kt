@@ -66,6 +66,13 @@ class LinkService(
     private val saveLock = Any()
     private val sessions = ConcurrentHashMap<String, Session>()
 
+    /**
+     * 同一文件同时只服务一个访客（link-share.md §12-3 的「同时 1 个访客」在 daemon 侧的落点）。
+     * key = fileId，value = 持有它的 share token。同一文件被建成两条链接时，第二条链接的访客
+     * 会被明确记成 link_visitor_busy reason=file-busy，而不是两边一起抢上传。
+     */
+    private val activeFiles = ConcurrentHashMap<String, String>()
+
     private val workers = Executors.newCachedThreadPool { runnable ->
         Thread(runnable, "huchuan-link-worker").apply { isDaemon = true }
     }
@@ -411,11 +418,37 @@ class LinkService(
             if (closing || stopped) return
             synchronized(lock) {
                 if (closing) return
+                // 分享者重连时 Worker 会重放 share-incoming（resumed）；同一个访客已经传完就不重来，
+                // 否则会把一条 done 的分享重新推一遍、最后又判成失败。
+                if (phase == STATUS_DONE && visitor == visitorId) {
+                    log.event("link_incoming_replayed", mapOf("share" to record.shareId.take(8), "visitor" to visitor.take(8)))
+                    return
+                }
                 if (sender != null) {
                     log.event(
                         "link_visitor_busy",
                         mapOf("share" to record.shareId.take(8), "visitor" to visitor.take(8)),
                     )
+                    return
+                }
+                val owner = activeFiles.putIfAbsent(record.fileId, record.token)
+                if (owner != null && owner != record.token) {
+                    phase = STATUS_FAILED
+                    visitorId = visitor
+                    joinedAt = System.currentTimeMillis()
+                    finishedAt = joinedAt
+                    error = "file-busy"
+                    log.event(
+                        "link_visitor_busy",
+                        mapOf(
+                            "share" to record.shareId.take(8),
+                            "visitor" to visitor.take(8),
+                            "file_id" to record.fileId,
+                            "reason" to "file-busy",
+                            "owner" to owner.take(8),
+                        ),
+                    )
+                    daemon.bump("link_visitor_busy")
                     return
                 }
                 phase = STATUS_CONNECTING
@@ -501,6 +534,7 @@ class LinkService(
                 resumeFuture = null
                 closeSender()
                 closeClient()
+                activeFiles.remove(record.fileId, record.token)
             }
             sessions.remove(record.token, this)
             log.event(
@@ -512,6 +546,14 @@ class LinkService(
         /* ------------------------------------------------------------ 传输 */
 
         private fun transfer() {
+            try {
+                runTransfer()
+            } finally {
+                activeFiles.remove(record.fileId, record.token)
+            }
+        }
+
+        private fun runTransfer() {
             val path = File(record.path)
             if (!path.isFile) {
                 failTransfer("file-missing")

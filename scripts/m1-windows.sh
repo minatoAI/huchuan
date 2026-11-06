@@ -5,12 +5,15 @@
 #   bash scripts/m1-windows.sh          # 跑完整流程；最后一行 PASS（rc 0）/ FAIL（rc 1）
 #   M1_SKIP_BUILD=1 bash scripts/m1-windows.sh   # 复用已构建的 daemon.jar
 #
+# 依赖：java 17+ / curl / sha256sum / node 18+（链接分享端到端要驱动 Edge headless）。
+# 链接分享那一段会连已部署的 Worker（https://huchuan-a9f.pages.dev），离线环境会失败。
+#
 # 装置（全程只走 daemon 的 HTTP/WS 接口，不碰 core 内部）：
 #   A（127.0.0.1:47200）建群 → 共享 32 MiB → 等 B 的评论
 #   B（127.0.0.1:47201）只用邀请码后 8 位 + 手动地址 127.0.0.1:<A 的消息端口> 加入
 #   B 激活下载 → 等到 complete → 两端 SHA-256 比对 → B 发评论 → A 侧看到
 #
-# 断言分八组：
+# 断言分九组：
 #   1. flow    ：建群 / 加入 / 共享 / 下载 / 评论，每一步都要有本轮证据
 #   2. sha256  ：两端文件逐字节一致，脚本自己重算，不信 daemon 的自述
 #   3. push    ：WS 真的在推（state 推送 + 传输中的 tick 采样）

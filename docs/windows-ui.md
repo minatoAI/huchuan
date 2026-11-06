@@ -213,7 +213,7 @@ daemon 侧的链接分享已经全通（端点、日志、过期、撤销、WebR
 
 | 界面上的 | 数据来源 | 判定 |
 | --- | --- | --- |
-| P9 列表的一行 | `GET /api/shares` 的 `shares[]` | 只显示 `active=true` 的（`waiting` / `connecting` / `transferring`）；撤销 / 过期按设计移出列表 |
+| P9 列表的一行 | `GET /api/shares` 的 `shares[]` | 只排除 `status` 是 `revoked` / `expired` / `file-missing` 的；`done` / `failed` 仍显示（链接还能再给下一位访客取） |
 | 二维码 | `share.qrText` | 就是链接本身（`https://huchuan-a9f.pages.dev/#s=<token>`），编码它，不拼别的 |
 | 「7 天后失效」 | `share.expiresAt` | 服务端给的时间，页面不自己从创建时间推算 |
 | 文件名 / 大小 | `share.fileName` / `share.sizeBytes` | 创建时从本机文件取，列表不重新读盘 |
@@ -241,7 +241,8 @@ Edge headless 打开 Pages 接收页收字节并自己算 SHA-256，两个 SHA �
 
 已知边界（都是设计口径，不是本轮缺陷）：
 
-- **同时 1 个访客**（Worker 房间的硬上限）。链接可以先后给多个人，列表中 `transfers` 累加。
+- **同时 1 个访客**（Worker 房间的硬上限）。链接可以先后给多个人，列表中 `transfers` 累加；
+  同一个文件被建成两条链接时，daemon 也只放一个访客进来（另一条记 `file-busy`，页面等不到 offer）。
 - 浏览器接收页单文件上限 **1 GiB**（OPFS / 内存降级），更大的走 App。
 - **没有 TURN**：对称 NAT / CGNAT 下打洞失败会如实显示「无法直连」。
 - 分享期间 daemon 要在线；进程退出链接变 offline（Worker 的 `/api/share/{token}` 四态之一）。
@@ -502,9 +503,9 @@ P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增�
 | `js/app.js` | 55,522 |
 | **页面资源合计** | **99,086**（预算 200 KB） |
 | `Huchuan.exe` | 402,432（WebView2 运行时是系统组件，不在 exe 内） |
-| `daemon.jar` | 18,041,527（含 core、libtorrent4j 的 x86_64 dll、WebRTC 原生包、jmdns、上面这份页面） |
+| `daemon.jar` | 18,045,580（含 core、libtorrent4j 的 x86_64 dll、WebRTC 原生包、jmdns、上面这份页面） |
 | `runtime/`（jlink） | 28,766,257（27.43 MiB，模块 `java.base,java.logging,java.net.http,jdk.crypto.ec`） |
-| **`dist/Huchuan` 合计** | **47,210,216**（45.02 MiB，拷走就能跑，目标机不用装 Java） |
+| **`dist/Huchuan` 合计** | **47,214,269**（45.03 MiB，拷走就能跑，目标机不用装 Java） |
 
 2026-11-07 读数：链接分享把 webrtc-java 1.0.0 的原生包（DLL 22.8 MB）打进 jar，daemon.jar 从 8.1 MiB
 涨到 17.21 MiB；runtime 因为 `java.net.http` 多 0.55 MiB。页面资源本身没变（96.7 KiB）。

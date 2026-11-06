@@ -507,7 +507,10 @@ daemon 是唯一的字节源。接口全部在 127.0.0.1 上，**token 只出现
 
 - `link` 与 `qrText` 是同一个字符串：二维码就编码它。fragment（`#s=<token>`）不发往服务器，
   链接里没有文件名，也没有 shareId。
-- `status` 是细分状态，`phase` 只有「进行中 / 已结束」两档：
+- `status` 是细分状态；`phase`（与 `active` 同义）只有**本次取件**的「进行中 / 已结束」
+  两档 —— 它回答「现在有没有人在收」，不回答「链接还能不能用」。判断后者请看 `status`：
+  `revoked` / `expired` / `file-missing` 才是链接不可用，`done` / `failed` 的链接
+  仍然可以给下一位访客（服务端允许，见「同一文件同时只服务 1 个访客」）。
 
 | status | 含义 | phase |
 | --- | --- | --- |
@@ -592,7 +595,13 @@ token 是 26 字符 Crockford B32；未知 token 404 `E_NO_LINK_SHARE`。
 
 - 一条分享一个 `SignalClient`（core 的信令状态机）；一个访客一条 PeerConnection
   （`WebRtcSender`）：建链 → `meta` → 16 KiB 分块 → `done` → 等浏览器 `verify`，
-  然后关 PeerConnection。信令连接留着等下一位置，服务端同时只允许 1 个访客。
+  然后关 PeerConnection。信令连接留着等下一位访客，服务端同时只允许 1 个访客。
+- **同一文件同时只服务 1 个访客**：daemon 自己再上一把锁（`fileId → token`）。同一文件被建成
+  两条链接时，第二条的访客不会建链，日志打 `link_visitor_busy … reason=file-busy`，
+  分享对象的 `status` 变 `failed`、`visitor.error=file-busy`；浏览器那边就是等不到
+  offer（约 20 s 后显示「无法直连」）。正常一个文件一条链接时看不到这一条。
+- 两处防抖：分享者重连后 Worker 会重放 `share-incoming`（`resumed`），同一个访客已经传完的
+  不再重推（`link_incoming_replayed`）；传完的分享也不会因为之后的信令断开把 `done` 改成 `failed`。
 - 90 s 传输空闲预算归 core；daemon 每收到一次访客 `ack` 就续一次，另有一条 30 s 心跳兜住
   「传完但页面还开着」的那段时间。
 - 浏览器回 `verify` 里带它自己算的 SHA-256 与字节数；daemon 用本机算的 SHA-256 比一次，
@@ -767,9 +776,9 @@ jlink 参数：`--strip-debug --no-man-pages --no-header-files --compress=2`。
 | 项 | 字节 | MiB | 与上一版比 |
 | --- | ---: | ---: | --- |
 | `Huchuan.exe` | 402,432 | 0.38 | — |
-| `daemon.jar` | 18,041,527 | 17.21 | +9.48 MiB：WebRTC 原生包（DLL 22.8 MB） |
+| `daemon.jar` | 18,045,580 | 17.21 | +9.48 MiB：WebRTC 原生包（DLL 22.8 MB） |
 | `runtime/` | 28,766,257 | 27.43 | +0.55 MiB：多了 `java.net.http` |
-| **合计 `dist/Huchuan`** | **47,210,216** | **45.02** | +10.04 MiB |
+| **合计 `dist/Huchuan`** | **47,214,269** | **45.03** | +10.05 MiB |
 
 2026-11-07 读数（JDK 17 Temurin；把链接分享的 webrtc-java 1.0.0 打进 jar 之后）。
 
