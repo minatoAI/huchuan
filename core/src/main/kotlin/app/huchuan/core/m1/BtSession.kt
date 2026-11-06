@@ -67,6 +67,11 @@ class BtSession(
     var ipFilterError: String = ""
         private set
 
+    /** 告警类型映射表补不上的原因（"" = 正常）。诊断用；见 [AlertTypeCompat]。 */
+    @Volatile
+    var alertTypeCompatError: String = ""
+        private set
+
     /**
      * 会话级（P7 全局限速）的目标值，单位 **KB/s**，0 = 不限。
      *
@@ -127,6 +132,10 @@ class BtSession(
 
     fun start(): Int {
         manager?.let { return listenPort }
+        // 补告警类型映射表的空槽（根因见 AlertTypeCompat）：补表是进程级一次性动作，
+        // 但私有会话的告警循环也是同一个 SessionManager，所以两边都在 start 前补一次。
+        // 私有会话不设 events，失败的原文记在 [alertTypeCompatError] 上给诊断页读。
+        AlertTypeCompat.install().let { if (!it.isClean) alertTypeCompatError = it.error }
         val candidates = ArrayList<Int>()
         if (portHint > 0) for (i in 0 until 100) candidates.add(portHint + i)
         // 兜底「系统分配端口」不能直接把 0 交给 libtorrent：实测 2.1.0-39 下

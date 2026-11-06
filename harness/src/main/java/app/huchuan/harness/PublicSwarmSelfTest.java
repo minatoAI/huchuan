@@ -1,6 +1,7 @@
 package app.huchuan.harness;
 
 import app.huchuan.core.FileScope;
+import app.huchuan.core.m1.AlertTypeCompat;
 import app.huchuan.core.m1.BtSession;
 import app.huchuan.core.m1.GroupRuntime;
 import app.huchuan.core.m1.KernelEvents;
@@ -16,9 +17,13 @@ import app.huchuan.core.m1.SessionRoute;
 import org.libtorrent4j.TorrentBuilder;
 import org.libtorrent4j.TorrentFlags;
 import org.libtorrent4j.TorrentInfo;
+import org.libtorrent4j.alerts.AlertType;
+import org.libtorrent4j.alerts.Alerts;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -84,6 +89,7 @@ final class PublicSwarmSelfTest {
             pub = new PublicBtSession(new File(root, "public"), PublicBtSession.DEFAULT_PORT, null);
             int pubPort = pub.start();
             sessions(check, priv, privPort, pub, pubPort);
+            alerts(check, pub);
             flags(check, priv, pub);
             routing(check, root, priv, pub);
             magnet(check, root, priv, pub);
@@ -222,6 +228,123 @@ final class PublicSwarmSelfTest {
                         && pub.getMetaDir().getParentFile() != null
                         && "public".equals(pub.getMetaDir().getParentFile().getName()));
     }
+
+    // ---------------------------------------------------------------- 1.5 告警类型映射表补洞 + 收敛
+
+    /**
+     * 公开会话开 DHT 后「收一段时间告警不把进程带走」的回归断言（对应真机 FATAL：
+     * `SessionManager-alertsLoop` 里 NPE 在 `AlertType.ordinal()`）。
+     *
+     * 三件事各有一个能把它打红的现实缺陷：
+     *
+     * 1. **补洞本身**：拿一张合成的 108 槽表（105/106/107 是空洞，等价于 Android 自编 .so 的形状）
+     *    过一遍 [AlertTypeCompat.fillTable]，要求恰好补这 3 个槽且补成 UNKNOWN。
+     *    打红方式：把 fillTable 改成不填 / 填错值。
+     * 2. **真会话的表**：native 报几种告警，`AlertType.fromSwig(i)` 就必须在这几个下标上都非 null。
+     *    打红方式：Windows 上这条恒真（native 报 105、没有空洞），所以 Android 上跑才有杀伤力；
+     *    真正能跨平台打红的是第 1 条。
+     * 3. **公开会话实际下发的 mask**：不能含 ip_block（崩溃那条 `ip_ban_alert` 的类别），
+     *    但必须含 status / storage / error（会话自己要用的那几类）。
+     *    打红方式：去掉 applyPublicAlertMask —— libtorrent4j 的默认 mask 是 all_categories，
+     *    含 ip_block，这条立刻红。
+     * 4. **持续收告警**：DHT 开着跑 `SOAK_MS`，结束后告警线程必须还活着、会话还在跑。
+     *    打红方式：真机上不补表就是这条挂（线程被 NPE 带走）；桌面上补表逻辑坏掉也可能让它挂。
+     */
+    private static void alerts(BiConsumer<String, Boolean> check, PublicBtSession pub) {
+        // --- 1. 合成 Android 形状的表：0..104 有值、105..107 是 null
+        AlertType[] synthetic = new AlertType[108];
+        for (int i = 0; i < synthetic.length; i++) {
+            synthetic[i] = i < 105 ? AlertType.TORRENT_FINISHED : null;
+        }
+        int[] filled = AlertTypeCompat.fillTable(synthetic, AlertType.UNKNOWN);
+        check.accept("public.alerttype_fill_android_gap (filled=" + Arrays.toString(filled) + ")",
+                Arrays.equals(filled, new int[]{105, 106, 107}));
+        boolean noNullLeft = true;
+        for (AlertType t : synthetic) {
+            if (t == null) {
+                noNullLeft = false;
+                break;
+            }
+        }
+        check.accept("public.alerttype_fill_leaves_no_null", noNullLeft);
+        check.accept("public.alerttype_fill_uses_unknown",
+                synthetic[105] == AlertType.UNKNOWN
+                        && synthetic[106] == AlertType.UNKNOWN
+                        && synthetic[107] == AlertType.UNKNOWN);
+        // 已知类型一个都不许动：补洞只补空洞。
+        check.accept("public.alerttype_fill_keeps_known", synthetic[0] == AlertType.TORRENT_FINISHED);
+        // 幂等：再补一次什么都不该填。
+        check.accept("public.alerttype_fill_idempotent",
+                AlertTypeCompat.fillTable(synthetic, AlertType.UNKNOWN).length == 0);
+
+        // --- 2. 真会话的 ALERT 表：native 报几种，就有几个下标必须能映射
+        AlertTypeCompat.Report report = AlertTypeCompat.install();
+        check.accept("public.alerttype_install_clean (" + report + ")", report.isClean());
+        int holes = 0;
+        for (int i = 0; i < Alerts.NUM_ALERT_TYPES; i++) {
+            if (AlertType.fromSwig(i) == null) {
+                holes++;
+            }
+        }
+        check.accept("public.alerttype_no_holes (native=" + Alerts.NUM_ALERT_TYPES + " holes=" + holes + ")",
+                holes == 0);
+
+        // --- 3. 公开会话真实生效的 alert_mask
+        int mask = pub.alertMaskSetting();
+        int ipBlock = PublicBtSession.ipBlockCategory();
+        check.accept("public.alert_mask_no_ip_block (mask=0x" + Integer.toHexString(mask) + ")",
+                mask != 0 && (mask & ipBlock) == 0);
+        int need = PublicBtSession.publicAlertMask();
+        check.accept("public.alert_mask_has_needed_categories", (mask & need) == need);
+
+        // --- 4. 持续收告警：DHT 开着跑一段时间，告警线程不能死
+        List<Thread> loops = alertLoopThreads();
+        check.accept("public.alerts_loop_thread_present (n=" + loops.size() + ")", !loops.isEmpty());
+        long until = System.currentTimeMillis() + SOAK_MS;
+        boolean stillRunning = true;
+        while (System.currentTimeMillis() < until) {
+            if (!pub.isRunning()) {
+                stillRunning = false;
+                break;
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        boolean allAlive = true;
+        for (Thread t : loops) {
+            if (!t.isAlive()) {
+                allAlive = false;
+                break;
+            }
+        }
+        check.accept("public.alerts_loop_survives_soak (" + SOAK_MS + "ms)", allAlive);
+        check.accept("public.session_alive_after_soak", stillRunning && pub.isRunning());
+        // 收完之后 DHT 还在转 —— 说明是「收告警」这件事本身没出问题，不是会话被顺手关了。
+        check.accept("public.dht_still_running_after_soak", pub.isDhtRunning());
+        System.out.println("selftest.info public.alerts soak_ms=" + SOAK_MS
+                + " loop_threads=" + loops.size() + " mask=0x" + Integer.toHexString(mask));
+    }
+
+    /** libtorrent4j 的告警线程（`SessionManager` 里 `new Thread(r, "SessionManager-alertsLoop")`）。 */
+    private static List<Thread> alertLoopThreads() {
+        List<Thread> out = new ArrayList<>();
+        for (Thread t : Thread.getAllStackTraces().keySet()) {
+            if (t.isAlive() && "SessionManager-alertsLoop".equals(t.getName())) {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 这一段 soak 的时长。默认 30 s（真机上崩溃出现在导入磁力后约 2 分钟，这里只做「线程不死」的回归，
+     * 不需要跑满 2 分钟）；`-Dm1.alertSoakMs=1000` 可以缩短，方便本地反复跑。
+     */
+    private static final long SOAK_MS = Long.getLong("m1.alertSoakMs", 30000L);
 
     // ---------------------------------------------------------------- 2. per-torrent flags
 

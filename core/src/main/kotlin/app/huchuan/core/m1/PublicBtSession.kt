@@ -136,6 +136,7 @@ class PublicBtSession(
 
     fun start(): Int {
         manager?.takeIf { it.isRunning }?.let { return listenPort }
+        installAlertTypeCompat()
         var lastFailure: Throwable? = null
         for (i in 0 until PORT_TRIES) {
             val port = portHint + i
@@ -148,6 +149,10 @@ class PublicBtSession(
                     synchronized(lock) { manager = mgr }
                     listenPort = actual
                     attachListener(mgr)
+                    // 收紧告警类别：公开会话只订它和 SessionManager 真正用得到的那四类。
+                    // 必须在 start() 之后：SessionManager.start() 会把 alert_mask 强行改写成
+                    // all_categories 去掉 log 类，我们在 settings() 里设的值一律被覆盖。
+                    applyPublicAlertMask(mgr)
                     lastError = ""
                     log(
                         "session_start",
@@ -158,6 +163,9 @@ class PublicBtSession(
                             "utp_in" to enableIncomingUtp().toString(),
                             "utp_out" to enableOutgoingUtp().toString(),
                             "port_mapping" to portMappingEnabled.toString(),
+                            // 实际生效的告警类别（十六进制）。真机上靠它一眼看出 ip_block 有没有被排掉：
+                            // 该位是 bit 8，0x4d = status|port_mapping|storage|error 里没有它。
+                            "alert_mask" to Integer.toHexString(alertMaskSetting()),
                             "data_dir" to dataDir.absolutePath,
                         ),
                     )
@@ -521,6 +529,18 @@ class PublicBtSession(
     /** settings_pack 里 enable_lsd 的真值（断言「公开会话 LSD 为关」用）。 */
     fun enableLsdSetting(): Boolean = settingBool { it.isEnableLsd }
 
+    /**
+     * 运行中会话的**实际** alert_mask（断言「公开侧不订 ip_block」用）。
+     *
+     * 走 `session.get_settings()` 读的是 live 值，不是我们在 settings() 里写进去、随后被
+     * `SessionManager.start()` 覆盖掉的那个值。会话没起来时返回 0。
+     */
+    fun alertMaskSetting(): Int = try {
+        manager?.settings()?.getInteger(settings_pack.int_types.alert_mask.swigValue()) ?: 0
+    } catch (e: Throwable) {
+        0
+    }
+
     fun enableIncomingUtp(): Boolean =
         settingBool { it.getBoolean(settings_pack.bool_types.enable_incoming_utp.swigValue()) }
 
@@ -612,6 +632,61 @@ class PublicBtSession(
             )
         } catch (_: Throwable) {
             // 内核那边抛异常不能把告警线程带崩
+        }
+    }
+
+    /**
+     * 补齐 [AlertType] 映射表的空槽（根因见 [AlertTypeCompat]）。
+     *
+     * 必须在建 [SessionManager] **之前**跑完：告警线程在 `SessionManager.start()` 里就起来了，
+     * 补表晚了会先吃一次 NPE。幂等，重复调用只有第一次真的干活。
+     */
+    private fun installAlertTypeCompat() {
+        val r = AlertTypeCompat.install()
+        if (!r.isClean) {
+            // 补不上不代表一定崩（Windows 的 dll 本来就没有空洞），但 Android 上这就是崩溃前兆，必须留痕。
+            lastError = r.error
+            log("alert_type_compat_failed", mapOf("error" to r.error))
+            return
+        }
+        if (r.filledIds.isNotEmpty()) {
+            log(
+                "alert_type_compat",
+                mapOf(
+                    "native" to r.nativeTypes.toString(),
+                    "table" to r.tableLength.toString(),
+                    "filled" to r.filledIds.joinToString(","),
+                ),
+            )
+        }
+    }
+
+    /**
+     * 收紧告警类别（public-swarm §2.1 的「只订需要的」）。
+     *
+     * 为什么不在 [settings] 里写：`SessionManager.start()` 有一句
+     * `sp.setInteger(alert_mask, alertMask(logging))`（注释写着 "we always control the alert mask"），
+     * 会话参数里的值一律被覆盖，只有 start 之后再 `apply_settings` 才生效。
+     *
+     * 订的四类：
+     * - `status`：metadata_received / torrent_finished / add_torrent / state_update（SessionManager 内部用）
+     * - `error`：metadata_failed / alerts_dropped
+     * - `storage`：save_resume_data(_failed)
+     * - `port_mapping`：portmap（只用于 isFirewalled 标记，留着不增加风险）
+     *
+     * 不订 `dht` / `peer` / `tracker` / `ip_block`：公开会话不消费它们，而且 `ip_block` 正是
+     * 崩溃那条 `ip_ban_alert` 的类别 —— 不订它，libtorrent 连发都不会发（ban_ip 里有 should_post 判断）。
+     * `session_stats` 不在此列但照样会到：它在 post_session_stats() 里直接 emplace，不看 mask，
+     * 所以 dhtNodes() 的读口径不受影响。
+     */
+    private fun applyPublicAlertMask(mgr: SessionManager) {
+        try {
+            val pack = SettingsPack()
+            pack.setInteger(settings_pack.int_types.alert_mask.swigValue(), publicAlertMask())
+            mgr.applySettings(pack)
+        } catch (e: Throwable) {
+            lastError = e.toString()
+            log("alert_mask_error", mapOf("error" to e.toString()))
         }
     }
 
@@ -766,5 +841,23 @@ class PublicBtSession(
         /** 公开条目的 per-torrent flags 真值（断言 PEX 等位没有被设上）。 */
         @JvmStatic
         fun publicFlagsBits(): Int = publicFlags().to_int()
+
+        /**
+         * 公开会话的告警类别：status | error | storage | port_mapping。
+         *
+         * 顺序不能反：`Alert.ALL_CATEGORIES` 之类是 swig 对象，每次 getstatic 都拿同一个实例，
+         * 这里只在真正要下发时算一次。用 [Alert] 接口上的常量而不是硬编码数字，跟着库走。
+         */
+        @JvmStatic
+        fun publicAlertMask(): Int =
+            Alert.STATUS_NOTIFICATION
+                .or_(Alert.ERROR_NOTIFICATION)
+                .or_(Alert.STORAGE_NOTIFICATION)
+                .or_(Alert.PORT_MAPPING_NOTIFICATION)
+                .to_int()
+
+        /** 崩溃那条 ip_ban 的类别（断言「公开会话不订它」用）。 */
+        @JvmStatic
+        fun ipBlockCategory(): Int = Alert.IP_BLOCK_NOTIFICATION.to_int()
     }
 }

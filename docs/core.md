@@ -2,7 +2,8 @@
 
 - 版本：2026-11-06 · 内核 agent · 对应协议 v0（docs/design/protocol.md，唯一事实源）
 - 状态：**M1 全流程在桌面 JVM 上用两个独立进程跑通**（建群 → 后 8 位加入 → 32 MiB 共享/下载/SHA 一致 → 评论 3 s 内入库 → 全程 dht_nodes=0）
-- 本轮（M1.7 跨网 BT 可达性）：修掉「ip_filter 只放行私网 → 公网 peer 被我们自己拒掉」的硬阻塞（AGENTS §9）。私有会话的 ip_filter 改成**动态白名单**：基础私网段 + 消息层确认的群成员公网地址（`peer.announce.btHost`、tracker 候选、手动 IP:port、上次建链端点），运行期整份重建；成员离线不移除、端点被新 announce 替换或退群时撤销（理由见 §3.7）。同时按 public-swarm §4.1 给 `peer.announce` 补可选 `pubBtPort`（协议 §10），公开条目不再整轮跳过，改为对每个成员各拨一次公开会话端口（`sess=pub`）。harness 新增 `selftest.crossnet checks=58`，`bash scripts/m1-headless.sh` 全 PASS。接口与断言见 §3.7，口径表见 §6
+- 本轮（告警线程 NPE）：修掉「公开会话开 DHT、导入磁力约 2 分钟后进程死在 `SessionManager-alertsLoop`」的致命崩溃。根因是**版本错配**：我们自编的 arm64 `.so`（libtorrent RC_2_1 head）报 `num_alert_types=108`，而 libtorrent4j-2.1.0-39 的 `AlertType` 映射表只填到 104 —— 105/106/107 三个槽是 null，其中 107 `ip_ban_alert`（`ip_block` 类）正是 DHT 探测流量会触发的那条，`AlertType.fromSwig` 返回 null 后在 `switch` 里取 `ordinal()` 直接 NPE。修法是在建会话前用反射把 null 槽补成 `AlertType.UNKNOWN`（只跳过真正未知的类型，已知类型一个不动）+ 公开会话 `alert_mask` 收窄到 `status|error|storage|port_mapping`（不订 `ip_block`）。**这是规避不是根治**，根治要换 .so 或升依赖。真机 MIX 2S 跑满 6 分钟存活、无 FATAL、crash=0、补表日志 `filled=105,106,107`。详见 §3.8
+- 上一轮（M1.7 跨网 BT 可达性）：修掉「ip_filter 只放行私网 → 公网 peer 被我们自己拒掉」的硬阻塞（AGENTS §9）。私有会话的 ip_filter 改成**动态白名单**：基础私网段 + 消息层确认的群成员公网地址（`peer.announce.btHost`、tracker 候选、手动 IP:port、上次建链端点），运行期整份重建；成员离线不移除、端点被新 announce 替换或退群时撤销（理由见 §3.7）。同时按 public-swarm §4.1 给 `peer.announce` 补可选 `pubBtPort`（协议 §10），公开条目不再整轮跳过，改为对每个成员各拨一次公开会话端口（`sess=pub`）。harness 新增 `selftest.crossnet checks=58`，`bash scripts/m1-headless.sh` 全 PASS。接口与断言见 §3.7，口径表见 §6
 - 上一轮（M1.6 跨网发现）：内核接上自建 tracker（协议 §3.2）—— 建群 / 入群时登记 `groupHash20`，每群一条线程按**服务端下发的 interval**（默认 600 s、下限 300 s）announce；passkey 每小时轮换（`hex(HMAC-SHA256(kGrp, "huchuan/trk1/v1"‖gid‖小时整数))`），换小时先重新注册（带 `prevPasskey` 做连续性证明）再 announce；回来的 peers 进候选表，与 mDNS / 手动地址按 §3.4 合并去重、**优先级最低**（`CandidateMerge`）。配置项 `trackerBaseUrl` 为空 = 整个功能关闭：只失去跨网那一档，局域网照常，不报错、零请求。私有群的 infohash 仍然不进 DHT / PEX / LSD（协议 §8 不变），上报给 tracker 的只有伪 swarm 的 `groupHash20`；日志里 passkey 只留前 4 字符。接口与口径见 §3.5，常量见 §6
 - 本轮（M3 公开种子内核）：按 `docs/design/public-swarm.md`（pub2）实现内核部分 —— ① `FileEntry` / `GroupFile` 加 `scope`（缺省 private，旧 state.json 零迁移）与 magnet、size/pieceSize 允许 0（未知），同群内按 fileId 去重且同一 infohash 只留 private；② 新增独立 `PublicBtSession`（DHT 开、PEX 开、LSD 关、uTP 开、端口 6881 起、`<data>/public`、独立 `pub_*` 日志），加种前一律按 `TorrentInfo.isPrivate` 选会话，公开会话拒绝 private 种子、私有会话拒绝 public 种子；③ `addPublicMagnet`：建 torrent → 等元数据 → 落 .torrent，五种失败各一句中文且不抛异常；④ 公开条目复用同一条 file.add 广播（带 magnet、不带内联种子、**不新增 0x53**），拨号走 `pubBtPort`（M1.7 已接，见 §3.7）。接口与断言见 §3.6
 - 上一轮（P7 全局限速接线前置）：内核补**会话级（全局）限速** —— `setSessionUploadLimit` / `setSessionDownloadLimit` / `sessionUploadLimitKbps` / `sessionDownloadLimitKbps`，运行期改立刻生效、对会话里**已存在**的 torrent 同样生效；入参 KB/s，内部 ×1024 字节/秒，0 = 不限（口径见 §6）。**踩到的坑**：libtorrent 默认把局域网与回环对端排除在全局限速之外（`upload_rate_limit` 只作用在 global peer class 上），只设那两个值时读数一切正常、局域网上一点没慢（实测 16 MiB loopback：设 2048 KB/s 仍按 31 MB/s 跑完）；内核在建会话时把私网段并进 global peer class 修掉（同一流量压到 ≈1.4 MB/s）。顺带修掉「端口兜底用 0」的缺陷（见 §8-2）。app 侧接线不在本轮
@@ -23,12 +24,12 @@ bash scripts/m1-headless.sh
 
 1. `./gradlew :core:jar :core:m1Deps :core:m1Native`（构建内核 + 拉依赖 + 解出 `libtorrent4j.dll`）
 2. `javac` 编译 harness（`harness/src/main/java`）
-3. 跑字节层自检 `SelfTest`（332 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃；**本轮新增公开种子一组 55 条**（§3.6：公开会话 DHT 开 / 私有会话 DHT 关、端口 ≥ 6881、per-torrent flags 清零与 0x380000、公开拒 private 与私有拒 public、磁力加种落进公开会话、五种失败文案、同 infohash 两种 scope 正反两种顺序去重）；**本轮新增跨网可达性一组 58 条**（§3.7：私网 / 公网 / 主机名的 IP 字面量分类与归一、真 BtSession 的动态 filter 真值、群知识四类来源并入 + 端点替换 / 退群撤销、pubBtPort 的 JSON 往返与签名域、两个真内核的 pubBtPort 广播 + 公开条目拨公开会话））
+3. 跑字节层自检 `SelfTest`（345 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃；**公开种子一组 68 条**（§3.6：公开会话 DHT 开 / 私有会话 DHT 关、端口 ≥ 6881、per-torrent flags 清零与 0x380000、公开拒 private 与私有拒 public、磁力加种落进公开会话、五种失败文案、同 infohash 两种 scope 正反两种顺序去重；**本轮加 13 条**告警类型映射表补洞与公开会话 alert_mask 收窄，含 30 s 真会话 DHT 收告警 soak，见 §3.8）；**本轮新增跨网可达性一组 58 条**（§3.7：私网 / 公网 / 主机名的 IP 字面量分类与归一、真 BtSession 的动态 filter 真值、群知识四类来源并入 + 端点替换 / 退群撤销、pubBtPort 的 JSON 往返与签名域、两个真内核的 pubBtPort 广播 + 公开条目拨公开会话））
 4. 起 A、B 两个 JVM 进程跑 M1 全流程，然后只用 grep 复核日志
 
 产物：`artifacts/m1/log-A.log`、`log-B.log`、`selftest.log`、`a-data/`、`b-data/`（含 `state.json`、`identity.txt`、`downloads/`）。`artifacts/` 不进版本库。
 
-一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **1 分 50 秒左右**（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；跨网发现要起两个真内核 + 两个本机 mock tracker，~8 s；本轮跨网可达性自检要起一个 BtSession + 三个内核（含公开会话），~10 s）；脚本的 35 条 CHECK 全 PASS（自检 332 条另计，其中公开种子 55 条、跨网发现 68 条、跨网可达性 58 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
+一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **2 分 20 秒左右**（§3.8 的告警 soak 固定占 30 s）（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；跨网发现要起两个真内核 + 两个本机 mock tracker，~8 s；本轮跨网可达性自检要起一个 BtSession + 三个内核（含公开会话），~10 s）；脚本的 35 条 CHECK 全 PASS（自检 345 条另计，其中公开种子 68 条、跨网发现 68 条、跨网可达性 58 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
 
 本轮新增的三条硬断言在 harness 里。`scripts/m1-headless.sh` 本轮不动，它仍然只看 harness 的退出码（`process.rc_0_0` / `catchup.process_rc_0_0_0`）：harness 判 FAIL 即整轮 FAIL，脚本输出里也有对应的证据行。
 
@@ -586,6 +587,90 @@ group.connectSeeders(fileId)             // 私有 → btPort；公开 → pubBt
 `updatePublicAllowlist` 只加不删 → 替换 / 清空撤销那几条红；把 `connectSeeders` 的公开早退加回来 →
 `crossnet.public_dial_uses_pub_bt_port` 红；去掉 `pubBtPort` 解析 → pubBtPort 那组（4 条）红。
 
+### 3.8 公开会话「2 分钟崩溃」的根因与规避（本轮）
+
+**现象。** 公开会话开 DHT、导入磁力后约 2 分钟，进程死在 `SessionManager-alertsLoop`
+（`java.lang.NullPointerException: Attempt to invoke virtual method 'int org.libtorrent4j.alerts.AlertType.ordinal()' on a null object reference`，
+`SessionManager.java:1176`）。桌面 harness 不复现，只在真机（自编 arm64 `.so`）上出现 ——
+这条差异就是根因的入口。
+
+**根因：Java 侧告警类型映射表比 native 少三项，中间被 version skew 撑开成 null。**
+
+1. `Alerts.NUM_ALERT_TYPES = libtorrent.getNum_alert_types()` —— 这个数**从 native 读**。
+2. `AlertType.buildTable()` 是 libtorrent4j 发布时按当时那个 libtorrent 生成的，只填到下标 104。
+3. 两边一错位，`TABLE` 尾部就是 null：
+
+   | 侧 | `num_alert_types` | `buildTable` 填到 | `TABLE` 尾部 |
+   |---|---|---|---|
+   | Maven 的 Windows dll（2.1.0-39） | 105 | 104 | 无空洞 |
+   | **自编 arm64 `.so`**（libtorrent RC_2_1 head `170663b`） | **108** | 104 | **105 / 106 / 107 = null** |
+
+   那三项是 `file_priorities_alert`(105) / `file_status_alert`(106) / `ip_ban_alert`(107)
+   （逐个对着 `alert_types.hpp` 的 `TORRENT_DEFINE_ALERT_PRIO` 宏核过，不是猜的）。
+4. `AlertType.fromSwig(107)` 于是返回 null；`SessionManager.alertsLoop()` 里
+   `switch (AlertType.fromSwig(type))` 被 javac 编译成 `SwitchMap[fromSwig(type).ordinal()]`，
+   null 上取 `ordinal()` 直接 NPE，告警线程当场死掉，进程随之被杀。
+5. **真正会自己冒出来的是 107**：它类别是 `ip_block`，由 `session_impl::ban_ip()` 发出，
+   而 `ban_ip` 只在 peer_connection 收到「info-hash 由 DHT secret id 反推出来」的入向连接时被调用
+   —— 正是公开会话开 DHT 跑一会儿就会遇上的探测流量。105/106 要显式调
+   `post_file_priorities()` / `post_file_status()` 才发，而 Java 绑定里根本没有这两个 API，
+   所以它们必然是空的却不会自己触发。这解释了「公开会话 + DHT + 约 2 分钟」这个精确的触发面。
+
+**结论：是库对未知 alert 类型的映射缺口（version skew 触发），不是我们的 alert_mask 配错。**
+我们一个 mask 都没设过；`SessionManager.start()` 里那句注释 "we always control the alert mask"
+会把会话参数里的 `alert_mask` 强行改写成 `all_categories` 去掉 log 类，我们写进去的值一律无效。
+
+**修法（两层，主修在映射表）。**
+
+1. **[AlertTypeCompat]（主修）**：建会话**之前**，用反射把 `AlertType.TABLE` 里的 null 槽填成
+   `AlertType.UNKNOWN`。UNKNOWN 是库自己给 0..3 那几项「native 有、Java 没建模」用的同一个值，所以：
+   已知类型一个不动、映射结果与补之前完全一致；真正未知的类型落到 UNKNOWN，`switch` 走 default，
+   不进任何 case，被安静跳过。**不是** try/catch 包住整个告警循环 —— 异常照常会从 `alertsLoop` 里
+   抛出来，只是产生 null 的源头被去掉了。
+2. **收紧公开会话 alert_mask（辅修）**：start 之后 `apply_settings` 下发
+   `status | error | storage | port_mapping` 四类。`ip_block` 不订，于是 libtorrent 连
+   `ip_ban_alert` 都不会发（`ban_ip` 里有 `should_post` 判断），把触发面直接掐掉。
+   `session_stats` 不在此列但照样会到：它在 `post_session_stats()` 里直接 emplace、不看 mask，
+   所以 `dhtNodes()` 的读口径不受影响（有断言钉着）。
+
+**caveat：这仍然是规避，不是修复。** 根治有两条路，都不在 `core/` 的边界内：
+（a）把自编 `.so` 换成 JNI 与 `num_alert_types` 都对得上的 libtorrent 提交（或换回 Maven 制品的
+`.so` —— 但它在 Android 13 上 Scudo abort，见 AGENTS §9，不能退）；（b）等 libtorrent4j 发布
+`buildTable()` 覆盖 108 的版本后升依赖。在那之前，`AlertTypeCompat` 是唯一能保证「进程不被一条
+告警带走」的做法。**升级依赖或换 .so 时必须重跑本节断言**：真出现 0 空洞时补表是空操作（
+`filledIds` 为空、不写日志），多出来的下标仍然会被安全跳过，不会因为「补表代码还在」而误伤。
+
+**用 [AlertTypeCompat] 的硬约束（写进类注释，违反会换一个地方再 NPE）：**
+
+- **不要**给空洞里的 type id（105/106/107，以及将来 native 再多出来的）注册 `AlertListener`：
+  `listeners[107] != null` 会让库去调 `Alerts.cast(a)`，而那一步查的 `Alerts.TABLE` 同样有空洞。
+- **不要**注册 catch-all 监听器（`types()` 返回 null），同理。
+
+**新字段 / 新读口。**
+
+| 符号 | 语义 |
+|---|---|
+| `AlertTypeCompat.install()` | 补表，幂等；返回 `Report(nativeTypes, tableLength, filledIds, error)`，失败不抛异常只记 `error` |
+| `AlertTypeCompat.fillTable(table, unknown)` | 纯函数，就地把 null 槽填掉并返回被填的下标；harness 用它打合成表 |
+| `AlertTypeCompat.report` | 最近一次安装结果（诊断页可读） |
+| `PublicBtSession.publicAlertMask()` / `ipBlockCategory()` | 公开会话订的类别 / 崩溃那条的类别，给断言用 |
+| `PublicBtSession.alertMaskSetting()` | 运行中会话**实际**的 `alert_mask`（读 `session.get_settings()` 的 live 值，不是 settings() 里写进去随后被覆盖的值） |
+| `BtSession.alertTypeCompatError` / `PublicBtSession` 的 `alert_type_compat` 日志 | 补表失败 / 补了哪几个槽；正常时 PublicBtSession 每次补表只在有空洞时写一行 |
+
+**断言（harness `PublicSwarmSelfTest.alerts`，正向证据 `selftest.info public.alerts soak_ms=30000 loop_threads=2 mask=0x4d`）。**
+
+| 断言 | 钉住什么 | 打红方式 |
+|---|---|---|
+| `public.alerttype_fill_android_gap` | 合成一张 108 槽、105..107 为 null 的表（等价于真机 `.so` 形状），补完恰好是 `[105,106,107]` | 把 `fillTable` 改成不填 / 填错 |
+| `public.alerttype_fill_leaves_no_null` / `_uses_unknown` / `_keeps_known` / `_idempotent` | 补完无 null、补成 UNKNOWN、已知类型不动、重复补是空操作 | 同上；把已知槽也覆盖会打红 `_keeps_known` |
+| `public.alerttype_no_holes` | native 报几种，`AlertType.fromSwig(i)` 在 `0..NUM_ALERT_TYPES-1` 就都必须非 null | **Windows 上恒真**（dll 报 105、本来没洞），真机才有杀伤力；跨平台能打红的是上一条 |
+| `public.alert_mask_no_ip_block` | 会话 live mask 不含 `ip_block` | 去掉 `applyPublicAlertMask` —— libtorrent4j 默认 mask 是 all_categories，含 ip_block，立刻红 |
+| `public.alert_mask_has_needed_categories` | status/storage/error 仍在（收窄不能收过头） | 把 mask 改成只留一类 |
+| `public.alerts_loop_survives_soak` | DHT 开着跑 `-Dm1.alertSoakMs`（**默认 30 s**）后，告警线程仍活着 | 真机上不补表就是这条挂（线程被 NPE 带走） |
+| `public.session_alive_after_soak` / `public.dht_still_running_after_soak` | soak 之后会话没被顺手关掉、DHT 还在转 | 同上 |
+
+`m1-headless.sh` 本轮**不动**，它仍然只看 harness 退出码；soak 默认 30 s 计入本机实测总时长。
+
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。
@@ -716,11 +801,15 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 - **成员平台 / 做种数是自报值。** `peer.announce` 的 `plat` / `seeds` 不进签名域、收端不验、不参与任何准入或传输判定，只用于 P6 显示。离线成员在被删除前一直显示重启前那一刻的值，重启后、重新握手前显示 `unknown` / 0。
 - **未读数按「可见 op」算。** 游标只记「上次读到哪条 op」，不存每条 op 的已读标记：墓碑到达后该条（及被墓碑指向的那条）从可见集合消失，未读数会跟着变小，这是刻意的口径。同一台设备上的两个群各自维护游标，没有全局未读。
 - **退群不删用户数据。** `removeGroup` 只从会话与本地库里摘掉群，磁盘上已下载的文件保持原样；群不在本地库里，重启时也就没有它的做种集合可恢复，所以退群不会去动 `downloads/`。
+- **告警类型映射表的空洞是「规避」不是「根治」（§3.8）。** 我们自编的 arm64 `.so`（libtorrent RC_2_1 head `170663b`）报 `num_alert_types=108`，libtorrent4j-2.1.0-39 生成的 `AlertType` 只映射 0..104，105/106/107 是 null；`AlertTypeCompat` 在每次建会话前把它们补成 `UNKNOWN`，公开会话再收窄 `alert_mask` 不订 `ip_block`，两句合起来才保证「一条未知告警带不走进程」。根治要么把 `.so` 换到 JNI 与 `num_alert_types` 都对得上的 libtorrent 提交，要么等 libtorrent4j 发布覆盖 108 的版本 —— 两条都在 `core/` 的边界外（`tools/` 与依赖基线，改基线须 L0 同意）。**升级依赖或换 .so 时必须重跑 §3.8 的断言**：真出现 0 空洞时补表是空操作，不会误伤。另：`Alerts.TABLE`（`Alerts.cast` 用的那张）同样有这三个空洞，所以**禁止**给 105/106/107 注册 `AlertListener`、也禁止注册 catch-all（`types()` 返回 null）—— 那会把 NPE 换个地方再来一次。
+- **公开会话不订 `ip_block` / `peer` / `tracker` / `dht` 类告警（§3.8）。** 这些类别公开侧本来就不消费；副作用是「谁被封了」「tracker 回了什么」这类排查信息在公开会话上拿不到，要看得临时把类别加回 `publicAlertMask()` 并重跑 §3.8 的断言。
 - **公开种子只做了内核，没接 UI。** ① 拨号已接（M1.7，§3.7）：公开条目按 `peer.announce.pubBtPort` 对每个成员各拨一次、走公开会话（`sess=pub`），不碰私有 `btPort`；成员没报 `pubBtPort` 时跳过，靠 DHT / 自带 tracker。② 公开条目的「激活」路径只保证把 torrent 挂进公开会话（缓存优先、磁力兜底），完成事件与做种集合按 `sessionOf` 路由后可用，但**没有真机 / 群外设备验证**（pub2 §9 第 7 条要求「群外设备纯磁力下完、两端 SHA-1 一致」，本轮未做）；「公开条目拨成员」的断言只在 loopback 上验过（`crossnet.public_dial_uses_pub_bt_port`），真机 NAT 组合仍未测。③ DHT 冷启动要几秒到几十秒，第一次激活会慢一拍（pub2 §7.1）；线程 / 内存是否随 `stop` 完全释放也还没测。
 - **公开会话与私有会话各占一份限速预算。** `upload_rate_limit` / `download_rate_limit` 是会话级的，libtorrent 没有跨会话共享令牌桶（pub2 §7.2 裁决 3）：设 512 KB/s 时最坏总峰值 2×。公开会话的 `setSessionUploadLimit` / `setSessionDownloadLimit` 与私有侧各自封顶。
 - **`app/` 与 `daemon/` 还没接 G1/G3/G4。** core 侧接口与落盘都已就绪（§3.1 有签名），UI 上这三块空白要等下一轮接线。
 
 ## 10. 下一步
+
+0. **告警类型错配的根治（§3.8，优先级高于下面的功能项）。** 二选一：① 把 `tools/build-libtorrent-android` 的 `LIBTORRENT_SHA` 换到 `num_alert_types == 105` 且仍带磁盘 I/O 生命周期修复的提交（注意别退回会 Scudo abort 的 `24a3adf`）；② 把 `libs.versions.toml` 的 libtorrent4j 升到 `AlertType` 覆盖 108 的版本（属于基线变更，须 L0 同意）。任一条落地后 `AlertTypeCompat` 的补表会退化成空操作（`filledIds` 为空、不写日志），可以原地删掉，也可以留着当未来的安全带 —— 留着的代价是每次建会话多一次反射 + 一次数组扫描。
 
 1. 接 UI：P2/P3/P4/P5 换成 `M1Kernel` + `GroupRuntime`，把 `InMemoryGroupStore` 降级成空实现；顺便按 §3.1 接上 G1（退群入口）、G3（成员平台/做种数）、G4（P2 未读角标 + P4 打开即清零）；P6 挂 `KernelEvents.peersChanged` 刷新在线状态（§3.3）。
 2. Android 侧：自编 arm64 .so 换掉 `compileOnly` 的桌面制品，加 MulticastLock，`keySeed` 进 Keystore。
