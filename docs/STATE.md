@@ -24,6 +24,8 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 - 邀请码 M1 只收后 8 位（40 bit）+ 在线限速；保留「P5 收全 16 位」的升级路径，协议零改动
 - mDNS 默认不广播群名与在线人数（只 v/gid/bt/r），隐私优先
 - 群规模上限 32 人
+- 组队只做通告（队友数读 kernel.teammates），不做显式分片、不用 0x53 调度
+- super-seeding 不默认开启（省字节不省时间，小文件负收益）；若判据改为省流量可再评估，前提是修队友数口径
 - P0 是自检开屏页，不是诊断页：无检测项列表、无「进入」、无「重测」；成功自动进、降级显警告后自动进、失败停留给「重试」
 - P7「网络诊断」不再跳 P0，改为只读状态行
 - 新增需求（L0）：接入系统分享菜单（ACTION_SEND）；应用内为文件创建链接分享，终态是二维码 + 「分享链接」按钮；接收方浏览器直接打开；链接可在设置里撤销。排 M2，系统分享入口可提前
@@ -43,10 +45,15 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 
 ## 在飞
 
-- DEVV 真机验证做种计数与重启续种（含 app 兜底清理）
-- JARFIX 截图门禁的 jar 时效判断
+- 无（等 M2 排期）
 
 ## 已完成
+- CORETEAM 拨号缺陷与 E0 → hasPeers 短路修复（C1 向 C2 上传 183 MiB）、duplicate_link 竞态修复（mutant 自证）、kernel.teammates 读口、E0 D=1.1394 → 不做显式分片
+- SUPERSEED 对照 → super-seeding 能消掉重复上传（D 1.09→1.00），但 T_all 只改善 3.1%、小文件慢 59%、污染队友数 → 不默认开启
+- APPP6 P6 在线状态 → peersChanged 驱动、离线灰显、真机 39 checks PASS
+- RECONNECT 重启重连与完成快通道 → PeerReconnector（退避/并发/去重）、torrent_finished_alert 快判；headless 与真机 --quick 均 PASS，两次反向验证证明断言可红
+- SPEC 组队口径对齐 → 队友数改为观测口径（实际互连），P2 去掉群级组队数，M2 验收改为记录 D 与 T_all
+- TEAM 组队研究 → docs/design/team-acceleration.md：显式分片收益 ≤0.6%，只做通告；发现 hasPeers 短路缺陷
 - WIN Windows 打包 → dist/Huchuan 34.9 MiB（jlink 运行时，无需装 Java）+ IFileOpenDialog 文件选择器；m1-windows 37/37 PASS
 - SHOT WebView2 离屏截图 → 桌面不渲染环境下 build-windows 16/16 PASS（index.json mode=offscreen）
 - CORE-FIX 做种计数与重启续种 → SeedingLedger 单一来源（下载完成/休眠/重启/文件缺失全走它）、state.json 存 seeding 数组、重启按原 info 字典续种；selftest 110 条，headless 35 CHECK PASS
@@ -98,6 +105,8 @@ P3 进 M1：无头内核先行，UI 只做视觉修正
 - 跨设备评论延迟用对端 ts 计算，时钟不同步会出现负值（实测 -1907 ms）；改为本地接收时刻
 - devkit 缺 input text 与 launch --extra，真机脚本仍需直调 adb
 - P7 全局限速与通知档只存设置，未接内核
+- E0 只跑一轮，D 与 1.00 的区分度不足；super-seeding 两臂各 2 轮，区间重叠
+- duplicate_link 竞态在真机半开连接路径未自动化覆盖
 - core 有 8 条缺口（退群/重做种/成员做种数/未读数/组队/评论删除/下载目录可指定/tracker 状态），UI 上对应「没有未读角标、没有组队人数、别人做种数显示 0」
 - Windows 端「添加文件」现在是绝对路径输入框，不是系统文件选择器
 - Windows 未打包 JRE，目标机需装 JDK 17+

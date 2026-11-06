@@ -19,9 +19,13 @@ import javax.net.ssl.SSLSocket
 internal class PeerLink(
     private val kernel: M1Kernel,
     private val socket: SSLSocket,
-    private val inbound: Boolean,
+    /** true = 对端拨进来的。同时拨号的两条链路要靠它 + deviceId 定出唯一胜者（见 GroupRuntime.attach）。 */
+    internal val inbound: Boolean,
     val remoteHost: String,
 ) : AutoCloseable {
+
+    /** 对端的端口。去程链路里这就是它的消息层监听端口，可以落盘给冷启动重连用。 */
+    internal val remotePort: Int get() = try { socket.port } catch (_: Throwable) { 0 }
 
     private val output = DataOutputStream(BufferedOutputStream(socket.outputStream, 64 * 1024))
     private val input = DataInputStream(BufferedInputStream(socket.inputStream, 64 * 1024))
@@ -50,6 +54,10 @@ internal class PeerLink(
     @Volatile
     private var peerBound = false
 
+    /** 双向 hello 验完、链路已经按群绑定（[onBound] 跑过）。冷启动重连靠它判断「连上了」。 */
+    @Volatile
+    private var bound = false
+
     @Volatile
     private var sentSignedHello = false
 
@@ -75,6 +83,8 @@ internal class PeerLink(
     private var secondMark = System.currentTimeMillis()
 
     val isClosed: Boolean get() = closed
+
+    val isBound: Boolean get() = bound
 
     fun chanIdHex(): String = chanId.toHex()
 
@@ -295,6 +305,9 @@ internal class PeerLink(
         val g = if (gid.isNotEmpty()) kernel.groupById(gid) else null
         if (g != null && g.members().any { it.dev == peerDeviceId }) {
             group = g
+            bound = true
+            // 记下「这条端点连得通」：去程链路记的是对端的监听端口，落盘给下次冷启动重连用（缺口一）。
+            kernel.onLinkBound(this, g)
             g.attach(this)
             kernel.events.log(
                 "peer_bound",
@@ -709,6 +722,18 @@ internal class PeerLink(
     private fun sendPeerAnnounce(g: GroupRuntime) {
         val body = g.peerAnnounceBody() ?: return
         sendQuietly(MsgType.PEER_ANNOUNCE, body)
+    }
+
+    /**
+     * 撞车兜底（[GroupRuntime.settleOnExistingLink]）：在一条已经绑定的链路上补发
+     * peer.announce 与 sync.req。
+     *
+     * 两条都是幂等的（announce 只是覆盖同一个 dev 的端点；sync.req 换回的 file.list 会按
+     * fileId 去重），所以对端多收一次没有副作用 —— 这正是「撞车后直接复用这条活链路」的实现。
+     */
+    internal fun announceAndSync(g: GroupRuntime) {
+        sendPeerAnnounce(g)
+        sendSyncReq(g)
     }
 
     // ------------------------------------------------------------------ 分发

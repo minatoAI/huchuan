@@ -57,6 +57,7 @@ L1 只做：任务分解、边界设定、验收标准、结果核验、状态�
 4. 日志分级、结构化，验证脚本能直接 grep 关键事件。
 5. 工具先于功能：调试链路的短板会放大成整个项目的返工。
 6. 真机操作统一走 tools/devkit（devices / install / launch / screenshot / ui-dump / tap-text / wait-text / logcat），不要各自手搓 adb。
+7. 禁止按镜像名全局清理进程（`taskkill /IM java.exe` 之类）——本机同时跑着多个 agent 的 JVM。只能按 PID 或命令行精确匹配，清不掉就报告。
 
 ## 7. 沟通
 

@@ -97,7 +97,8 @@
     <string name="p6_copied">已复制</string>
     <string name="p6_empty">暂无成员</string>
     <string name="p6_load_failed">加载失败，重试</string>
-    <string name="p6_offline">离线，显示缓存</string>
+    <!-- 成员行的离线标签：内核连接表判定的实时状态（离线成员仍留在列表里，整行灰显） -->
+    <string name="p6_offline">离线</string>
 
     <!-- P7 设置 -->
     <string name="p7_title">设置</string>

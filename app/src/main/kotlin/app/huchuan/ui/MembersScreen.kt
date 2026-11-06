@@ -22,6 +22,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -33,6 +34,9 @@ import kotlinx.coroutines.launch
 
 /**
  * P6 成员。入口：P3 顶部「成员（n 人）」；出口：系统返回 → P3。
+ *
+ * 「在线」是内核连接表的实时投影：链路绑定 / 断开时 [app.huchuan.kernel.M1Runtime] 收到
+ * KernelEvents.peersChanged，推一次「重读数据」，这里跟着重组。界面侧没有定时器，也不轮询。
  *
  * 「做种 n」与平台来自 MemberRecord（协议 §10 的 peer.announce.plat / seeds）：
  * 本机是真值，别人是他自己最后一次自报的值；没自报过就是「未知」/ 0。
@@ -116,9 +120,16 @@ private fun platformLabel(platform: String): String = when (platform) {
     else -> stringResource(R.string.p6_platform_unknown)
 }
 
+/**
+ * 一个成员行。
+ *
+ * 在线 / 离线两个状态都写出来（以前离线什么都不显示，看不出「没连上」和「不在群里」的区别）。
+ * 离线成员不删除、不换位，只整行降透明度灰显：列表顺序变了反而看不出谁掉线。
+ */
 @Composable
 private fun MemberRow(member: Member) {
     ListItem(
+        modifier = if (member.online) Modifier else Modifier.alpha(OFFLINE_ALPHA),
         headlineContent = {
             Text(
                 text = member.name,
@@ -127,13 +138,13 @@ private fun MemberRow(member: Member) {
         },
         supportingContent = {
             Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
-                if (member.online) {
-                    Text(
-                        text = stringResource(R.string.p6_online),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+                Text(
+                    text = stringResource(
+                        if (member.online) R.string.p6_online else R.string.p6_offline,
+                    ),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Text(
                     text = stringResource(R.string.p6_seeding, member.seedingCount),
                     style = MaterialTheme.typography.bodyMedium,
@@ -150,3 +161,6 @@ private fun MemberRow(member: Member) {
         },
     )
 }
+
+/** 离线行的透明度：降权但不隐藏，文字仍可读（M3 的 disabled 档位同一量级）。 */
+private const val OFFLINE_ALPHA = 0.45f

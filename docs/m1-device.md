@@ -72,7 +72,7 @@ libtorrent 只认文件系统路径，`content://` 给不了它。P3「添加文
 | P3 群组 | 文件清单 + 状态（做种中 / 下载中 / 休眠）+ 进度 + 做种者数；进入即 `markGroupRead` |
 | P4 文件详情 | 激活/休眠 = 真的 `add_torrent` / `remove_torrent`；进度、上下行速率来自 BT 会话；评论来自签名 op 日志；打开即 `markFileRead` |
 | P5 新群组 | 只收后 8 位 → `kernel.joinByTail8`（mDNS 发现 + 手动 IP:port 兜底） |
-| P6 成员 | `members()` + 消息层连接表判在线；「做种 n」与平台直接取 `MemberRecord.seedingCount` / `MemberRecord.platform`（G3） |
+| P6 成员 | 在线 = 消息层连接表的实时值（`GroupRuntime.onlinePeers()`），由 `KernelEvents.peersChanged` 推刷新；「做种 n」与平台直接取 `MemberRecord.seedingCount` / `MemberRecord.platform`（G3） |
 
 **文件状态只有一个来源**：`GroupRuntime.localRole()`（内核的 `SeedingLedger`）。P3 的 chip 与 P4 的
 激活开关都读它，`M1GroupStore` 里不再有「进程内已完成 + 盘上有文件 → 当作做种中」这类二次推测。
@@ -82,8 +82,15 @@ libtorrent 只认文件系统路径，`content://` 给不了它。P3「添加文
 之后转「做种中」；这是内核状态的真实时延，不是界面丢状态。
 
 **刷新靠内核事件，不轮询**：`M1Runtime.attachUiRefresh` 把 `KernelEvents`（`op_ingested`、
-`peer_announce`、`download_progress`、`file_add`、`file_completed` …）压成一次「重读数据」投到主线程；
-每 2 s 的 `heartbeat` 不算事件，界面不靠它当节拍。旧实现是界面侧 700 ms 定时器，已删。
+`peer_announce`、`peers_changed`、`download_progress`、`file_add`、`file_completed` …）压成一次
+「重读数据」投到主线程；每 2 s 的 `heartbeat` 不算事件，界面不靠它当节拍。旧实现是界面侧 700 ms 定时器，已删。
+
+**P6 的「在线」是实时的**：`M1Runtime` 覆盖 `KernelEvents.peersChanged(group, deviceId, online)`
+（内核只在 `attach` / `detach` 两处回调，冷启动重连成功同样是一次 `online=true`），收到就打一行
+`event=ui_peers_changed ... online=...` 并推一次重读，界面侧没有任何定时器。
+离线成员**不删、不换位**：成员记录还在，行里写「离线」并把整行降到 45% 透明度灰显——
+这样「掉线」和「不在群里」一眼能分开，也不会因为有人上下线让列表自己跳。
+P6 的离线文案因此由 `离线，显示缓存` 收成 `离线`（`p6_offline`）：在线状态现在是内核真值，不是缓存。
 
 **线程纪律**：所有会碰网络的内核动作（建群注册 mDNS、加入、共享、激活、发评论）都必须离开界面线程。
 这条不是风格问题——真机上界面线程写 socket 会抛 `NetworkOnMainThreadException`，
@@ -124,10 +131,28 @@ quick 模式下对端没共享压力文件，所以这两条就是「0 → 1」�
 | P4 开关 | 激活开关是开（ui-dump XML 里 Switch 节点 `checked="true"`，`--texts` 看不到这个属性） |
 | P6 做种数 | 本机那一行的做种数与重启前一致（quick 模式下就是 1） |
 
-冷启动后消息层不会自动重连对端（现有实现只在「加入」时建链，重连属于后续工作），
-所以这两条断言只看本机：续种是纯本地判定（条目在、torrent 在、文件在、大小对得上）。
-代价是 P6 上对端的平台与做种数在重启后回到「未知 / 0」——脚本因此把 P6 平台与对端做种数
-放在重启之前取，重启后只验本机那一行。
+冷启动后消息层现在会主动重连群成员（M1.4：PeerReconnector，候选 = 落盘端点 → 手动地址 → mDNS，
+指数退避 1/2/4/8/16/30 s、每群并发 3；连上走 hello 绑定，不重新 join）。重连成功后对端的
+平台与做种数会随第一条 peer.announce 恢复，不再是「未知 / 0」。
+
+本节的续种断言只验本机那一行：续种是纯本地判定（条目在、torrent 在、文件在、大小对得上），
+不依赖对端有没有连回来。对端能不能自己连回来见下一节。
+
+**(c) 冷启动自动重连（`restart.reconnect` 组）**
+
+四条证据各占一个 CHECK，缺一条都不算「自动重连」：
+
+| 观察点 | 判据 |
+| --- | --- |
+| 重连器真的起来了 | 最后一条 `kernel_started` 里 `reconnect=on`（`restored_groups` ≥ 1 内核才会起 PeerReconnector） |
+| 候选来自上次的落盘端点 | `reconnect_attempt ... sources=` 这一段里含 `peer`（候选优先级 peer > manual > lan；adb 给的 `huchuan.debug.manual` 与落盘端点同地址时按去重规则记 `peer`，所以断言「这一段里有 peer」，不断言整段相等） |
+| 绑定成功且够快 | `peer_reconnected addr=... dev=<对端> elapsed_ms=...` ≤ 5000（`M1_RECONNECT_MS` 可改），`dev` 必须是对端的 device_id |
+| 对端看到的是 inbound | `desktop-peer.log` 里 `peer_bound ... role=in` 的条数比重启前多一条：这条链路由手机拨出，不是对端连回来。用条数比基线，是因为对端日志里可能已经有更早的 inbound 绑定，只 grep 存在性会放过假证据 |
+| P6 上对端那一行 | 重启后进 P6，对端那一行是「在线」——`peersChanged` 推出来的实时状态，不是重启前的缓存 |
+
+脚本在 force-stop 之前先记 `reconnect_attempt` 与 `peer_bound role=in` 的基线，重启后只认「多出来的那一条」，
+旧日志冒充不了本次重连。证据：`screenshots/restart-reconnect.png`（冷启动后）、
+`screenshots/restart-p6-online.png`（P6 上对端变回在线）。
 
 ## 3. 桌面对端
 
@@ -174,6 +199,11 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 | `restart.p3_chip_seeding` | 冷启动进群后 P3 上仍有「做种中」（状态读 `localRole`，不靠盘上文件推测） |
 | `restart.p4_switch_on` | 冷启动进 P4，激活开关是开（ui-dump XML 里 Switch 节点 `checked="true"`；`--texts` 只吐 text/desc，看不到这个属性） |
 | `restart.self_seeding_kept` | 冷启动后 P6 本机那一行的做种数与重启前一致（quick 模式下就是 1） |
+| `restart.reconnect_kernel_on` | 冷启动后最后一条 `kernel_started` 是 `reconnect=on`（`restored_groups` ≥ 1 才有重连器） |
+| `restart.reconnect_attempt_peer` | `reconnect_attempt` 的 `sources=` 里含 `peer`：挑的是上次连过的端点，不是 adb 塞的手动地址 |
+| `restart.reconnect_bind_5s` | `peer_reconnected addr=... dev=<对端>` 的 `elapsed_ms` ≤ 5000 |
+| `restart.reconnect_peer_bound_in` | `desktop-peer.log` 里 `peer_bound ... role=in` 比重启前多一条（链路是手机拨出去的） |
+| `restart.reconnect_p6_online` | 重启后 P6 上对端那一行是「在线」（`KernelEvents.peersChanged` 推的实时状态） |
 | `join.mdns_discovered` | `join_candidates lan=` ≥ 1（mDNS 找到候选；端点与手动候选重复时协议记 manual） |
 | `desktop.shared_stress_files` | 对端把压力文件真的共享出去了（否则第 10 步才发现 P3 没文件） |
 | `stress.roundN.sha256` | 每轮下载完成后 `run-as` 拉回手机上的文件，与桌面源文件比对 SHA-256 |
@@ -189,7 +219,8 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 artifacts/m1-device/
   screenshots/     关键界面截图（P1、P5 输入、P3、SAF、P4 评论、P2 角标前后、每轮完成、
                    成员页 final-members（做种计数）、 restart-p2 / restart-p3 / restart-p4 /
-                   restart-members（force-stop 冷启动一路的证据））
+                   restart-members（force-stop 冷启动一路的证据）、
+                   restart-reconnect / restart-p6-online（冷启动自动重连与 P6 实时在线））
   ui-dumps/        失败现场的界面层级
   logs/app-logcat.log        只含 huchuan/m1 事件
   logs/full-logcat.log       全量（Scudo/ANR 断言用）

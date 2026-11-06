@@ -72,11 +72,32 @@ class GroupRuntime internal constructor(
      */
     private val pendingSeeds = LinkedHashMap<String, String>()
 
+    /**
+     * dev → 上次成功建链的对端消息层端点（host:port），跟着群一起落盘。
+     *
+     * 冷启动重连的第一优先候选（[reconnectCandidates]）：只记「本机拨出去并成功绑定」的端点 ——
+     * 入向链路拿到的是对端的临时源端口，不是它的监听端口，记下来没用。
+     */
+    internal val peerAddrs = LinkedHashMap<String, String>()
+
+    /**
+     * 上次加入时用过、或本机建群后手动填过的 IP:port（host:port），跟着群一起落盘。
+     *
+     * 用途只有一个：mDNS 不通、上次连过的端点也变了的时候，冷启动还能按同一组地址连回去（协议 §3.3）。
+     */
+    internal val manualAddrs = LinkedHashSet<String>()
+
     /** 已连接的 BT 端点（做种侧标记用）。 */
     internal val connectedEndpoints = HashSet<String>()
 
-    /** fileId@dev:port → 上次 connect_peer 的时间戳，避免刷屏式重连。 */
-    private val lastConnect = HashMap<String, Long>()
+    /**
+     * fileId@dev → 这个成员的 BT 拨号状态（端点、拨了几次、下一次最早什么时候拨）。
+     *
+     * 按**成员**记而不是按「有没有 peer」判：同一台设备先后换端口（重启）时端点变了就当新成员重来。
+     * 成员一旦在 libtorrent 的 peer 列表里被确认互连，这条记录就被删掉 —— 重复调用 connectSeeders
+     * 不会给已经连上的成员再拨一次。
+     */
+    private val dials = HashMap<String, MemberDial>()
 
     /** 已上报过「下载完成」的文件，避免重复事件。 */
     private val completed = HashSet<String>()
@@ -136,8 +157,15 @@ class GroupRuntime internal constructor(
 
     // ------------------------------------------------------------------ 写
 
-    /** 共享文件：建 v1 私有种子 → 加种 → 广播 file.add（协议 §11 第 11-12 步）。 */
-    fun addFile(file: File): FileEntry {
+    /**
+     * 共享文件：建 v1 私有种子 → 加种 → 广播 file.add（协议 §11 第 11-12 步）。
+     *
+     * [superSeeding] 透传给 [BtSession.addSeed]（BEP 16，只在做种侧有意义）。
+     * 真值用 [superSeeding] 读回，别信这个入参。
+     */
+    fun addFile(file: File): FileEntry = addFile(file, false)
+
+    fun addFile(file: File, superSeeding: Boolean): FileEntry {
         require(file.isFile) { "not a file: " + file }
         val seeded = kernel.bt.createPrivateTorrent(file)
         val entry = FileEntry(
@@ -153,7 +181,7 @@ class GroupRuntime internal constructor(
         val sig = kernel.identity.sign(Domains.FILE, entry.signFields())
         // 签名跟着条目一起存：file.list 要把「原样携带 file.add 的 sig」发给别人（协议 §7）。
         val signed = entry.copy(sig = sig)
-        kernel.bt.addSeed(seeded, file.parentFile ?: file.absoluteFile.parentFile)
+        kernel.bt.addSeed(seeded, file.parentFile ?: file.absoluteFile.parentFile, superSeeding)
         synchronized(lock) {
             files[entry.fileId] = signed
             localTasks.add(entry.fileId)
@@ -170,6 +198,7 @@ class GroupRuntime internal constructor(
                 "size" to entry.size.toString(),
                 "piece_size" to entry.pieceSize.toString(),
                 "torrent_bytes" to seeded.torrentBytes.size.toString(),
+                "super_seeding" to superSeeding.toString(),
             ),
         )
         broadcast(
@@ -210,42 +239,136 @@ class GroupRuntime internal constructor(
     }
 
     /**
-     * 把已知的做种端点接上（swig connect_peer；高层 API 没有这个能力）。
+     * 把成员挨个接上（swig connect_peer；高层 API 没有这个能力）。
      *
-     * connect_peer 是「每个 torrent 一份」的连接，所以去重键必须带 fileId：
-     * 只按 dev:port 去重会让第二个文件永远接不上做种者（一文件一 torrent）。
-     * 另外 libtorrent 断线不会自己重连，没有活连接时按 CONNECT_RETRY_MS 重试。
+     * **缺陷修复点**：原来的实现先算一个 `hasPeers = bt.peers(fileId) > 0`，只要有 1 条 peer 连接
+     * 就整轮不拨 —— 单做种者先被一个下载者连上之后，其余下载者永远不互连，队友之间拿不到互补的片。
+     * 现在按「每成员一次拨号」：候选就是成员表里自报过 BT 端点的每个成员，
+     * 已互连的跳过（幂等），还在退避里的跳过，其余按 [ReconnectPolicy.MAX_PARALLEL_DIALS] 截断。
+     *
+     * 退避与预算复用冷启动重连的那一套（[ReconnectPolicy]，1/2/4/8/16/30 s 封顶），不另立参数。
+     * connect_peer 是「每个 torrent 一份」的连接，所以状态键必须带 fileId：只按 dev 去重会让
+     * 第二个文件永远接不上同一个成员（一文件一 torrent）。
      */
     fun connectSeeders(fileId: String) {
+        // 没挂进会话就没有可 connect_peer 的 torrent
+        if (!isLocalTask(fileId)) return
         val targets = synchronized(lock) {
-            btEndpoints.entries.map { Triple(it.key, it.value.first, it.value.second) }
+            btEndpoints.entries
+                .filter { it.key != kernel.deviceId }
+                .map { MemberDialPolicy.Target(it.key, it.value.first, it.value.second) }
         }
-        val hasPeers = kernel.bt.peers(fileId) > 0
-        for ((dev, host, port) in targets) {
-            if (dev == kernel.deviceId) continue
-            val key = fileId + "@" + dev + ":" + port
-            val now = System.currentTimeMillis()
-            val attempt = synchronized(lock) {
-                if (hasPeers) {
-                    false
-                } else {
-                    val last = lastConnect[key] ?: 0L
-                    if (now - last >= CONNECT_RETRY_MS) {
-                        lastConnect[key] = now
-                        true
-                    } else {
-                        false
-                    }
-                }
+        if (targets.isEmpty()) return
+
+        // 已经互连的成员（数据来自 libtorrent 的 peer 列表）+ 顺手把它们的拨号状态清掉
+        val live = liveMembers(fileId)
+        val now = System.currentTimeMillis()
+        val throttled = ArrayList<String>()
+        synchronized(lock) {
+            for (dev in live.keys) dials.remove(fileId + "@" + dev)
+            for (t in targets) {
+                val st = dials[fileId + "@" + t.dev] ?: continue
+                if (now < st.nextDialAt) throttled.add(t.key)
             }
-            if (!attempt) continue
-            if (kernel.bt.connectPeer(fileId, host, port)) {
+        }
+
+        val plan = MemberDialPolicy.plan(
+            targets,
+            live.keys,
+            throttled,
+            ReconnectPolicy.MAX_PARALLEL_DIALS,
+        )
+        for (t in plan) {
+            val addr = t.host + ":" + t.port
+            val ok = kernel.bt.connectPeer(fileId, t.host, t.port)
+            val attempt = synchronized(lock) {
+                val st = dials.getOrPut(fileId + "@" + t.dev) { MemberDial() }
+                st.note(now, addr)
+            }
+            if (ok) {
                 kernel.events.log(
                     "bt_connect_peer",
-                    mapOf("file_id" to fileId, "peer" to dev, "addr" to (host + ":" + port)),
+                    mapOf(
+                        "file_id" to fileId,
+                        "peer" to t.dev,
+                        "addr" to addr,
+                        "attempt" to attempt.toString(),
+                        "backoff_ms" to ReconnectPolicy.backoffMs(attempt - 1).toString(),
+                    ),
                 )
             }
         }
+    }
+
+    /**
+     * 当前与这个文件的 torrent **真实互连**的成员（dev → 对端快照）。
+     *
+     * 唯一数据来源是 libtorrent 的 peer 列表（[BtSession.peerSnapshot]）：
+     * 不看成员表、不看协议帧、不新造字段。peer_info 只有 IP 没有端口，所以「连接 → 成员」按 host 匹配；
+     * 同一个 host 上有多条连接（同机多进程 / 同一 NAT 后）时按 dev 字典序逐条分配，每个成员最多一条。
+     * 匹配不上的对端（非成员的直连）不计数。
+     */
+    private fun liveMembers(fileId: String): Map<String, BtSession.PeerSnapshot> {
+        val peers = kernel.bt.peerSnapshot(fileId).filter { it.connected }
+        if (peers.isEmpty()) return emptyMap()
+        val targets = synchronized(lock) {
+            btEndpoints.entries
+                .filter { it.key != kernel.deviceId }
+                .map { Triple(it.key, it.value.first, it.value.second) }
+                .sortedBy { it.first }
+        }
+        val out = LinkedHashMap<String, BtSession.PeerSnapshot>()
+        val taken = HashSet<Int>()
+        // ① 先按 host:port 精确配对：本机拨出去的连接看到的就是对方的监听端口，一定对得上
+        for ((dev, host, port) in targets) {
+            val want = host + ":" + port
+            for (i in peers.indices) {
+                if (i in taken) continue
+                if (peers[i].ip != want) continue
+                out[dev] = peers[i]
+                taken.add(i)
+                break
+            }
+        }
+        // ② 精确对不上的（对端拨进来的连接，端口是临时端口）退化成按 host 配，
+        //    同一个 host 上有多条连接时按 dev 顺序逐条分配，每个成员最多一条
+        val byHost = HashMap<String, MutableList<Int>>()
+        for (i in peers.indices) {
+            if (i in taken) continue
+            byHost.getOrPut(hostOf(peers[i].ip)) { ArrayList() }
+                .add(i)
+        }
+        for ((dev, host, _) in targets) {
+            if (out.containsKey(dev)) continue
+            val list = byHost[host] ?: continue
+            while (list.isNotEmpty()) {
+                val i = list.removeAt(0)
+                out[dev] = peers[i]
+                break
+            }
+        }
+        return out
+    }
+
+    /** `127.0.0.1:53513` → `127.0.0.1`；IPv6 字面量表里存的是裸地址，这里只按最后一个冒号切。 */
+    private fun hostOf(endpoint: String): String {
+        val at = endpoint.lastIndexOf(':')
+        return if (at > 0) endpoint.substring(0, at) else endpoint
+    }
+
+    /**
+     * 队友数（观测口径，产品规格 docs/design/product-spec.md:306）：
+     * **当前与该文件 torrent 实际互连、且本机处于「部分」的成员数**，不含做种者。
+     *
+     * - 本机不在「部分」（没挂进会话 / 已经 100%）→ 0：文件到 100% 即退出组队。
+     * - 只数 libtorrent 的 peer 列表里真握上手、且对端不是做种者的成员。
+     * - 数据不落盘、不进协议：是读数，不是状态。宿主轮询即可（见 kernel.teammates）。
+     */
+    fun teammates(fileId: String): Int {
+        if (!isLocalTask(fileId)) return 0
+        // 「部分」= 数据还没齐；做种中的文件不再算组队（100% 即退出）
+        if (kernel.bt.isFinished(fileId)) return 0
+        return liveMembers(fileId).values.count { !it.seed }
     }
 
     fun progress(fileId: String): Double = kernel.bt.progress(fileId)
@@ -340,8 +463,8 @@ class GroupRuntime internal constructor(
             localTasks.remove(fileId)
             seeding.leave(fileId)
             unhealthySeeds.remove(fileId)
-            // 重连计时也要清，否则刚休眠完再激活会被 CONNECT_RETRY_MS 卡住。
-            lastConnect.keys.removeIf { it.startsWith(fileId + "@") }
+            // 拨号状态也要清，否则刚休眠完再激活会被退避窗口卡住。
+            dials.keys.removeIf { it.startsWith(fileId + "@") }
             connectedEndpoints.clear()
             true
         }
@@ -354,6 +477,12 @@ class GroupRuntime internal constructor(
     }
 
     /** 单文件限速（协议 §4：一文件一 torrent + setUploadLimit）。 */
+    /** super-seeding 的真值：读 libtorrent 的 `torrent::flags()`，不是本项目自报的开关。 */
+    fun superSeeding(fileId: String): Boolean = kernel.bt.superSeeding(fileId)
+
+    /** 运行中开关 super-seeding（BEP 16 允许中途切）；成没成用 [superSeeding] 读回。 */
+    fun setSuperSeeding(fileId: String, on: Boolean): Boolean = kernel.bt.setSuperSeeding(fileId, on)
+
     fun setUploadLimitKbps(fileId: String, kbps: Int) {
         kernel.bt.setUploadLimit(fileId, kbps)
     }
@@ -539,7 +668,7 @@ class GroupRuntime internal constructor(
         val changed = synchronized(lock) {
             localTasks.remove(fileId)
             unhealthySeeds.remove(fileId)
-            lastConnect.keys.removeIf { it.startsWith(fileId + "@") }
+            dials.keys.removeIf { it.startsWith(fileId + "@") }
             seeding.leave(fileId)
         }
         kernel.bt.removeTorrent(fileId)
@@ -603,14 +732,168 @@ class GroupRuntime internal constructor(
         oplog.loadAll(listOf(op))
     }
 
+    /**
+     * 一条链路绑定成功（hello 通过，对端是本群成员）：进连接表，并让宿主刷新 P6。
+     *
+     * 冷启动自动重连会和对端自己的重连撞在同一瞬间（两端各自拨一条），所以同一个 dev
+     * 已经有活链路时不能简单覆盖：覆盖会把两端各留一条、各掐一条，结果两条都不剩。
+     * 这里按 [preferNewLink] 裁决，两端用同一个规则算出同一条胜者，留下那条 TCP 连接。
+     *
+     * **缺陷修复点（两端同时拨号永远连不上）**：裁决前先把已经关掉的旧链路当不存在。
+     * 以前一条僵尸链路（本端还没读到对端 EOF，但 socket 其实已经废了）会一直占着 [links]，
+     * 于是每一条新拨进来的健康链路都被判成 duplicate_link 关掉，两端互相「你关我的我关你的」，
+     * 30 s 退避一轮永远不 attach（现场见 artifacts/m1-device/reconnect-race-evidence.txt）。
+     */
     internal fun attach(link: PeerLink) {
-        synchronized(lock) { links[link.peerDeviceId] = link }
+        val dev = link.peerDeviceId
+        var keep: PeerLink? = null
+        var drop: PeerLink? = null
+        var replacedDead = false
+        synchronized(lock) {
+            val old = links[dev]
+            when {
+                old == null || old === link -> {
+                    links[dev] = link
+                    keep = link
+                }
+                // 僵尸不参与裁决：它已经关了（或对端已经不在），留它就是留一条死链路。
+                old.isClosed -> {
+                    links[dev] = link
+                    keep = link
+                    replacedDead = true
+                }
+                preferNewLink(old, link) -> {
+                    links[dev] = link
+                    keep = link
+                    drop = old
+                }
+                else -> drop = link
+            }
+        }
+        if (replacedDead) {
+            kernel.events.log("peer_link_dead_replaced", mapOf("dev" to dev, "gid" to groupId, "host" to link.remoteHost))
+        }
+        // 关旧链路要放在群锁外面：close 会回灌 detach / 事件回调，持锁调容易和宿主互相等。
+        if (drop != null) drop.close("duplicate_link")
+        if (keep != null) kernel.events.peersChanged(this, dev, true)
+    }
+
+    /** 该成员当前有没有活链路（未关闭）。撞车兜底与「已经连着」判定都读它。 */
+    internal fun liveLinkFor(dev: String): PeerLink? = synchronized(lock) {
+        links[dev]?.takeIf { !it.isClosed }
+    }
+
+    /**
+     * 按地址找一个活链路（用于拨号撞车兜底时还不知道对端 deviceId 的场合）。
+     * 同一个 host 上有多条活链路（同机多进程 / 同一 NAT 后）时返回 null —— 宁可不认，也不认错人。
+     */
+    internal fun liveLinkForHost(host: String): PeerLink? = synchronized(lock) {
+        val hits = links.values.filter { !it.isClosed && it.remoteHost == host }
+        if (hits.size == 1) hits[0] else null
+    }
+
+    /**
+     * 撞车兜底：把「同一成员已经有一条活链路」认成一次成功绑定。
+     *
+     * 拨号线程在自己那条链路被 duplicate_link 关掉之后走这里：不退回 30 s 重拨，
+     * 而是在既有链路上补一次 peer.announce 与 sync.req（两者都幂等），把这条链路当绑定成功。
+     * 返回 true 表示确实有一条可用的活链路。
+     */
+    internal fun settleOnExistingLink(dev: String): Boolean {
+        val link = liveLinkFor(dev) ?: return false
+        if (!link.isBound || link.group?.groupId != groupId) return false
+        link.announceAndSync(this)
+        return true
+    }
+
+    /**
+     * 同一 dev 两条链路并存时留哪条。
+     *
+     * 同向（都是本机拨出 / 都是对端拨来）：留新的，旧的多半是没收到对端 EOF 的僵尸。
+     * 异向（同时拨号）：按 deviceId 定序 —— deviceId 小的一方留自己拨出的那条。两边算出的
+     * 胜者是同一条 TCP 连接，否则「你关我的、我关你的」会把两条都关掉。
+     */
+    private fun preferNewLink(old: PeerLink, new: PeerLink): Boolean {
+        if (old.inbound == new.inbound) return true
+        val weAreLower = kernel.deviceId < new.peerDeviceId
+        return if (new.inbound) !weAreLower else weAreLower
     }
 
     internal fun detach(link: PeerLink) {
-        synchronized(lock) {
-            if (links[link.peerDeviceId] === link) links.remove(link.peerDeviceId)
+        val removed = synchronized(lock) {
+            if (links[link.peerDeviceId] === link) {
+                links.remove(link.peerDeviceId)
+                true
+            } else {
+                false
+            }
         }
+        if (removed) kernel.events.peersChanged(this, link.peerDeviceId, false)
+    }
+
+    // ------------------------------------------------------------------ 冷启动重连（缺口一）
+
+    /**
+     * 记下「本机拨出去并绑定成功」的对端端点，落盘给下次冷启动用。
+     *
+     * 只在端点真的变了的时候写一次盘：每次重连成功都重写 state.json 没必要。
+     */
+    internal fun rememberPeerAddr(dev: String, host: String, port: Int) {
+        if (dev.isEmpty() || host.isEmpty() || port <= 0) return
+        val addr = host + ":" + port
+        val changed = synchronized(lock) { peerAddrs.put(dev, addr) != addr }
+        if (changed) kernel.saveStateIfStarted()
+    }
+
+    /** 记下手动 IP:port（P5 输入过的）。已经在集合里就不写盘。 */
+    internal fun rememberManualAddrs(raw: List<String>) {
+        var changed = false
+        synchronized(lock) {
+            for (item in raw) {
+                val c = ManualCandidate.parse(item) ?: continue
+                if (manualAddrs.add(c.key)) changed = true
+            }
+        }
+        if (changed) kernel.saveStateIfStarted()
+    }
+
+    /** 载入 state.json 时用。 */
+    internal fun restorePeerAddr(dev: String, addr: String) {
+        if (dev.isEmpty() || addr.isEmpty()) return
+        synchronized(lock) { peerAddrs[dev] = addr }
+    }
+
+    /** 载入 state.json 时用。 */
+    internal fun restoreManualAddr(addr: String) {
+        if (addr.isEmpty()) return
+        synchronized(lock) { manualAddrs.add(addr) }
+    }
+
+    /**
+     * 冷启动重连的候选，按优先级：上次连过的端点 → 手动地址 → 传入的 mDNS 候选。
+     *
+     * 按 host:port 去重，先出现的来源赢（同一个地址既在手动地址里又有 mDNS 时，记 manual，
+     * 口径同协议 §3.4）。本机自己的地址不发出去：本机不可能连自己。
+     */
+    internal fun reconnectCandidates(lan: List<Candidate>): List<Candidate> {
+        val out = LinkedHashMap<String, Candidate>()
+        val saved = ArrayList<Candidate>()
+        val manual = ArrayList<Candidate>()
+        synchronized(lock) {
+            for ((dev, addr) in peerAddrs) {
+                if (dev == kernel.deviceId) continue
+                val c = ManualCandidate.parse(addr) ?: continue
+                saved.add(c.copy(source = "peer"))
+            }
+            for (addr in manualAddrs) {
+                val c = ManualCandidate.parse(addr) ?: continue
+                manual.add(c.copy(source = "manual"))
+            }
+        }
+        for (c in saved) if (!out.containsKey(c.key)) out[c.key] = c
+        for (c in manual) if (!out.containsKey(c.key)) out[c.key] = c
+        for (c in lan) if (!out.containsKey(c.key)) out[c.key] = c
+        return out.values.toList()
     }
 
     internal fun linkFor(dev: String): PeerLink? = synchronized(lock) { links[dev] }
@@ -815,10 +1098,9 @@ class GroupRuntime internal constructor(
     }
 
     companion object {
-        /** 没有活 BT 连接时的 connect_peer 重试间隔。 */
-        const val CONNECT_RETRY_MS = 5_000L
-
-        /** 连续几拍「数据不完整」才把做种降级为休眠（巡查 2 s 一拍，即 ~4 s 的确认窗口）。 */
+        /**
+         * 连续几拍「数据不完整」才把做种降级为休眠（巡查 2 s 一拍，即 ~4 s 的确认窗口）。
+         */
         const val UNHEALTHY_STRIKES = 2
     }
 
@@ -855,6 +1137,12 @@ class GroupRuntime internal constructor(
                     "path" to jstr(path),
                 )
             }),
+            // 冷启动重连（缺口一）：上次成功建链的对端消息层端点 + 加入时用过的手动 IP:port。
+            // 没有这两个字段的旧库读回来就是「没有候选」，重连器改走 mDNS。
+            "peerAddrs" to jarr(peerAddrs.map { (dev, addr) ->
+                jobj("dev" to jstr(dev), "addr" to jstr(addr))
+            }),
+            "manual" to jarr(manualAddrs.map { jstr(it) }),
             // 未读游标（缺口 G4）：每个文件「上次读到哪条 op」，重启后未读数不会归零重算。
             "read" to jarr(readCursors.map { (fileId, cursor) ->
                 jobj(
@@ -883,10 +1171,13 @@ class GroupRuntime internal constructor(
             pendingSeeds.clear()
             unhealthySeeds.clear()
             connectedEndpoints.clear()
-            lastConnect.clear()
+            dials.clear()
             completed.clear()
             btEndpoints.clear()
             memberLive.clear()
+            // 退群之后这些端点既不该再被拨，也不该留在 state.json 里
+            peerAddrs.clear()
+            manualAddrs.clear()
             ids
         }
         var stopped = 0
@@ -922,3 +1213,26 @@ class GroupRuntime internal constructor(
 
 /** 成员自报的运行期属性（协议 §10 的 peer.announce.plat / seeds），只活在内存里。 */
 internal class MemberLive(val platform: String, val seeds: Int)
+
+/**
+ * 单个成员的 BT 拨号状态（每个 `fileId@dev` 一条）。
+ *
+ * 退避直接取 [ReconnectPolicy] 的表（1/2/4/8/16/30 s，30 s 封顶），与冷启动重连同一套策略：
+ * 拨号失败不会刷屏，成员重新出现（端点变了）就当新成员从头开始。
+ */
+private class MemberDial {
+    var addr: String = ""
+    var attempts: Int = 0
+    var nextDialAt: Long = 0L
+
+    /** 记一次拨号，返回这是第几次（日志用）。 */
+    fun note(now: Long, addr: String): Int {
+        if (this.addr != addr) {
+            this.addr = addr
+            attempts = 0
+        }
+        attempts += 1
+        nextDialAt = now + ReconnectPolicy.backoffMs(attempts - 1)
+        return attempts
+    }
+}

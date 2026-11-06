@@ -13,6 +13,19 @@ data class Candidate(val host: String, val port: Int, val source: String) {
     val key: String get() = host + ":" + port
 }
 
+/**
+ * 一个 DNS-SD 实例（协议 §3.1 的一条广播）与其解析出的全部地址。
+ *
+ * [open] 是 TXT 的 `r`：是否还开着加入。冷启动重连不看这一位 —— 已经是成员的群，
+ * 哪怕关了加入也照样要能连回去；[M1Kernel.joinByTail8] 的候选才按它过滤。
+ */
+data class LanEntry(
+    val gid: String,
+    val instanceName: String,
+    val open: Boolean,
+    val candidates: List<Candidate>,
+)
+
 /** 协议 §3.3 手动 IP:port 的语法。 */
 object ManualCandidate {
     fun parse(raw: String): Candidate? {
@@ -121,7 +134,17 @@ class LanDiscovery : AutoCloseable {
     }
 
     /** 浏览 LAN 候选；只收 TXT r=1 的实例（协议 §3.4）。 */
-    fun browse(timeoutMs: Long): List<Candidate> {
+    fun browse(timeoutMs: Long): List<Candidate> =
+        browseEntries(timeoutMs).filter { it.open }.flatMap { it.candidates }
+
+    /**
+     * 浏览 LAN 的全部实例，按实例保留 TXT 的 `gid`：冷启动重连要按群挑候选，
+     * 光有一串 IP:port 没法知道哪条属于哪个群（协议 §3.4 的候选本身不含群标识）。
+     *
+     * 与 [browse] 的差别只有两点：不过滤 `r`（已经是成员就要能连回去），以及保留实例名
+     * （用来排除本机自己注册的那条）。
+     */
+    fun browseEntries(timeoutMs: Long): List<LanEntry> {
         val jm = jmDns ?: return emptyList()
         val found = LinkedHashMap<String, ServiceInfo>()
         val listener = object : ServiceListener {
@@ -153,18 +176,27 @@ class LanDiscovery : AutoCloseable {
         } catch (e: Throwable) {
             lastError = e.toString()
         }
-        val out = ArrayList<Candidate>()
+        val out = ArrayList<LanEntry>()
         val snapshot = synchronized(found) { found.values.toList() }
         for (info in snapshot) {
-            if (!openForJoin(info)) continue
             val addresses = info.inetAddresses ?: continue
             // 一台机器可能有多张网卡（VPN 常是 172.16/12 的点对点地址）。只取第一个地址会
             // 拿到不可达的那个，所以每个地址都出一个候选：连不上的自然被下一个候选顶掉。
+            val candidates = ArrayList<Candidate>()
             val ordered = addresses.sortedByDescending { scoreAddress(it) }
             for (addr in ordered) {
                 val host = addr.hostAddress ?: continue
-                out.add(Candidate(host, info.port, "lan"))
+                candidates.add(Candidate(host, info.port, "lan"))
             }
+            if (candidates.isEmpty()) continue
+            out.add(
+                LanEntry(
+                    gid = info.getPropertyString("gid") ?: "",
+                    instanceName = info.name ?: "",
+                    open = openForJoin(info),
+                    candidates = candidates,
+                ),
+            )
         }
         return out
     }

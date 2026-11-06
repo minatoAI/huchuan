@@ -23,6 +23,9 @@
 #       做种计数：对端下载完成转做种后 P6 那一行是「做种 共享数+1」（不是停在共享数）/
 #       重启续种：force-stop 冷启动后 seed_resumed + seed_resume_done resumed=n、
 #       P3 状态仍是「做种中」、P4 激活开关仍为开、P6 本机做种数与重启前一致。
+#       冷启动自动重连（restart.reconnect 组，四条）：kernel_started reconnect=on /
+#       reconnect_attempt 的 sources 含 peer / peer_reconnected elapsed_ms ≤ 5000 /
+#       对端 desktop-peer.log 出现 peer_bound role=in；外加 P6 上对端那一行实时变回「在线」。
 # 证据：artifacts/m1-device/（截图、ui-dump、logcat、peer 日志、拉回的文件与哈希）
 #
 # 最后一行打印 PASS / FAIL，退出码 0 / 1。
@@ -44,6 +47,8 @@ GROUP_NAME="${M1_GROUP_NAME:-真机验收群}"
 PEER_NAME="${M1_PEER_NAME:-桌面电脑}"
 # 桌面端补发评论的延迟：从「收到手机回的那条评论」开始算，留出手机返回 P2 的时间。
 ECHO_DELAY_MS="${M1_ECHO_DELAY_MS:-25000}"
+# 冷启动自动重连（M1.4）：peer_reconnected 的 elapsed_ms 上限，超了就算候选选错或退避太慢。
+RECONNECT_MAX_MS="${M1_RECONNECT_MS:-5000}"
 QUICK=0
 
 while [ $# -gt 0 ]; do
@@ -51,7 +56,7 @@ while [ $# -gt 0 ]; do
     --quick) QUICK=1 ;;
     --rounds) shift; STRESS_ROUNDS="${1:-3}" ;;
     --mib) shift; STRESS_MIB="${1:-128}" ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "FATAL: 未知参数 $1" >&2; exit 2 ;;
   esac
   shift
@@ -177,6 +182,25 @@ wait_log_peer() {
   return 1
 }
 
+# 桌面端日志里「手机拨进来」的次数：peer_bound 的 role=in 就是本条链路由手机发起。
+# 断言的是「重启之后又多了一条」，所以先记基线再等计数增加：同一轮里更早的 inbound 绑定
+# （换网、对端自己重试、加入时的握手）都不能冒充重启后的这一次，只 grep 存在性会放过假证据。
+count_peer_bound_in() {
+  local n
+  n="$(grep -c 'peer_bound .*role=in' "$PEER_LOG" 2>/dev/null || true)"
+  printf '%s' "${n:-0}"
+}
+
+wait_peer_bound_in() {
+  local want="$1" timeout="${2:-30000}" start
+  start=$(date +%s)
+  while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
+    if [ "$(count_peer_bound_in)" -ge "$want" ] 2>/dev/null; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
 # 等到指定文件的下载进度到 N%（logcat 的 download_progress pct=NN）。
 # 必须按 file_id 过滤：只看「最后一行进度」会被上一轮 100% 的那行骗过去。
 wait_progress() {
@@ -255,17 +279,18 @@ badge_text() {
   dks ui-dump --texts 2>/dev/null | grep -o '[0-9]\+ 条新消息' | head -1
 }
 
-# P6 上某个成员那一行的「做种 n」。
+# P6 上某个成员那一行 supporting 里的某段文字。
 #
-# 参数：$1 = 成员名（headline 文字），$2 = ui-dump --texts 的输出（不给就现抓一次）。
-# 一张 P6 上每个成员占两行文字：name 在高处、supporting 里的「做种 n」紧随其下，
+# 参数：$1 = 成员名（headline 文字），$2 = 值的 ERE（'^做种 [0-9]+$' / '^(在线|离线)$'），
+#       $3 = ui-dump --texts 的输出（不给就现抓一次）。
+# 一张 P6 上每个成员占两行文字：name 在高处、supporting（在线/离线 + 做种 n）紧随其下，
 # 相邻成员之间隔一整行。NODE 行带 center=y，所以按「y 最近的一对」配对，
 # 不依赖成员排序，也不会把「做种 0」错配到上一个成员头上。
 # 找不到该成员（或被 dedupe 掉）时输出空串，由调用方判 FAIL。
-member_seeding() {
-  local who="$1" texts="${2:-}"
+member_near() {
+  local who="$1" pat="$2" texts="${3:-}"
   if [ -z "$texts" ]; then texts="$(dks ui-dump --texts 2>/dev/null)"; fi
-  printf '%s\n' "$texts" | awk -v who="$who" '
+  printf '%s\n' "$texts" | awk -v who="$who" -v pat="$pat" '
     function value_of(l) { v = l; sub(/^.* value=/, "", v); sub(/ bounds=.*$/, "", v); gsub(/^"|"$/, "", v); return v }
     function y_of(l,   c) {
       if (match(l, /center=[0-9]+,[0-9]+/)) { c = substr(l, RSTART, RLENGTH); sub(/^center=[0-9]+,/, "", c); return c + 0 }
@@ -274,7 +299,7 @@ member_seeding() {
     /^NODE/ {
       v = value_of($0); y = y_of($0)
       if (v == who) { ny[++nn] = y }
-      else if (v ~ /^做种 [0-9]+$/) { m = v; sub(/^做种 /, "", m); sn++; sy[sn] = y; sv[sn] = m + 0 }
+      else if (v ~ pat) { sn++; sy[sn] = y; sv[sn] = v }
     }
     END {
       bestd = 1e9; got = 0
@@ -284,6 +309,16 @@ member_seeding() {
       }
       if (got) print best; else print ""
     }'
+}
+
+# 某个成员那一行的「做种 n」，只要数字（沿用老调用方的口径）。
+member_seeding() {
+  member_near "$1" '^做种 [0-9]+$' "${2:-}" | sed 's/^做种 //'
+}
+
+# 某个成员那一行的在线状态：'在线' / '离线'（内核连接表的实时值，见 restart.reconnect_p6_online）。
+member_status() {
+  member_near "$1" '^(在线|离线)$' "${2:-}"
 }
 
 # 前台窗口是不是我们的应用
@@ -866,6 +901,10 @@ chk "p6.self_seeding_row" "$([ -n "$SELF_SEEDS_BEFORE" ] && [ "$SELF_SEEDS_BEFOR
 # 重启续种只能靠上一份 state.json，于是「进程死掉」这件事本身就是被测对象。
 KERNEL_READY_BEFORE="$(count_log "app_kernel_ready")"
 RESUME_DONE_BEFORE="$(count_log "seed_resume_done")"
+# 重连证据的基线：内核重连器的日志、对端的 inbound 绑定，都要「重启之后又多一条」才算数。
+# 首次启动是 pm clear 之后的全新进程（没有恢复出来的群），重连器根本没起，所以两项基线都是 0。
+RECONNECT_ATTEMPTS_BEFORE="$(count_log "reconnect_attempt")"
+PEER_BOUND_IN_BEFORE="$(count_peer_bound_in)"
 APP_PID_BEFORE="$(sh_ pidof "$PKG" | tr -d '\r')"
 sh_ am force-stop "$PKG" >/dev/null 2>&1
 sleep 2
@@ -891,6 +930,49 @@ chk "restart.seed_resume_done" "$([ "${RESUMED:-0}" -ge 1 ] 2>/dev/null && [ "${
   "seed_resume_done resumed=${RESUMED:-?} skipped=${SKIPPED:-?}"
 chk "restart.seed_resumed_logged" "$(applog | grep -F 'seed_resumed' | grep -qF "file_id=$FILE_ID" && echo 1 || echo 0)" \
   "seed_resumed file_id=$FILE_ID"
+
+# ---------------------------------------------------------------- (c) 冷启动自动重连（M1.4 restart.reconnect 组）
+# 内核的 PeerReconnector 冷启动后自己拨回去：候选 = 落盘端点(peer) → 手动地址(manual) → mDNS(lan)，
+# 指数退避 1/2/4/8/16/30 s、每群并发 3，绑上走 hello、不重新 join。
+# 四条证据缺一条都不算「自动重连」，各占一个 CHECK：
+#   ① kernel_started reconnect=on        —— 重连器真的起来了（restored_groups ≥ 1 才会起）
+#   ② reconnect_attempt sources 含 peer  —— 挑的是上次连过的端点，不是靠 adb 塞的手动地址
+#   ③ peer_reconnected elapsed_ms ≤ 5 s  —— 绑定成功，且快到用户看不见
+#   ④ 对端 peer_bound role=in 多一条      —— 这条链路由手机自己拨出，对端看到的是 inbound
+wait_log_count "reconnect_attempt" $((RECONNECT_ATTEMPTS_BEFORE + 1)) 60000 \
+  || warn "冷启动后 60 s 内没有新的 reconnect_attempt（下面四条照实判）"
+
+KERNEL_RECONNECT="$(log_field "kernel_started" reconnect)"
+RESTORED_GROUPS="$(log_field "kernel_started" restored_groups)"
+chk "restart.reconnect_kernel_on" "$([ "$KERNEL_RECONNECT" = "on" ] && echo 1 || echo 0)" \
+  "kernel_started reconnect=${KERNEL_RECONNECT:-none} restored_groups=${RESTORED_GROUPS:-?}"
+
+# sources 是候选来源的逗号列表（优先级 peer > manual > lan，同一 host:port 先出现者赢）。
+# adb 的 huchuan.debug.manual 与落盘端点常常是同一个地址、按去重规则记成 peer，
+# 所以这里断言「这一段里有 peer」，不断言整段相等：同时用上 mDNS 候选是正常的。
+RECONNECT_SOURCES="$(applog | grep -F 'event=reconnect_attempt' | grep -o 'sources=[^ ]*' | tail -1 | cut -d= -f2)"
+RECONNECT_SRC_PEER=0
+if printf '%s' "$RECONNECT_SOURCES" | tr ',' '\n' | grep -qx 'peer'; then RECONNECT_SRC_PEER=1; fi
+chk "restart.reconnect_attempt_peer" "$RECONNECT_SRC_PEER" "sources=${RECONNECT_SOURCES:-none}"
+
+RECONNECT_BIND="$(applog | grep -F 'event=peer_reconnected' | tail -1)"
+RECONNECT_ADDR="$(printf '%s' "$RECONNECT_BIND" | grep -o 'addr=[^ ]*' | cut -d= -f2)"
+RECONNECT_DEV="$(printf '%s' "$RECONNECT_BIND" | grep -o 'dev=[A-Z0-9]*' | cut -d= -f2)"
+RECONNECT_SRC="$(printf '%s' "$RECONNECT_BIND" | grep -o 'source=[a-z]*' | cut -d= -f2)"
+RECONNECT_MS="$(printf '%s' "$RECONNECT_BIND" | grep -o 'elapsed_ms=[0-9]*' | cut -d= -f2)"
+RECONNECT_OK=0
+if [ -n "${RECONNECT_MS:-}" ] && [ "${RECONNECT_MS:-999999}" -le "$RECONNECT_MAX_MS" ] 2>/dev/null \
+  && { [ -z "$PEER_DEV" ] || [ "$RECONNECT_DEV" = "$PEER_DEV" ]; }; then RECONNECT_OK=1; fi
+chk "restart.reconnect_bind_5s" "$RECONNECT_OK" \
+  "peer_reconnected addr=${RECONNECT_ADDR:-none} source=${RECONNECT_SRC:-none} dev=${RECONNECT_DEV:-none}（对端 $PEER_DEV）elapsed_ms=${RECONNECT_MS:-none} ≤ ${RECONNECT_MAX_MS}"
+
+wait_peer_bound_in $((PEER_BOUND_IN_BEFORE + 1)) 30000 \
+  || warn "对端 30 s 内没有新的 peer_bound role=in"
+PEER_BOUND_IN_AFTER="$(count_peer_bound_in)"
+chk "restart.reconnect_peer_bound_in" \
+  "$([ "${PEER_BOUND_IN_AFTER:-0}" -gt "${PEER_BOUND_IN_BEFORE:-0}" ] && echo 1 || echo 0)" \
+  "desktop-peer.log peer_bound role=in ${PEER_BOUND_IN_BEFORE:-0} → ${PEER_BOUND_IN_AFTER:-0}"
+screenshot "restart-reconnect"
 
 # force-stop 不会收起输入法，冷启动时键盘可能还盖着半屏；先按 ESC 收掉，截图才是干净的一页。
 sh_ input keyevent 111 >/dev/null 2>&1 || true
@@ -949,6 +1031,15 @@ SELF_SEEDS_AFTER="$(member_seeding "$MODEL" "$P6_TEXTS_AFTER")"
 chk "restart.self_seeding_kept" "$([ -n "$SELF_SEEDS_AFTER" ] && [ "$SELF_SEEDS_AFTER" = "$SELF_SEEDS_BEFORE" ] && echo 1 || echo 0)" \
   "本机做种数 重启前 ${SELF_SEEDS_BEFORE:-?} → 重启后 ${SELF_SEEDS_AFTER:-?}"
 
+# P6 的在线状态是内核连接表的实时投影（M1Runtime 订阅 KernelEvents.peersChanged 后重读一次）。
+# 冷启动那一刻连接表是空的（对端一开始必然是「离线」），只有这次重连触发的 peersChanged 重读
+# 能把它变回「在线」—— 界面不轮询，缓存也不会自己变。
+PEER_ONLINE_AFTER="$(member_status "$PEER_NAME" "$P6_TEXTS_AFTER")"
+UI_PEERS_ONLINE="$(applog | grep -F 'event=ui_peers_changed' | grep -c 'online=true' || true)"
+chk "restart.reconnect_p6_online" "$([ "$PEER_ONLINE_AFTER" = "在线" ] && echo 1 || echo 0)" \
+  "P6 对端[$PEER_NAME]行=${PEER_ONLINE_AFTER:-?}（ui_peers_changed online=true ${UI_PEERS_ONLINE:-0} 条，实时状态不是缓存）"
+screenshot "restart-p6-online"
+
 # ------------------------------------------------------------------ 12. 断言与证据
 
 step "证据与断言"
@@ -998,7 +1089,7 @@ say "peer      : $PEER_LOG"
 say "screenshots: $ART/screenshots/"
 say "pulled    : $ART/pulled/"
 say "关键日志行："
-grep -hE "event=(app_kernel_ready|join_input|join_via|group_joined|share_import|file_seeding|download_start|file_stopped|seed_resumed|seed_resume_done|ui_file_completed|ui_op_received)" \
+grep -hE "event=(app_kernel_ready|kernel_started|reconnect_attempt|peer_reconnected|ui_peers_changed|join_input|join_via|group_joined|share_import|file_seeding|download_start|file_stopped|seed_resumed|seed_resume_done|ui_file_completed|ui_op_received)" \
   "$ART/logs/app-logcat.log" 2>/dev/null | sed 's/^/  /' | head -30
 say "桌面关键行："
 grep -hE "PEER (ready|peer_joined|file_seen|download_done|comment_sent|op_received|reply_seen|share )" \

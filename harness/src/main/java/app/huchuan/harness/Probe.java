@@ -127,6 +127,38 @@ final class Probe {
                 + " finished=" + st.isFinished();
     }
 
+    /**
+     * 每个 BT 对端的完成度（ppm，1000000 = 对端数据完整）。
+     *
+     * E0 里 S 侧用它确认两个下载者都真的到了 100%，而不是只看到「连上了」。
+     * 直接读 TorrentHandle.peerInfo()，不经过 core 的读数。
+     */
+    String peerProgressLine(String fileId) {
+        if (!ok()) {
+            return "source=unavailable error=" + safe(error);
+        }
+        java.util.List<org.libtorrent4j.PeerInfo> peers;
+        try {
+            synchronized (lock) {
+                Object task = ((Map<?, ?>) tasks).get(fileId);
+                if (task == null) {
+                    return "source=libtorrent status=missing file_id=" + fileId;
+                }
+                Object handle = field(task, "handle");
+                peers = ((TorrentHandle) handle).peerInfo();
+            }
+        } catch (Throwable t) {
+            return "source=libtorrent status=error error=" + safe(t.toString()) + " file_id=" + fileId;
+        }
+        StringBuilder sb = new StringBuilder("source=libtorrent file_id=").append(fileId).append(" n=").append(peers.size());
+        for (int i = 0; i < peers.size(); i++) {
+            org.libtorrent4j.PeerInfo p = peers.get(i);
+            sb.append(" p").append(i).append('=').append(safe(p.ip())).append(':').append(p.progressPpm());
+            sb.append(":0x").append(Integer.toHexString(p.flags()));
+        }
+        return sb.toString();
+    }
+
     /** 变异注入：把会话的 enable_dht 打开。只给反向测试用，正常路径不调用。 */
     boolean turnDhtOn() {
         if (manager == null) {

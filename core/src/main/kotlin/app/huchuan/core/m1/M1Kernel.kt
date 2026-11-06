@@ -64,8 +64,29 @@ class M1Kernel @JvmOverloads constructor(
     private var server: PeerServer? = null
     private var monitorThread: Thread? = null
 
+    /**
+     * 冷启动重连（缺口一）：只对「[start] 时从 state.json 恢复出来的群」工作。
+     * 刚建 / 刚加入的群不进这里 —— 它们的链路本来就由加入流程建立。
+     */
+    private val restoredGroupIds: MutableSet<String> =
+        Collections.synchronizedSet(LinkedHashSet<String>())
+
+    /** 冷启动重连器；没有恢复群时根本不启动（省掉 mDNS 浏览与空转线程）。 */
+    private var reconnecter: PeerReconnector? = null
+
+    /**
+     * 完成告警队列（缺口二）：libtorrent 的 torrent_finished_alert 只往里塞 fileId，
+     * 判定与实际动作（进做种集合 / 推事件 / 重新自报 seeds）在 [completionWatcher] 线程上做。
+     * 不能直接在告警线程上做：那上面碰 socket 与 state.json 会把 libtorrent 的告警循环卡住。
+     */
+    private val completionQueue = java.util.concurrent.LinkedBlockingQueue<String>()
+    private var completionWatcher: Thread? = null
+
     /** 每个文件上一次打点过的进度，避免同一百分比刷屏。（巡查线程读写、退群时主线程清，需同步） */
     private val progressSeen = Collections.synchronizedMap(HashMap<String, Int>())
+
+    /** 每个文件上一次打点过的队友数：只在变化时打一行，观测口径见 [teammates]。 */
+    private val teamsSeen = Collections.synchronizedMap(HashMap<String, Int>())
 
     @Volatile
     private var joinIntent: JoinIntent? = null
@@ -85,8 +106,12 @@ class M1Kernel @JvmOverloads constructor(
         identity = DeviceIdentity.loadOrCreate(File(dataDir, "identity.txt"))
         tlsIdentity = TlsIdentity.create(identity)
         loadState()
+        // 记下「这次是从本地库恢复出来的群」：只有它们需要冷启动主动重连（缺口一）。
+        for (g in allGroups()) restoredGroupIds.add(g.groupId)
 
         bt = BtSession(btHint, File(dataDir, "bt"), ipFilterEnabled = true)
+        // 完成判定不再等 2 s 巡查（缺口二）：libtorrent 判完当场塞队列，由完成线程立刻推事件。
+        bt.onTorrentFinished = { fileId -> onTorrentFinishedAlert(fileId) }
         bt.start()
 
         // 重启续种（缺口 G2）：state.json 里记着「上次在做种」的条目，会话一起来就按判定挂回去。
@@ -101,6 +126,12 @@ class M1Kernel @JvmOverloads constructor(
         for (g in allGroups()) lanDiscovery.register(g.meta, messagePortValue, bt.listenPort)
 
         startMonitor()
+        // 缺口二：完成判定自己有一条线程（告警队列 + 200 ms 兜底巡查），不再等 2 s 巡查节拍。
+        startCompletionWatcher()
+        // 缺口一：恢复出来的群主动连回去（mDNS + 落盘的手动地址 + 上次连过的端点，指数退避）。
+        if (restoredGroupIds.isNotEmpty()) {
+            reconnecter = PeerReconnector(this).also { it.start() }
+        }
         events.log(
             "kernel_started",
             mapOf(
@@ -113,6 +144,10 @@ class M1Kernel @JvmOverloads constructor(
                 "mdns_error" to lanDiscovery.lastError,
                 "dht_nodes" to bt.dhtNodes().toString(),
                 "dht_running" to bt.isDhtRunning().toString(),
+                "restored_groups" to restoredGroupIds.size.toString(),
+                "reconnect" to if (reconnecter != null) "on" else "off",
+                "completion_alert" to if (bt.listenerError.isEmpty()) "on" else "off",
+                "completion_alert_error" to bt.listenerError,
             ),
         )
     }
@@ -123,6 +158,11 @@ class M1Kernel @JvmOverloads constructor(
 
     fun stop() {
         if (!closed.compareAndSet(false, true)) return
+        reconnecter?.close()
+        reconnecter = null
+        completionWatcher?.interrupt()
+        completionWatcher = null
+        completionQueue.clear()
         monitorThread?.interrupt()
         for (g in allGroups()) {
             lanDiscovery.unregister(g.groupId)
@@ -145,6 +185,45 @@ class M1Kernel @JvmOverloads constructor(
     fun dhtNodes(): Long = if (this::bt.isInitialized) bt.dhtNodes() else 0L
 
     internal fun messagePortHint(): Int = portHint
+
+    /** 冷启动重连的目标群（[start] 时从 state.json 恢复出来的那些，且现在还在本地库里）。 */
+    internal fun reconnectTargets(): List<GroupRuntime> = synchronized(stateLock) {
+        restoredGroupIds.mapNotNull { groupsById[it] }
+    }
+
+    /** 建一条去程链路：TLS 握手成功后把 PeerLink 的读线程起起来，返回时链路已在收发 hello。 */
+    internal fun openOutboundLink(host: String, port: Int): PeerLink {
+        val ctx = Tls.clientContext(tlsIdentity)
+        val socket = ctx.socketFactory.createSocket() as SSLSocket
+        try {
+            socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+            Tls.configure(socket)
+            socket.soTimeout = HANDSHAKE_TIMEOUT_MS
+            socket.startHandshake()
+            socket.soTimeout = 0
+        } catch (e: Throwable) {
+            try { socket.close() } catch (_: Throwable) {}
+            throw e
+        }
+        val link = PeerLink(this, socket, inbound = false, remoteHost = host)
+        registerLink(link)
+        val thread = Thread { link.run() }
+        thread.isDaemon = true
+        thread.name = "huchuan-link-out"
+        thread.start()
+        return link
+    }
+
+    /**
+     * 一条链路绑定成功（[PeerLink.onBound]）。只在去程链路上记端点：
+     * 入向链路拿到的是对端的临时源端口，不是它的监听端口，落盘也没有意义。
+     */
+    internal fun onLinkBound(link: PeerLink, group: GroupRuntime) {
+        if (link.inbound) return
+        val dev = link.peerDeviceId
+        if (dev.isEmpty()) return
+        group.rememberPeerAddr(dev, link.remoteHost, link.remotePort)
+    }
 
     internal fun localBtPortLong(): Long = localBtPort().toLong()
 
@@ -176,6 +255,18 @@ class M1Kernel @JvmOverloads constructor(
     /** P4 打开时清零该文件的未读，返回清掉的条数；群或文件不存在返回 0。 */
     fun markFileRead(groupId: String, fileId: String): Int = group(groupId)?.markRead(fileId) ?: 0
 
+    // ------------------------------------------------------------------ 队友数（观测口径）
+
+    /**
+     * 队友数（产品规格 docs/design/product-spec.md:306）：当前与该文件 torrent 实际互连、
+     * 且本机处于「部分」的成员数，不含做种者；本机已经 100% 或没挂进会话时一律 0。
+     *
+     * 读的是 libtorrent 的 peer 列表（[GroupRuntime.teammates]），没有新协议字段、不用 0x53。
+     * 宿主按需轮询（P3 行 chip / P4 标题）即可：这个数只随连接实况变化，没有对应事件。
+     * 群或文件不存在返回 0，不抛。
+     */
+    fun teammates(groupId: String, fileId: String): Int = group(groupId)?.teammates(fileId) ?: 0
+
     // ------------------------------------------------------------------ 退群（缺口 G1）
 
     /**
@@ -205,7 +296,10 @@ class M1Kernel @JvmOverloads constructor(
         // ③：删群密钥
         val keyWiped = group.wipeKeys()
         // 顺带清掉进度打点缓存里属于这个群的条目，避免长跑进程里越积越多
-        for (id in fileIds) progressSeen.remove(id)
+        for (id in fileIds) {
+            progressSeen.remove(id)
+            teamsSeen.remove(id)
+        }
         // ④：从本地库移除（saveState 只看 groupsById，群已经不在里面了）
         saveState()
         events.log(
@@ -334,6 +428,7 @@ class M1Kernel @JvmOverloads constructor(
         }
         val deadline = System.currentTimeMillis() + timeoutMs
         val intent = JoinIntent(invite)
+        intent.manualCandidates = manualCandidates
         joinIntent = intent
         try {
             val lanCandidates = if (lanDiscovery.start()) {
@@ -386,23 +481,9 @@ class M1Kernel @JvmOverloads constructor(
         val attempt = CompletableFuture<GroupRuntime>()
         intent.attempt = attempt
         var link: PeerLink? = null
-        var socket: SSLSocket? = null
         try {
-            val ctx = Tls.clientContext(tlsIdentity)
-            socket = ctx.socketFactory.createSocket() as SSLSocket
-            socket.connect(InetSocketAddress(candidate.host, candidate.port), CONNECT_TIMEOUT_MS)
-            Tls.configure(socket)
-            socket.soTimeout = HANDSHAKE_TIMEOUT_MS
-            socket.startHandshake()
-            socket.soTimeout = 0
-            val created = PeerLink(this, socket, inbound = false, remoteHost = candidate.host)
-            link = created
-            registerLink(created)
-            val thread = Thread { created.run() }
-            thread.isDaemon = true
-            thread.name = "huchuan-link-out"
-            thread.start()
-            return try {
+            link = openOutboundLink(candidate.host, candidate.port)
+            val joined = try {
                 attempt.get(timeoutMs, TimeUnit.MILLISECONDS)
             } catch (e: TimeoutException) {
                 intent.lastError = "timeout connecting " + candidate.key
@@ -411,13 +492,21 @@ class M1Kernel @JvmOverloads constructor(
                 intent.lastError = e.cause?.message ?: e.message ?: "join rejected"
                 null
             }
+            if (joined != null) {
+                // 这一条端点是「加入成功用过的地址 + 手动候选项」：落盘给下次冷启动重连（缺口一）。
+                // 建群方没有手动候选，但它的对端（加入方）会把这两样都记住。
+                joined.rememberPeerAddr(link.peerDeviceId, candidate.host, candidate.port)
+                joined.rememberManualAddrs(intent.manualCandidates)
+            }
+            return joined
         } catch (e: Throwable) {
             intent.lastError = e.toString()
             return null
         } finally {
             if (!attempt.isDone) {
+                // 连接已经建好但没等到 join.ok：关掉这条链路（socket 的收尾在 PeerLink.close 里）。
                 attempt.cancel(true)
-                if (link != null) link.close() else try { socket?.close() } catch (_: Throwable) {}
+                try { link?.close() } catch (_: Throwable) {}
             }
         }
     }
@@ -613,6 +702,16 @@ class M1Kernel @JvmOverloads constructor(
                     val fileId = so.str("fileId") ?: continue
                     rt.restoreSeeding(fileId, so.str("path") ?: "")
                 }
+                // 冷启动重连（缺口一）：上次成功连过的端点 + 加入时用过的手动 IP:port。
+                // 没有这两个字段的旧库读回来就是「没有候选」，重连器改走 mDNS（browseEntries 按 gid 归群）。
+                for (p in o.arr("peerAddrs") ?: emptyList()) {
+                    val po = p as? J.Obj ?: continue
+                    rt.restorePeerAddr(po.str("dev") ?: "", po.str("addr") ?: "")
+                }
+                for (m in o.arr("manual") ?: emptyList()) {
+                    val ms = m as? J.Str ?: continue
+                    rt.restoreManualAddr(ms.value)
+                }
                 // 未读游标（缺口 G4）：没有这一段的旧 state.json 读回来就是「全都未读」，
                 // 所以缺字段一律当没有游标，不做兼容补算。
                 for (r in o.arr("read") ?: emptyList()) {
@@ -675,6 +774,16 @@ class M1Kernel @JvmOverloads constructor(
                         for (f in g.files()) {
                             if (!g.isLocalTask(f.fileId) || g.isLocalSeed(f.fileId)) continue
                             if (!g.isComplete(f.fileId)) {
+                                // 队友数每拍算一次（观测口径，见 teammates）：进度打点与「变化才报」都用它。
+                                val team = try {
+                                    g.teammates(f.fileId)
+                                } catch (e: Throwable) {
+                                    events.log(
+                                        "teammates_probe_error",
+                                        mapOf("group_id" to g.groupId, "file_id" to f.fileId, "error" to e.toString()),
+                                    )
+                                    -1
+                                }
                                 // 进度只在变化时打点，脚本靠它判断「下载在动 / 休眠后停了」。
                                 val pct = g.percent(f.fileId)
                                 if (progressSeen[f.fileId] != pct) {
@@ -686,28 +795,47 @@ class M1Kernel @JvmOverloads constructor(
                                             "file_id" to f.fileId,
                                             "pct" to pct.toString(),
                                             "down_bps" to g.downloadRateBps(f.fileId).toString(),
+                                            "teammates" to team.toString(),
                                         ),
                                     )
                                 }
-                                g.connectSeeders(f.fileId)
-                            } else {
-                                // 完成判定 → 做种集合，唯一一处（以前这里只记「上报过了」不进做种集合）。
-                                val result = g.markCompleted(f.fileId)
-                                if (result.first) {
-                                    events.fileCompleted(g, f)
+                                // 拨号不再看「有没有 peer」，而是每成员一次（见 GroupRuntime.connectSeeders）
+                                try {
+                                    g.connectSeeders(f.fileId)
+                                } catch (e: Throwable) {
                                     events.log(
-                                        "download_completed",
+                                        "connect_seeders_error",
+                                        mapOf("group_id" to g.groupId, "file_id" to f.fileId, "error" to e.toString()),
+                                    )
+                                }
+                                // 队友数只在变化时打一行：它只随 BT 连接实况变化，不会刷屏。
+                                val before = teamsSeen.put(f.fileId, team)
+                                if (before == null) {
+                                    events.log(
+                                        "teammates_first_sample",
                                         mapOf(
                                             "group_id" to g.groupId,
                                             "file_id" to f.fileId,
-                                            "size" to f.size.toString(),
-                                            "path" to (g.savedFile(f.fileId)?.absolutePath ?: ""),
+                                            "count" to team.toString(),
+                                            "peers" to g.peerCount(f.fileId).toString(),
                                         ),
                                     )
-                                    g.setUploadLimitKbps(f.fileId, 0)
+                                } else if (before != team && team >= 0) {
+                                    events.log(
+                                        "teammates_changed",
+                                        mapOf(
+                                            "group_id" to g.groupId,
+                                            "file_id" to f.fileId,
+                                            "count" to team.toString(),
+                                            "peers" to g.peerCount(f.fileId).toString(),
+                                        ),
+                                    )
                                 }
-                                // 做种数变了才重新自报（协议 §10 的 peer.announce.seeds）
-                                if (result.seeding) g.broadcastPeerAnnounce(null)
+                            } else {
+                                // 完成判定 → 做种集合，判定与动作都在 completeFile 一处。
+                                // 正常路径由完成线程（告警 / 200 ms 兜底巡查）先命中，这里只是兜底：
+                                // markCompleted 是幂等的，同一个文件不会推两次事件。
+                                completeFile(g, f.fileId, "monitor")
                             }
                         }
                     }
@@ -733,10 +861,127 @@ class M1Kernel @JvmOverloads constructor(
         monitorThread = thread
     }
 
+    // ------------------------------------------------------------------ 完成判定（缺口二）
+
+    /**
+     * 完成判定到事件的整条路径（**唯一一处**）：
+     * 数据落盘且校验通过 → 进做种集合 → 推 [KernelEvents.fileCompleted] + 打 download_completed
+     * → 做种数变了重新自报 peer.announce.seeds。
+     *
+     * 幂等：[GroupRuntime.markCompleted] 用集合去重，同一个文件重复进来不会重复出事件。
+     * [source] 只用于日志 —— alert（libtorrent 的 torrent_finished_alert 当场）/ sweep（200 ms 兜底巡查）
+     * / monitor（2 s 巡查兜底）。真机缺陷就是它迟到一拍（docs/m1-device.md §2.5）：
+     * 下完之后 P3 会停在「下载中 100%」等巡查，最多 2 s 才转「做种中」。
+     */
+    internal fun completeFile(group: GroupRuntime, fileId: String, source: String): Boolean {
+        val entry = group.file(fileId) ?: return false
+        if (!group.isLocalTask(fileId) || group.isLocalSeed(fileId)) return false
+        if (!group.isComplete(fileId)) return false
+        val result = group.markCompleted(fileId)
+        if (result.first) {
+            // 先写日志行再推事件：宿主（含 harness）常在 fileCompleted 回调里立刻读
+            // "download_completed 的 source"，反过来写会有一个「事件已到、字段还没填」的窗口，
+            // 表现为 source="" 把快通道误判成慢通道（真机与 harness 都踩到过）。
+            events.log(
+                "download_completed",
+                mapOf(
+                    "group_id" to group.groupId,
+                    "file_id" to fileId,
+                    "size" to entry.size.toString(),
+                    "path" to (group.savedFile(fileId)?.absolutePath ?: ""),
+                    "source" to source,
+                ),
+            )
+            events.fileCompleted(group, entry)
+            group.setUploadLimitKbps(fileId, 0)
+        }
+        // 做种数变了才重新自报（协议 §10 的 peer.announce.seeds）
+        if (result.seeding) group.broadcastPeerAnnounce(null)
+        return result.first
+    }
+
+    /**
+     * libtorrent 告警线程的入口：只入队，判定与动作交给 [completionWatcher]。
+     *
+     * 告警会对「挂进会话时数据就完整」的做种 torrent 也发（续种、校验完），所以先按本机任务表
+     * 过一遍：只有「挂进会话、还没进做种集合」的才值得排队，免得把队列和日志刷成噪音。
+     * 这一遍只读内存结构，不碰磁盘也不碰 socket —— 告警线程上不能做重活。
+     */
+    private fun onTorrentFinishedAlert(fileId: String) {
+        if (fileId.isEmpty()) return
+        var downloading = false
+        for (g in allGroups()) {
+            if (g.file(fileId) == null) continue
+            if (g.isLocalTask(fileId) && !g.isLocalSeed(fileId)) {
+                downloading = true
+                break
+            }
+        }
+        if (!downloading) return
+        events.log("completion_alert", mapOf("file_id" to fileId))
+        completionQueue.offer(fileId)
+    }
+
+    /**
+     * 完成线程：告警一来立刻判定；没有告警时每 [COMPLETION_TICK_MS] 兜底扫一遍在下的文件。
+     *
+     * 两条路走同一个 [completeFile]，所以「事件早到 / 晚到」只影响时延，不影响结果。
+     * 兜底那一半是必要的：升级前就在下、或者平台没投递告警的 torrent 只能靠它。
+     */
+    private fun startCompletionWatcher() {
+        val thread = Thread {
+            while (!closed.get()) {
+                var fileId: String? = null
+                try {
+                    fileId = completionQueue.poll(COMPLETION_TICK_MS, TimeUnit.MILLISECONDS)
+                } catch (e: InterruptedException) {
+                    break
+                }
+                if (closed.get()) break
+                try {
+                    if (fileId != null) completeByFileId(fileId, "alert")
+                    sweepDownloads("sweep")
+                } catch (e: Throwable) {
+                    // 完成判定不允许把线程带崩：下一个节拍还会再来
+                }
+            }
+        }
+        thread.isDaemon = true
+        thread.name = "huchuan-complete"
+        thread.start()
+        completionWatcher = thread
+    }
+
+    private fun completeByFileId(fileId: String, source: String): Boolean {
+        for (g in allGroups()) {
+            if (g.file(fileId) == null) continue
+            if (!g.isLocalTask(fileId) || g.isLocalSeed(fileId)) return false
+            return completeFile(g, fileId, source)
+        }
+        return false
+    }
+
+    /** 兜底巡查：只碰「挂进会话且还没进做种集合」的文件，正常就 0–2 条。 */
+    private fun sweepDownloads(source: String) {
+        for (g in allGroups()) {
+            for (f in g.files()) {
+                if (!g.isLocalTask(f.fileId) || g.isLocalSeed(f.fileId)) continue
+                if (!g.isComplete(f.fileId)) continue
+                completeFile(g, f.fileId, source)
+            }
+        }
+    }
+
     companion object {
         const val CONNECT_TIMEOUT_MS = 4000
         const val HANDSHAKE_TIMEOUT_MS = 10_000
         const val HEARTBEAT_MS = 2000L
         const val PING_INTERVAL_MS = 30_000L
+
+        /**
+         * 完成兜底巡查的节拍。真机要求「下载完成 → 状态变化」在 500 ms 以内，
+         * 告警当场到达时这条兜底不会触发；告警拿不到时最坏也就是这一档的时延。
+         */
+        const val COMPLETION_TICK_MS = 200L
     }
 }

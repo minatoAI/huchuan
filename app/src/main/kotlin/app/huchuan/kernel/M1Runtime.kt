@@ -279,6 +279,21 @@ class M1Runtime(context: Context) {
             requestUiRefresh()
         }
 
+        /**
+         * 群内在线成员集合变了（M1.4）：链路绑定 / 断开各一次，冷启动自动重连成功也算一次 online=true。
+         *
+         * 这是 P6「在线」的唯一驱动 —— 收到就重读一次群数据，界面侧没有任何定时器。
+         * 离线成员不在这里删除：连接表变了只是一次刷新，成员记录还在，界面按 online=false 灰显。
+         */
+        override fun peersChanged(group: GroupRuntime, deviceId: String, online: Boolean) {
+            Log.i(
+                TAG,
+                "event=ui_peers_changed group_id=" + group.groupId + " dev=" + deviceId +
+                    " online=" + online,
+            )
+            requestUiRefresh()
+        }
+
         override fun fileAdded(group: GroupRuntime, entry: FileEntry) {
             Log.i(
                 TAG,

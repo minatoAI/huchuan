@@ -16,6 +16,20 @@ abstract class KernelEvents {
     /** 群里某个成员的名字记录更新。 */
     open fun memberJoined(group: GroupRuntime, deviceId: String, name: String) {}
 
+    /**
+     * 群内在线成员集合变了：链路建立（[online] = true）或断开（false）。
+     *
+     * 触发点只有 [GroupRuntime.attach] / [GroupRuntime.detach] 两处，也就是「成员连接表」变化的地方，
+     * 所以宿主（P6 成员页）收到就重读一次 [GroupRuntime.members] / [GroupRuntime.onlinePeers]，
+     * 在线状态、平台与做种数一定是同一拍的数据，不用轮询。
+     *
+     * 冷启动后的自动重连（[PeerReconnector]）走的也是 hello 绑定这条链路，因此重连成功同样会有一次
+     * online=true —— 这就是「重启后 P6 上对端从『未知 / 0』恢复」的那一下刷新。
+     *
+     * 回调在群内部锁之外执行，可以安全地回读群数据；但不要在这里做阻塞网络操作。
+     */
+    open fun peersChanged(group: GroupRuntime, deviceId: String, online: Boolean) {}
+
     /** 文件清单新增一条。 */
     open fun fileAdded(group: GroupRuntime, entry: FileEntry) {}
 
@@ -41,6 +55,13 @@ internal class JoinIntent(val invite: InviteCode) {
 
     @Volatile
     var lastError: String = ""
+
+    /**
+     * 这一次加入时用户给的手动 IP:port（协议 §3.3）。加入成功后原样落进群（state.json 的 manual），
+     * 冷启动重连时当兜底候选用 —— 否则 mDNS 一断，重启就再也回不去。
+     */
+    @Volatile
+    var manualCandidates: List<String> = emptyList()
 }
 
 /** 协议 §8 的准入限速：join.req 失败 5 次/10 min/源 IP、30 次/h/群。 */

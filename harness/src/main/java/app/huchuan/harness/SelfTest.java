@@ -17,7 +17,10 @@ import app.huchuan.core.m1.OpRecord;
 import app.huchuan.core.m1.PeerAnnounceMsg;
 import app.huchuan.core.m1.Proto;
 import app.huchuan.core.m1.PubRegistry;
+import app.huchuan.core.m1.Candidate;
 import app.huchuan.core.m1.ReadCursor;
+import app.huchuan.core.m1.MemberDialPolicy;
+import app.huchuan.core.m1.ReconnectPolicy;
 import app.huchuan.core.m1.SeedRestore;
 import app.huchuan.core.m1.SeedingLedger;
 import app.huchuan.core.m1.SignBytes;
@@ -55,6 +58,8 @@ public final class SelfTest {
             peerAnnounceFields();
             unreadCursor();
             seedingLedger();
+            reconnectPolicy();
+            memberDialPolicy();
             signBytes();
             json();
             framing();
@@ -564,6 +569,123 @@ public final class SelfTest {
         SeedingLedger afterMissing = new SeedingLedger();
         check("seeding.count_after_missing_file_is_0",
                 afterMissing.count(manifest) == 0 && afterMissing.isEmpty());
+    }
+
+    /**
+     * 缺口一的退避与候选编排（ReconnectPolicy）：冷启动重连的「什么时候拨、拨哪几个」就是这两条纯函数。
+     * 全部走生产代码 —— 不在这里重写一遍退避表，否则脚本绿了也不代表内核用的是这张表。
+     */
+    private static void reconnectPolicy() {
+        long[] EXPECTED = {1000L, 2000L, 4000L, 8000L, 16000L, 30000L};
+        boolean scheduleOk = true;
+        for (int i = 0; i < EXPECTED.length; i++) {
+            scheduleOk &= ReconnectPolicy.INSTANCE.backoffMs(i) == EXPECTED[i];
+            check("reconnect.backoff." + i + "_is_" + EXPECTED[i] + "ms",
+                    ReconnectPolicy.INSTANCE.backoffMs(i) == EXPECTED[i]);
+        }
+        check("reconnect.backoff_table", scheduleOk);
+        // 超出表长按 30 s 封顶：连续失败很久之后不能无限涨（也不可能变成 0 或负数）
+        check("reconnect.backoff_caps_at_30s",
+                ReconnectPolicy.INSTANCE.backoffMs(6) == 30000L
+                        && ReconnectPolicy.INSTANCE.backoffMs(99) == 30000L);
+        check("reconnect.backoff_negative_is_first", ReconnectPolicy.INSTANCE.backoffMs(-3) == 1000L);
+        check("reconnect.max_parallel_is_3", ReconnectPolicy.INSTANCE.MAX_PARALLEL_DIALS == 3);
+
+        List<Candidate> candidates = List.of(
+                new Candidate("192.168.1.10", 47100, "peer"),
+                new Candidate("192.168.1.10", 47100, "manual"),   // 同一端点：去重
+                new Candidate("192.168.1.11", 47101, "manual"),
+                new Candidate("192.168.1.12", 47102, "lan"),
+                new Candidate("192.168.1.13", 47103, "lan"));
+        List<Candidate> planned = ReconnectPolicy.INSTANCE.plan(candidates, List.of(), 3);
+        check("reconnect.plan_budget_is_3", planned.size() == 3);
+        check("reconnect.plan_dedup_same_endpoint",
+                planned.size() == 3 && "192.168.1.10:47100".equals(planned.get(0).getKey()));
+        check("reconnect.plan_keeps_order",
+                "192.168.1.10:47100".equals(planned.get(0).getKey())
+                        && "192.168.1.11:47101".equals(planned.get(1).getKey())
+                        && "192.168.1.12:47102".equals(planned.get(2).getKey()));
+
+        // 已经在拨的端点不重拨：否则每 250 ms 一拍会把同一个地址连炸
+        List<Candidate> skipBusy = ReconnectPolicy.INSTANCE.plan(candidates, List.of("192.168.1.10:47100"), 3);
+        check("reconnect.plan_skips_in_flight",
+                skipBusy.size() == 3 && "192.168.1.11:47101".equals(skipBusy.get(0).getKey()));
+        // 并发上限用满时不再派新拨号
+        check("reconnect.plan_zero_budget",
+                ReconnectPolicy.INSTANCE.plan(candidates, List.of(), 0).isEmpty());
+        // 四个不同端点全部在拨 → 本轮没有可派的（并发上限 3 时不会走到「全都在拨」，
+        // 但预算算错、把预算和数据源搞混时会在这里露出来）
+        check("reconnect.plan_all_in_flight",
+                ReconnectPolicy.INSTANCE.plan(candidates,
+                        List.of("192.168.1.10:47100", "192.168.1.11:47101",
+                                "192.168.1.12:47102", "192.168.1.13:47103"),
+                        3).isEmpty());
+        // 端口非法的候选直接丢掉（手动地址解析出来的 0 端口之类）
+        check("reconnect.plan_drops_invalid_port",
+                ReconnectPolicy.INSTANCE.plan(
+                        List.of(new Candidate("192.168.1.20", 0, "manual")), List.of(), 3).isEmpty());
+        check("reconnect.plan_empty_input",
+                ReconnectPolicy.INSTANCE.plan(List.of(), List.of(), 3).isEmpty());
+    }
+
+    /**
+     * 成员间 BT 拨号（MemberDialPolicy）：修的是「已有 1 条 peer 就整轮不拨」的短路。
+     *
+     * 这里的每条断言都对应缺陷现场的一个后果：只要「有 peer 就跳过」回来，
+     * per_member_dial（单做种者先连上后仍要拨第二个成员）立刻 FAIL。
+     */
+    private static void memberDialPolicy() {
+        MemberDialPolicy.Target s = new MemberDialPolicy.Target("dev-s", "192.168.1.10", 51413);
+        MemberDialPolicy.Target c2 = new MemberDialPolicy.Target("dev-c2", "192.168.1.11", 51513);
+        MemberDialPolicy.Target c3 = new MemberDialPolicy.Target("dev-c3", "192.168.1.12", 51613);
+        List<MemberDialPolicy.Target> all = List.of(s, c2, c3);
+
+        // 核心：已经连上做种者（s）之后，剩下的成员仍然各拨一次 —— 不是「有 peer 就整轮放弃」
+        List<MemberDialPolicy.Target> afterSeed = MemberDialPolicy.INSTANCE.plan(
+                all, List.of("dev-s"), List.of(), 3);
+        check("dial.plan_per_member_not_has_peers", afterSeed.size() == 2);
+        check("dial.plan_skips_only_connected_member",
+                afterSeed.size() == 2
+                        && "dev-c2".equals(afterSeed.get(0).getDev())
+                        && "dev-c3".equals(afterSeed.get(1).getDev()));
+
+        // 幂等：所有成员都互连之后不再拨任何人（重复调用 connectSeeders 不会重拨）
+        check("dial.plan_idempotent_when_all_connected",
+                MemberDialPolicy.INSTANCE.plan(all, List.of("dev-s", "dev-c2", "dev-c3"), List.of(), 3)
+                        .isEmpty());
+
+        // 退避：还在窗口里的候选不提前重拨，窗口外的照常拨
+        check("dial.plan_skips_throttled",
+                MemberDialPolicy.INSTANCE.plan(all, List.of(),
+                        List.of(s.getKey(), c2.getKey()), 3).size() == 1);
+        check("dial.plan_throttled_key_carries_dev",
+                s.getKey().startsWith("dev-s@") && s.getKey().endsWith(":51413"));
+
+        // 预算：每轮最多 MAX_PARALLEL_DIALS 个，且按给定顺序截断
+        List<MemberDialPolicy.Target> budgeted = MemberDialPolicy.INSTANCE.plan(all, List.of(), List.of(), 2);
+        check("dial.plan_budget_truncates", budgeted.size() == 2
+                && "dev-s".equals(budgeted.get(0).getDev())
+                && "dev-c2".equals(budgeted.get(1).getDev()));
+        check("dial.plan_zero_budget", MemberDialPolicy.INSTANCE.plan(all, List.of(), List.of(), 0).isEmpty());
+        check("dial.plan_empty_targets",
+                MemberDialPolicy.INSTANCE.plan(List.of(), List.of(), List.of(), 3).isEmpty());
+
+        // 端点还没自报全（端口 0）的成员没有可拨的地址，跳过而不是拨 0 端口
+        MemberDialPolicy.Target noPort = new MemberDialPolicy.Target("dev-x", "192.168.1.13", 0);
+        check("dial.plan_drops_invalid_port",
+                MemberDialPolicy.INSTANCE.plan(List.of(noPort), List.of(), List.of(), 3).isEmpty());
+
+        // 同一台机器上的两个成员（同 host、不同端口）是两条独立候选：去重键带 dev，不能按地址合并
+        MemberDialPolicy.Target a = new MemberDialPolicy.Target("dev-a", "127.0.0.1", 51513);
+        MemberDialPolicy.Target b = new MemberDialPolicy.Target("dev-b", "127.0.0.1", 51513);
+        check("dial.plan_same_host_two_members",
+                MemberDialPolicy.INSTANCE.plan(List.of(a, b), List.of(), List.of(), 3).size() == 2);
+        check("dial.plan_same_host_keys_differ", !a.getKey().equals(b.getKey()));
+
+        // 退避表直接复用 ReconnectPolicy（不另立一套），这里钉一次两者是同一个数
+        check("dial.backoff_is_reconnect_table",
+                ReconnectPolicy.INSTANCE.backoffMs(0) == 1000L
+                        && ReconnectPolicy.INSTANCE.backoffMs(5) == 30000L);
     }
 
     private static J field(J value, String key) {

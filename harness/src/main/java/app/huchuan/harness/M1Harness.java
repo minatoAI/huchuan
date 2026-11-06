@@ -80,6 +80,17 @@ public final class M1Harness {
     static final CountDownLatch MEMBER_JOINED = new CountDownLatch(1);
     static final CountDownLatch FILE_SEEN = new CountDownLatch(1);
     static final CountDownLatch COMMENT_RECEIVED = new CountDownLatch(1);
+    /** 本机下载完成事件（KernelEvents.fileCompleted）到达的那一刻。 */
+    static final CountDownLatch FILE_COMPLETED = new CountDownLatch(1);
+
+    /** 缺口一：B 冷启动后必须在这个时间内重新连上 A（A 只负责取证，判据在 B 侧）。 */
+    static final long RECONNECT_LIMIT_MS = longProp("m1.reconnectLimitMs", 10_000L);
+
+    /** 缺口一：A 等 B 冷启动后自己连回来的上限（宽松一些，失败原因由上面的 10 s 说清）。 */
+    static final long REBIND_WAIT_MS = longProp("m1.rebindMs", 40_000L);
+
+    /** 缺口二：下载完成到事件回调的上限。 */
+    static final long COMPLETION_EVENT_LIMIT_MS = longProp("m1.completionLimitMs", 500L);
 
     static volatile FileEntry lastFile;
     static volatile OpRecord lastOp;
@@ -203,7 +214,42 @@ public final class M1Harness {
                 // 只有真的全过才算 PASS：以前这里先打 RESULT=PASS 再 exit 1。
                 fail("A", "comment_not_in_store");
             }
-            Thread.sleep(500);
+
+            // ---------- 缺口一：等 B 冷启动后自己连回来 ----------
+            // 这里不主动拨号、不做任何补救：B 重启（内核重建）之后必须由它自己连上来。
+            // 判据在 B 侧（重启到绑定 ≤10 s）；A 只提供对端的现场 ——
+            // 「A 侧看到 B 的平台与做种数恢复」= 重连之后那条 peer.announce 不是 unknown / 0。
+            long rebindBase = events.peerOnlineEvents();
+            long rebindT0 = System.currentTimeMillis();
+            boolean rebound = awaitPeerOnlineEvents(events, rebindBase + 1, REBIND_WAIT_MS);
+            long rebindWaitMs = System.currentTimeMillis() - rebindT0;
+            // 重连成功后对端的第一条 peer.announce 才带平台与做种数，等它落地（最多 5 s）
+            long announceDeadline = System.currentTimeMillis() + 5_000L;
+            while (events.announcesAfterRebind() < 1 && System.currentTimeMillis() < announceDeadline) {
+                Thread.sleep(50);
+            }
+            RunLog.out("M1 A peer_rebound ok=" + rebound
+                    + " wait_ms=" + rebindWaitMs
+                    + " ts=" + System.currentTimeMillis()
+                    + " online_events=" + events.peerOnlineEvents()
+                    + " rebind_announces=" + events.announcesAfterRebind()
+                    + " dev=" + events.reboundDev()
+                    + " plat=" + events.reboundPlat()
+                    + " seeds=" + events.reboundSeeds());
+            if (!rebound) {
+                fail("A", "peer_rebound_timeout");
+                return;
+            }
+            if (events.announcesAfterRebind() < 1
+                    || events.reboundPlat().isEmpty()
+                    || "unknown".equals(events.reboundPlat())
+                    || events.reboundSeeds() <= 0) {
+                // 「未知 / 0」就是缺陷现场的样子：链路回来了但成员运行期属性没补上。
+                fail("A", "peer_plat_seeds_not_restored plat=" + events.reboundPlat()
+                        + " seeds=" + events.reboundSeeds());
+                return;
+            }
+            Thread.sleep(200);
             RunLog.out("M1 A flow_done");
             stopSampler();
             kernel.close();
@@ -304,6 +350,8 @@ public final class M1Harness {
             int maxPeers = 0;
             long firstPeerMs = -1;
             boolean complete = false;
+            // 缺口二：本进程第一次看到「已下完」的时刻，用来量完成事件晚了多久。
+            long completeSeenAt = 0L;
             while (System.currentTimeMillis() < deadline) {
                 int peers = group.peerCount(entry.getFileId());
                 samples++;
@@ -318,6 +366,7 @@ public final class M1Harness {
                 }
                 if (group.isComplete(entry.getFileId())) {
                     complete = true;
+                    completeSeenAt = System.currentTimeMillis();
                     break;
                 }
                 int pct = (int) (group.progress(entry.getFileId()) * 100.0);
@@ -325,7 +374,9 @@ public final class M1Harness {
                     RunLog.out("M1 B progress pct=" + pct);
                     lastPct = pct;
                 }
-                Thread.sleep(250);
+                // 缺口二的时间基准：轮询越密，「本进程看到已下完」离真实完成越近。
+                // 100 ms 足够：要判的是 500 ms 的时延，不是微秒级。
+                Thread.sleep(100);
             }
             // 传输过程中的 peer 数：证明 B 真的连着 A，不是单机自嗨。
             RunLog.out("M1 B transfer_peers max=" + maxPeers
@@ -351,6 +402,40 @@ public final class M1Harness {
                     + " sha256=" + sha);
             // B 侧字节真值：libtorrent 的 payload 下载计数（对比文件大小，识别「文件本来就在盘上」）。
             RunLog.out("M1 B transfer_stats " + probe.torrentLine(entry.getFileId()));
+
+            // ---------- 缺口二：完成事件必须当场推，不能等 2 s 巡查节拍 ----------
+            boolean completionEvent = FILE_COMPLETED.await(5, TimeUnit.SECONDS);
+            // source 由 download_completed 那一行填；内核先写行再推事件，这里仍留一个有界等待，
+            // 免得一次线程切换就把快通道误判成慢通道（缺陷现场是 source="" / fast_path=false）。
+            long sourceDeadline = System.currentTimeMillis() + 1000L;
+            while (events.fileCompletedSource().isEmpty() && System.currentTimeMillis() < sourceDeadline) {
+                Thread.sleep(5);
+            }
+            long completionEventAt = events.fileCompletedAtMs();
+            long completionLag = (completionEvent && completeSeenAt > 0 && completionEventAt > 0)
+                    ? completionEventAt - completeSeenAt
+                    : Long.MAX_VALUE;
+            int seedsAtComplete = group.seedingFileCount();
+            String completionSource = events.fileCompletedSource();
+            // 快通道 = 完成线程（告警 / 200 ms 兜底）。落回 2 s 巡查就是缺陷复发。
+            // 光量时延不够：2 s 巡查的相位是随机的，恰好提前到的时候测出来也是「快」，所以两头都判：
+            // ① 判定当场（≤500 ms）；② 这条事件不是 2 s 巡查产出的。
+            boolean fastPath = "alert".equals(completionSource) || "sweep".equals(completionSource);
+            RunLog.out("M1 B completion_event arrived=" + completionEvent
+                    + " lag_ms=" + completionLag
+                    + " limit_ms=" + COMPLETION_EVENT_LIMIT_MS
+                    + " event_ts=" + completionEventAt
+                    + " complete_seen_ts=" + completeSeenAt
+                    + " seeding_at_event=" + seedsAtComplete
+                    + " source=" + completionSource
+                    + " fast_path=" + fastPath);
+            if (!completionEvent || completionLag > COMPLETION_EVENT_LIMIT_MS || !fastPath) {
+                // 旧实现：完成判定只在 2 s 巡查里做，事件最坏晚 2 s —— P3 停在「下载中 100%」。
+                fail("B", "completion_event_late lag_ms=" + completionLag
+                        + " arrived=" + completionEvent + " limit_ms=" + COMPLETION_EVENT_LIMIT_MS
+                        + " source=" + completionSource);
+                return;
+            }
 
             // 单文件限速接口（协议 §4：一文件一 torrent + setUploadLimit）
             group.setUploadLimitKbps(entry.getFileId(), 512);
@@ -391,10 +476,28 @@ public final class M1Harness {
             // source=unavailable 的行，脚本的 dht 断言会把它当坏样本（重启后的采样因此不重开）。
             stopSampler();
             kernel.close();
+            // ---------- 缺口一：重启后主动重连（冷启动不再只等对端先连过来）----------
+            // 这里不调 joinByTail8、不给任何手动候选：内核起来之后必须自己找到 A 并连回去。
+            long onlineBase = events.peerOnlineEvents();
+            long restartAt = System.currentTimeMillis();
             M1Kernel kernel2 = new M1Kernel(dataDir.toFile(), name, msgPort, btPort, events);
             events.attach(kernel2);
             kernel2.start();
+            RunLog.out("M1 B restart_kernel_started phase=2 ts=" + restartAt
+                    + " groups=" + kernel2.groups().size());
             GroupRuntime group2 = firstGroup(kernel2, "B");
+            boolean relinked = awaitPeerOnlineEvents(events, onlineBase + 1, RECONNECT_LIMIT_MS);
+            long relinkedAt = System.currentTimeMillis();
+            RunLog.out("M1 B reconnect_after_restart ok=" + relinked
+                    + " elapsed_ms=" + (relinkedAt - restartAt)
+                    + " ts=" + relinkedAt
+                    + " limit_ms=" + RECONNECT_LIMIT_MS
+                    + " online=" + group2.onlinePeers().size()
+                    + " groups=" + kernel2.groups().size());
+            if (!relinked) {
+                fail("B", "reconnect_after_restart_timeout limit_ms=" + RECONNECT_LIMIT_MS);
+                return;
+            }
             int seedsAfterRestart = awaitSeedingCount(group2, 2, 15_000L);
             RunLog.out("M1 B seeding_count phase=after_restart value=" + seedsAfterRestart
                     + " expect=2 groups=" + kernel2.groups().size()
@@ -748,6 +851,24 @@ public final class M1Harness {
                 "harness injection point missing: GroupRuntime.restoreFile$<module> not found");
     }
 
+    /**
+     * 等 peersChanged / peer_announce 这类「成员上线」回调累计到 want 次。
+     *
+     * 用计数而不是一次性 latch：同一个进程里内核会重建（B 的冷启动），
+     * latch 在第一轮就被消费掉了，第二轮会立刻「通过」——那是假绿。
+     */
+    static boolean awaitPeerOnlineEvents(Events events, long want, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (events.peerOnlineEvents() >= want) {
+                return true;
+            }
+            Thread.sleep(50);
+        }
+        return events.peerOnlineEvents() >= want;
+    }
+
     /** 等群内在线成员数是否为空变成期望状态；超时不抛，由调用方判 FAIL 并说清原因。 */
     static boolean waitPeerState(GroupRuntime group, boolean wantOnline, long timeoutMs)
             throws InterruptedException {
@@ -919,6 +1040,17 @@ public final class M1Harness {
         return sb.toString();
     }
 
+    static int parseIntOr(String raw, int def) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return def;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
     static String clean(String s) {
         if (s == null) {
             return "";
@@ -1028,6 +1160,60 @@ public final class M1Harness {
         /** memberJoined 那一刻本群的清单长度：join.ok 快照是否该置空（§10 >32 条）就看它。 */
         volatile int memberJoinedFiles = -1;
 
+        // ---- 缺口一：成员上线的次数与「重连之后对端自报了什么」 ----
+
+        /**
+         * peersChanged(online=true) 的次数。第一次是加入时那条链路，第二次往后才是「重启后连回来」。
+         * 用它做判据而不是「在线成员非空」：后者在重启瞬间可能还留着上一轮的值。
+         */
+        private final java.util.concurrent.atomic.AtomicInteger peerOnlineEvents =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        /** 第 2 次（含）之后收到的 peer.announce 条数：重连之后对端补报平台与做种数靠它。 */
+        private final java.util.concurrent.atomic.AtomicInteger announcesAfterRebind =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        private final java.util.concurrent.atomic.AtomicReference<String> reboundDev =
+                new java.util.concurrent.atomic.AtomicReference<>("");
+        private final java.util.concurrent.atomic.AtomicReference<String> reboundPlat =
+                new java.util.concurrent.atomic.AtomicReference<>("");
+        private volatile int reboundSeeds = -1;
+
+        // ---- 缺口二：完成事件到达的时刻与它走的哪条路 ----
+
+        private final java.util.concurrent.atomic.AtomicLong fileCompletedAtMs =
+                new java.util.concurrent.atomic.AtomicLong(0L);
+        private final java.util.concurrent.atomic.AtomicReference<String> fileCompletedSource =
+                new java.util.concurrent.atomic.AtomicReference<>("");
+
+        int peerOnlineEvents() {
+            return peerOnlineEvents.get();
+        }
+
+        int announcesAfterRebind() {
+            return announcesAfterRebind.get();
+        }
+
+        String reboundDev() {
+            return reboundDev.get();
+        }
+
+        String reboundPlat() {
+            return reboundPlat.get();
+        }
+
+        int reboundSeeds() {
+            return reboundSeeds;
+        }
+
+        long fileCompletedAtMs() {
+            return fileCompletedAtMs.get();
+        }
+
+        String fileCompletedSource() {
+            return fileCompletedSource.get();
+        }
+
         Events(String role) {
             this.role = role;
         }
@@ -1061,7 +1247,32 @@ public final class M1Harness {
         }
 
         @Override
+        public void peersChanged(GroupRuntime group, String deviceId, boolean online) {
+            if (online) {
+                peerOnlineEvents.incrementAndGet();
+            }
+            // 在线成员数一起打出来：P6 刷新读的就是这几个数。
+            log("peers_changed", Map.of(
+                    "dev", deviceId,
+                    "online", String.valueOf(online),
+                    "gid", group == null ? "" : group.getGroupId(),
+                    "online_peers", String.valueOf(group == null ? -1 : group.onlinePeers().size())));
+        }
+
+        @Override
         public void log(String event, Map<String, String> fields) {
+            if ("download_completed".equals(event)) {
+                // 完成事件走的哪条路（alert = 告警当场 / sweep = 200 ms 兜底 / monitor = 2 s 巡查）
+                fileCompletedSource.set(fields.getOrDefault("source", ""));
+            }
+            if ("peer_announce".equals(event) && peerOnlineEvents.get() >= 2) {
+                // 重连之后（第 2 次及以后的上线）对端补报的平台与做种数：
+                // 「A 侧看到 B 的 plat/seeds 恢复」就是这里读到的值，不再靠界面截图。
+                announcesAfterRebind.incrementAndGet();
+                reboundDev.set(fields.getOrDefault("dev", ""));
+                reboundPlat.set(fields.getOrDefault("plat", ""));
+                reboundSeeds = parseIntOr(fields.get("seeds"), -1);
+            }
             if ("file_list_entry".equals(event)) {
                 fileListEntries.incrementAndGet();
             } else if ("file_add".equals(event)) {
@@ -1112,7 +1323,10 @@ public final class M1Harness {
 
         @Override
         public void fileCompleted(GroupRuntime group, FileEntry entry) {
+            // 回调进来的这一刻就是「完成判定当场」：脚本 / 内核日志用它量缺口二修好了没有。
+            fileCompletedAtMs.compareAndSet(0L, System.currentTimeMillis());
             log("file_completed", Map.of("file_id", entry.getFileId()));
+            FILE_COMPLETED.countDown();
         }
 
         @Override
