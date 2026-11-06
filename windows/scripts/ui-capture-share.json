@@ -1,0 +1,27 @@
+{
+  "note": "P8 链接分享 / P9 分享管理的两张取证图，由 windows/scripts/capture-share-ui.sh 单独跑（不进构建门禁：这两张要真的向 Pages 的 Worker 登记一条 7 天链接，构建不该依赖外网与 pages.dev）。page 必须等于 document.body.dataset.page，expect 必须出现在截图那一刻的 DOM 探针里。route=p8-share / p9-list 是取证别名：先确保 daemon 里有一条有效分享（没有就用本群第一个私有文件建一条），再落页。daemonPort 让壳连到这台装置专用的端口（47200 可能被别的服务占着）。",
+  "jobs": [
+    {
+      "name": "p8-share",
+      "route": "p8-share",
+      "theme": "light",
+      "page": "p8",
+      "expect": "复制链接",
+      "daemonPort": 47270,
+      "shotDelayMs": 1200,
+      "shotTimeoutMs": 30000,
+      "describe": "P8 链接分享：本地二维码（qrText，版本 4）+ 链接 + 复制链接 + 7 天后失效 + 等待访客"
+    },
+    {
+      "name": "p9-list",
+      "route": "p9-list",
+      "theme": "light",
+      "page": "p9",
+      "expect": "被访问",
+      "daemonPort": 47270,
+      "shotDelayMs": 1200,
+      "shotTimeoutMs": 30000,
+      "describe": "P9 分享管理：文件名 / 7 天后失效 · 被访问 0 次 / 撤销（同一台 daemon，复用 p8-share 建的那条）"
+    }
+  ]
+}

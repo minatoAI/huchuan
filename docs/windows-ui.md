@@ -7,7 +7,9 @@
 - 链接分享（W1）已接进 P4 / P8 / P9：P4「…」→「分享链接」创建 7 天链接并进 P8，
   二维码由页面本地编码并画成 SVG（`js/qrcode.js`，不出网）；P7「分享管理」→ P9 列表与撤销。
 - 一条命令出结果：`bash scripts/build-windows.sh` → 编译 → 起一个带料的 daemon →
-  逐页截图 → 18 张门禁逐张断言，再补 3 张公开种子截图（同一套离屏截图与断言）。
+  逐页截图 → 16 张门禁逐张断言，再补 3 张公开种子截图（同一套离屏截图与断言）。
+- P8 / P9 的两张截图单独跑：`bash windows/scripts/capture-share-ui.sh`（会真向 Worker 登记
+  一条链接，所以不放进构建门禁，见 §6.4）。
 - 壳只负责窗口与 WebView2：启动时拉起 daemon、退出时带走它，业务逻辑一行都不在 `main.cpp` 里。
 
 ## 1. 怎么起、怎么连
@@ -108,6 +110,8 @@ windows/scripts/
   ui-capture-teammates.json 上面那三张的任务表（同一份 capture-ui.ps1，换 -JobsPath / -IndexName）
   capture-tracker-ui.sh  跨网发现关闭态的一张取证图（一个 daemon，见 §6.2）
   ui-capture-tracker.json 上面那张的任务表（用 --daemon-port 连取证装置）
+  capture-share-ui.sh  链接分享两张：P8 / P9（一个 daemon，向 Worker 真登记一条链接，见 §6.4）
+  ui-capture-share.json 上面两张的任务表（同一份 capture-ui.ps1，换 -JobsPath / -IndexName）
   click-navigate.ps1  点击链路冒烟（可选，不进构建门禁）
 scripts/build-windows.sh   构建 + 内嵌 + 起取证 daemon + 截图
 scripts/package-windows.sh 绿色版打包：jlink runtime + exe + jar → dist/Huchuan/（见 docs/daemon-api.md §8）
@@ -275,12 +279,13 @@ html / css / js / svg / png / woff2，按路径排序后：
 ## 5. 构建与验收
 
 ```bash
-bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 18 张门禁截图 + 3 张公开种子补充图
+bash scripts/build-windows.sh                # 编译 + 起取证 daemon + 16 张门禁截图 + 3 张公开种子补充图
 bash scripts/build-windows.sh --no-evidence  # 只编译
 bash scripts/build-windows.sh --clean        # 先清 windows/build
 bash scripts/package-windows.sh              # 绿色版：jlink runtime + exe + jar → dist/Huchuan/
 bash windows/scripts/capture-team-ui.sh      # 组队通告 + 限速的三张取证图（三个 daemon，见 §6.1）
 bash windows/scripts/capture-tracker-ui.sh   # 跨网发现关闭态的一张取证图（一个 daemon，见 §6.2）
+bash windows/scripts/capture-share-ui.sh     # P8 / P9 两张（会真登记一条 7 天链接，见 §6.4）
 ```
 
 四道关，任一不过脚本退出非 0：
@@ -311,7 +316,7 @@ bash windows/scripts/capture-tracker-ui.sh   # 跨网发现关闭态的一张取
 进程退出码、尝试次数、尺寸、颜色数、主色占比、亮度、探针原文）。每页最多重跑 3 次（`-Attempts`）。
 
 门禁跑完后再跑一轮**公开种子补充截图**（§6.3）：同样是 `capture-ui.ps1` + 一次性 exe，任务表由
-`build-windows.sh` 现场生成 `public-capture-jobs.json`，索引单独写 `public-index.json`，不挤进那 18 张。
+`build-windows.sh` 现场生成 `public-capture-jobs.json`，索引单独写 `public-index.json`，不挤进那 16 张。
 脚本另外按屏 grep 探针原文（`公开` / `等待来源` / `移除` / `btih:` / `导入`），像素断言照旧。
 
 两个已经踩过的坑，改这里之前先看一眼：
@@ -356,9 +361,9 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 
 ## 6. 截图清单
 
-构建门禁的 `artifacts/windows/ui/` 共 18 张（§6.4 的 P8 / P9 两张是这一轮加的），每张一个独立进程；
-同一轮构建还会补 3 张公开种子图（§6.3，索引单独一份 `public-index.json`）。另有 §6.1 / §6.2
-两个脚本产的 4 张也落在同一目录。涉及数据的断言写的是取证 daemon 那份料的字面：
+构建门禁的 `artifacts/windows/ui/` 共 16 张，每张一个独立进程；同一轮构建还会补 3 张公开种子图
+（§6.3，索引单独一份 `public-index.json`）。另有 §6.1 / §6.2 / §6.4 三个脚本产的 6 张也落在同一目录
+（P8 / P9 因为要真登记一条链接，不进构建门禁）。涉及数据的断言写的是取证 daemon 那份料的字面：
 
 | 文件 | 页 | 状态 | 断言文案 |
 | --- | --- | --- | --- |
@@ -375,8 +380,6 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 | `p5-new-group.png` | P5 | 新群组：邀请码后 8 位 / 加入 / 新建群组 | 新建群组 |
 | `p6-members.png` | P6 | 成员列表 + 邀请码 | 邀请码 |
 | `p7-settings.png` | P7 | 设置抽屉：用户名 / 全局限速 / 通知 / 跨网发现 / 分享管理 / 网络状态 | 全局限速 |
-| `p8-share.png` | P8 | 链接分享：本地二维码 + 链接 + 复制链接 + 7 天后失效 + 等待访客（§6.4） | 复制链接 |
-| `p9-list.png` | P9 | 分享管理：文件名 / 7 天后失效 · 被访问 0 次 / 撤销（§6.4） | 被访问 |
 | `p2-home-dark.png` | P2 | 深色 | 老板的群 |
 | `p4-file-dark.png` | P4 | 深色 | 单文件限速 |
 | `p7-settings-dark.png` | P7 | 深色 | 全局限速 |
@@ -426,7 +429,7 @@ daemon 还用 `--device-name=Tracker-Off` 认领 health，避免把占着同一�
 
 ### 6.3 公开种子三张（构建脚本的后半段）
 
-`bash scripts/build-windows.sh` 在 18 张门禁之后，用同一个取证 daemon 再跑一轮离屏截图。
+`bash scripts/build-windows.sh` 在 16 张门禁之后，用同一个取证 daemon 再跑一轮离屏截图。
 daemon 里那条公开条目是随机 infohash + `timeoutMs=0` 导入的：没有来源，但条目已建好，
 `scope=public`、`sizeKnown=false`，正好是「等待来源」那一态。
 
@@ -443,22 +446,35 @@ daemon 里那条公开条目是随机 infohash + `timeoutMs=0` 导入的：没�
 任务表由构建脚本现场写到 `artifacts/windows/ui/public-capture-jobs.json`（源码里没有第四份任务表），
 断言分两层：`capture-ui.ps1` 的页名 + 文案 + 像素照旧；脚本另外 grep 截图那一刻的探针原文，
 把「公开」「等待来源」「移除」「btih:」「导入」逐条钉住（文件名「远山」不含「公开」，不会误命中）。
-索引是 `public-index.json`，三张都 `mode=offscreen`、`failed=0` 才算过；18 张门禁的 `index.json`
+索引是 `public-index.json`，三张都 `mode=offscreen`、`failed=0` 才算过；16 张门禁的 `index.json`
 不受影响。
 
-### 6.4 链接分享两张（P8 / P9）
+### 6.4 链接分享两张（P8 / P9，单独跑，不进构建门禁）
 
-构建门禁里的 `p8-share` / `p9-list` 用两个取证别名落到页面（§1.3）：`p8-share` 先确保 daemon 里
-有一条有效分享（没有就用本群第一个私有文件 `POST /api/shares` 一条 7 天的），再落 P8；
-`p9-list` 复用同一条（同一个 daemon），落 P9。
+**为什么不进门禁**：这两张要真的向 Pages 的 Worker 登记一条 7 天有效链接（`POST /api/shares`），
+而构建不该依赖外网与 pages.dev 的可用性 —— pages.dev 一抖，整条 `build-windows.sh` 就红。
+所以门禁保持 16 张，这两张由独立脚本跑、单独出 `share-index.json`。
+
+```bash
+bash windows/scripts/capture-share-ui.sh
+```
+
+装置是一个专用 daemon（127.0.0.1:47270，`--device-name=Share-Evidence`）：一个群 + 一个 1 MiB
+私有文件。两个任务用取证别名落到页面（§1.3）：`p8-share` 先确保 daemon 里有一条有效分享
+（没有就用本群第一个私有文件建一条 7 天的），再落 P8；`p9-list` 复用同一条（同一个 daemon），落 P9。
+收尾会把这条链接 `DELETE` 掉（`remoteRevoked=true`），不在 Worker 上留 7 天记录。
 
 | 文件 | 页 | 状态 | 断言文案 |
 | --- | --- | --- | --- |
 | `p8-share.png` | P8 | 本地二维码（版本 4）+ 链接 + 复制链接 + 7 天后失效 + 等待访客 | 复制链接 |
 | `p9-list.png` | P9 | 一行：文件名 / 7 天后失效 · 被访问 0 次 / 撤销 | 被访问 |
 
-两张与其余 16 张走同一套离屏截图 + DOM / 像素断言；同名 `.log` 里有截图那一刻的
-`DOM 探针(shot)` 原文。另有三条可重跑的机读证据：
+两张与门禁那 16 张走同一套离屏截图 + DOM / 像素断言；同名 `.log` 里有截图那一刻的
+`DOM 探针(shot)` 原文。脚本另外断言 API 与日志侧的事实：`/api/shares` 的 `available=true`、
+只创建了一条（`link_share_created` 恰好 1 行）、P8 页面里的 link 与 daemon 日志里的 link 逐字相同、
+列表里 `status=waiting transfers=0`、撤销回包 `remoteRevoked=true`。
+
+另有三条可重跑的机读证据：
 
 - `bash artifacts/windows/share-ui-check.sh`：Edge headless + CDP 真实点击链路 —— P4「…」→
   「分享链接」→ P8（二维码 / 链接 / 复制 / 有效期 / 状态）→ 返回 P2 → P7「分享管理」→ P9
@@ -469,16 +485,16 @@ daemon 里那条公开条目是随机 infohash + `timeoutMs=0` 导入的：没�
 - `bash artifacts/windows/qr-shot-check.sh`：从 `p8-share.png` 里把二维码解出来，和取证 daemon
   日志里 `link_share_created` 的 link 逐字比 —— 同一张图、同一条链接。
 
-**网络依赖**：这两张会真的向 Pages 的 Worker 登记一条 7 天有效链接（与 `scripts/m1-windows.sh` 的
-链接分享验收同一条依赖）。pages.dev 不可达时这两张会失败，其余 16 张不受影响；daemon 的
-`link_share_created` 里能看到这次登记。
+**网络依赖**：pages.dev 不可达（或本机没有 WebRTC 原生库）时这个脚本会明确失败，16 张门禁截图
+不受影响（门禁本身不碰外网）。这条链接只在脚本运行的这一两分钟里有效，跑完即撤销。
 
 ## 7. 页面与文案
 
 文案表在 `windows/resources/web/js/app.js` 顶部（`COPY`），逐条对应
 `docs/design/product-spec.md` §3 各页「文案」行。改文案的顺序：先改 spec，再改 `COPY`，
-再跑一次 `bash scripts/build-windows.sh` 让截图断言跟着更新（18 张门禁的断言文案在
-`ui-capture-jobs.json`；公开种子三张的任务表由 `build-windows.sh` 现场生成，见 §6.3）。
+再跑一次 `bash scripts/build-windows.sh` 让截图断言跟着更新（16 张门禁的断言文案在
+`ui-capture-jobs.json`；公开种子三张的任务表由 `build-windows.sh` 现场生成，见 §6.3；
+P8 / P9 两张在 `ui-capture-share.json`，见 §6.4）。
 
 P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增的三条 Windows 文案，spec §3 P7 的元素表
 与文案行还没列进去（`docs/design/` 不归本任务改）；合并时由设计 agent 补进 spec，以免两处各说一套。

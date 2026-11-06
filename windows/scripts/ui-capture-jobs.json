@@ -117,26 +117,6 @@
       "theme": "light"
     },
     {
-      "name": "p8-share",
-      "route": "p8-share",
-      "page": "p8",
-      "expect": "复制链接",
-      "shotDelayMs": 1200,
-      "shotTimeoutMs": 25000,
-      "describe": "P8 链接分享：本地二维码（qrText）+ 链接 + 复制链接 + 剩余有效期 + 状态行（取证别名 p8-share 先确保一条有效分享）",
-      "theme": "light"
-    },
-    {
-      "name": "p9-list",
-      "route": "p9-list",
-      "page": "p9",
-      "expect": "被访问",
-      "shotDelayMs": 1200,
-      "shotTimeoutMs": 25000,
-      "describe": "P9 分享管理：文件名 / 剩余有效期 / 被访问 n 次 / 撤销（取证别名 p9-list 复用上一条有效分享）",
-      "theme": "light"
-    },
-    {
       "name": "p2-home-dark",
       "route": "p2",
       "theme": "dark",
