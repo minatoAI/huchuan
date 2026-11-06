@@ -144,3 +144,68 @@ P0 四态截图**待补**：旧设计（检测项 + 重测 + 进入）的两张 
 4. **P7 状态是快照**：抽屉打开时取一次，M1 内存假数据下够用；接真实探针时需改成可观察状态。
 5. **调试入口**：两个 intent extra 只影响探针与停留，不写盘、不出 UI；发布前可考虑用 debug 构建类型隔离。
 6. **OPPO 1440x3168**：布局全部用 dp / 自适应宽度，没有固定屏宽假设；但本轮没有该分辨率截图，需下轮补。
+
+## 9. U2 修正：OPPO 走查四处问题（2026-11-06）
+
+输入：`docs/reports/oppo-layout.md`。设备：OPPO `3B1F5HEADK1TXSF0`（1440x3168 @640dpi，API 37，挖孔 `[0,0][1440,160]`，导航条 64px = 16dp）与 Mi MIX 2S `5b94673a`（720x1280 @260dpi，API 33，无挖孔，导航条 39px = 24dp）。
+
+验证脚本 `artifacts/ui-oppo/verify-layout.mjs`（安装 → 启动 → 导航 → 操作 → 断言 → 留证，一条命令跑两台）：
+`node artifacts/ui-oppo/verify-layout.mjs`，本轮结果 **14 条断言全过**（`artifacts/ui-oppo/verify-layout.log`、`verify-layout-result.json`）。
+
+### 9.1 P4 输入行贴底：改用 Scaffold 的 bottomBar
+
+- `ui/Common.kt`：`PageScaffold` 增加 `bottomBar` 槽（默认空，其它页行为不变）。
+- `ui/FileScreen.kt`：评论输入行从正文 `Column` 搬进 `bottomBar`，抽成 `CommentInputBar`；正文只留可滚动内容，`verticalScroll` 不变。
+- 为什么选 bottomBar 而不是 `Column + weight`：正文的 `innerPadding.bottom` 由 Scaffold 按 bottomBar 的**实测高度**算，栏高随键盘、字体缩放、多行输入自动变，页面里不需要写死任何高度；TopAppBar 与窗口 Insets 也继续归 Scaffold 管，不必在两处各自处理。
+- 底栏内边距：水平 16dp、上 12dp、**下 0dp**。下方 0 是刻意的——底栏自己吃掉 `navigationBars`，输入框底边正好落在导航条上沿。
+- 实测（无键盘）：OPPO 输入框底边 3104px / 屏高 3168px = **16dp**；MIX 1241px / 1280px = **24dp**（两台导航条高度恰为 16dp / 24dp）。
+
+### 9.2 P4 键盘态：adjustResize + imePadding
+
+- `AndroidManifest.xml`：`MainActivity` 显式 `android:windowSoftInputMode="adjustResize"`。不写这一行时系统按 `adjustUnspecified` 选了 `adjustPan`，整窗上推 69px（17dp），标题进挖孔区——这是问题 2 的直接原因。
+- `CommentInputBar`：`navigationBarsPadding()` + `imePadding()`。两者重叠段由 Compose 的 Insets 消费链去重：无键盘让开导航条，有键盘贴键盘上沿。
+- 实测：OPPO 键盘顶 1938px、输入框底边 1938px = **0dp**，标题顶 y 236 → 236px（位移 0，挖孔底 160px）；MIX 键盘顶 638px、输入框底边 638px = **0dp**，标题顶 y 77 → 77px。
+
+### 9.3 P7 限速框单位：单位改走 trailingIcon
+
+- 根因（M3 1.4.0 实测，不是 `enabled` 单独决定）：`suffix` 只在「有文字 / 有焦点」时渲染。disabled 的空框、以及「有 label、值为空」的框都不画，所以走查里两个灰框只剩「上行/下行」；P4 的框空值也能看到 `KB/s`，是因为它只有 placeholder、没有 label。
+- 处理：P7 两个框与 P4 单文件限速框的 `suffix` 统一换成 `trailingIcon = { Text(unit_kbps) }`。trailingIcon 与输入态无关：disabled、空、有值、聚焦都画，三处限速框的单位位置也一致。
+- 没有选「改成只读文本」：那会让「不限」开关打开时 P7 上出现一种新的控件形态（两行文字代替两个框），信息量相同但结构变了；保留框 + 单位更省事，也更贴近 M3 的 TextField。
+- 文案字面值未改（复用 `unit_kbps` = `KB/s`），未新增控件；`不限` 开关的语义与下发路径未动。
+
+### 9.4 深色 Switch：统一 BrandJade
+
+- `ui/theme/Theme.kt` 新增 `brandSwitchColors()`：已选轨道与边框锁 `BrandJade #1F6F5C`、拇指白（对轨道 6.02:1，轨道对深底 3.07:1）；未选态沿用 M3 中性灰。P4 与 P7 两个 `Switch` 都改用它，不再跟 `colorScheme.primary`（深色是提亮版 `#4FC7A5`）。
+- 像素证据（浅色/深色截图取色）：深色 P4 开关轨道 = `#1F6F5C`（OPPO 像素 (280,1137)、MIX (116,459)）；同页进度条仍是 `#4FC7A5`，那是文本/指示类角色，未动。
+
+### 9.5 截图（`artifacts/ui-oppo/`）
+
+| 页面 | OPPO 3B1F5HEADK1TXSF0 | Mi MIX 2S 5b94673a |
+| --- | --- | --- |
+| P4 常态 | `p4-normal-oppo.png` | `p4-normal-mix2s.png` |
+| P4 键盘态 | `p4-ime-oppo.png` | `p4-ime-mix2s.png` |
+| P7 限速区（浅色） | `p7-light-oppo.png` | `p7-light-mix2s.png` |
+| P7 限速区（深色） | `p7-dark-oppo.png` | `p7-dark-mix2s.png` |
+| P4 深色（开关取证） | `p4-dark-oppo.png` | `p4-dark-mix2s.png` |
+
+ui-dump 原文在 `artifacts/ui-oppo/ui-dumps/<serial>/`，脚本的语义名副本在 `artifacts/ui-oppo/`。
+
+### 9.6 本轮改动文件
+
+| 文件 | 改了什么 |
+| --- | --- |
+| `app/src/main/kotlin/app/huchuan/ui/Common.kt` | `PageScaffold` 增加 `bottomBar` |
+| `app/src/main/kotlin/app/huchuan/ui/FileScreen.kt` | 输入行搬到底栏（`CommentInputBar`）、Insets、`brandSwitchColors()`、单位改 trailingIcon |
+| `app/src/main/kotlin/app/huchuan/ui/SettingsDrawer.kt` | 两个限速框单位改 trailingIcon、`brandSwitchColors()` |
+| `app/src/main/kotlin/app/huchuan/ui/theme/Theme.kt` | 新增 `brandSwitchColors()` |
+| `app/src/main/AndroidManifest.xml` | `windowSoftInputMode="adjustResize"` |
+
+### 9.7 风险与未决
+
+1. **键盘态正文在输入行上沿会裁掉半行**：滚动视口到栏顶就结束，没做「打开详情 / 弹键盘时自动滚到底」。多评论（>5 条）时用户需要自己上滑，本轮仍未测多评论 + 键盘组合。
+2. **API < 30 的 IME Insets**：`WindowInsets.ime` 在 API 29 及以下为空，`imePadding()` 不生效（minSdk 26）。本机两台是 API 33 / 37，未覆盖低版本；真要覆盖低版本得另加 `WindowInsetsAnimationCompat` 兜底。
+3. **底栏下内边距 0dp** 是为了同时满足两台「输入框底边到屏幕底 ≤ 24dp」（导航条 16dp / 24dp）。若以后换三键导航（导航条 48dp），这条断言会天然不达标，届时应改成按「导航条上沿」度量。
+4. **P7 抽屉仍铺满全宽**（走查 §3 里记的独立现象），不在本轮四处问题内，未改。
+5. **P7 两框在 disabled / 可编辑之间切换时没有动效**，框的可用性变化是硬切。
+6. 验证脚本会临时切换「不限」开关取证，结束时按设备原状态还原（OPPO `unlimited=true`、MIX `unlimited=false`，MIX 原本的 512KB/s 上行值未被改写——`applyGlobalLimits()` 只按 0 下发内核，不覆盖落盘值）。
+

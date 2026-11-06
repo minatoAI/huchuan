@@ -34,6 +34,11 @@ object Spacing {
     val rowMinHeight = 48.dp
 }
 
+/**
+ * 页面骨架。bottomBar 给「固定在底部的操作行」用（P4 评论输入行）：
+ * 正文拿到的 innerPadding.bottom 会等于 bottomBar 的实测高度，因此正文滚动区
+ * 自动缩短，不会钻到条下面；bottomBar 自己负责吃窗口 Insets。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PageScaffold(
@@ -41,6 +46,7 @@ fun PageScaffold(
     navigation: (@Composable () -> Unit)? = null,
     actions: @Composable RowScope.() -> Unit = {},
     snackbarHost: @Composable () -> Unit = {},
+    bottomBar: @Composable () -> Unit = {},
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Scaffold(
@@ -65,6 +71,7 @@ fun PageScaffold(
             )
         },
         snackbarHost = snackbarHost,
+        bottomBar = bottomBar,
         content = content,
     )
 }

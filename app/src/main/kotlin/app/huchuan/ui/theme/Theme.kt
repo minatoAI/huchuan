@@ -4,6 +4,8 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
+import androidx.compose.material3.SwitchColors
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -128,6 +130,23 @@ private val DarkScheme = darkColorScheme(
     tertiaryFixedDim = Color(0xFFA5CCDF),
     onTertiaryFixed = Color(0xFF001F2B),
     onTertiaryFixedVariant = Color(0xFF254A5A),
+)
+
+/**
+ * Switch 的品牌容器色：明暗两套的已选轨道都锁 BrandJade #1F6F5C + 白拇指。
+ *
+ * 不能跟 `colorScheme.primary`：深色主题的 primary 是给文本 / 图标留对比度的提亮版
+ * #4FC7A5（薄荷绿），跟锁死的 [BrandButton] 不同源，同页会出现两种绿（走查：P4/P7 深色）。
+ * 白拇指对 #1F6F5C 为 6.02:1；轨道对深底 #0F1513 为 3.07:1，组件边界达标。
+ */
+@Composable
+fun brandSwitchColors(): SwitchColors = SwitchDefaults.colors(
+    checkedThumbColor = Color.White,
+    checkedTrackColor = BrandJade,
+    checkedBorderColor = BrandJade,
+    uncheckedThumbColor = MaterialTheme.colorScheme.outline,
+    uncheckedTrackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+    uncheckedBorderColor = MaterialTheme.colorScheme.outline,
 )
 
 /** Material 3 字号阶梯：只落实现阶段用到的角色，全部按 M3 的 size / lineHeight / tracking。 */

@@ -17,11 +17,15 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Huchuan">
 
+        <!-- adjustResize + 页面里的 imePadding()：窗口不再走 adjustPan 整体上推。
+             不写这一行时系统按 adjustUnspecified 选了 adjustPan，P4 键盘态会把标题栏
+             顶进状态栏 / 挖孔区（走查见 docs/reports/oppo-layout.md 问题 2）。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
-            android:theme="@style/Theme.Huchuan">
+            android:theme="@style/Theme.Huchuan"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

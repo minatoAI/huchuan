@@ -11,6 +11,7 @@ captures/
 .DS_Store
 
 # 不纳入版本库的临时目录
+.worktrees/
 spikes/
 artifacts/
 windows/build/

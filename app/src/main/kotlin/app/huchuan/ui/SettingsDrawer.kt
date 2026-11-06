@@ -38,6 +38,7 @@ import app.huchuan.R
 import app.huchuan.core.Group
 import app.huchuan.core.NetworkStatus
 import app.huchuan.core.NotificationLevel
+import app.huchuan.ui.theme.brandSwitchColors
 
 /**
  * P7 设置抽屉。入口：P2 右上「设置」；出口：系统返回或下滑 → P2。
@@ -109,7 +110,8 @@ fun SettingsDrawer(
                         scope.launch { state.setGlobalUploadLimit(digits.toIntOrNull() ?: 0) }
                     },
                     label = { Text(stringResource(R.string.p7_upload)) },
-                    suffix = { Text(stringResource(R.string.unit_kbps)) },
+                    // 单位走 trailingIcon：M3 的 suffix 在「disabled / 空框」下不渲染，走查里两个灰框没单位。
+                    trailingIcon = { Text(stringResource(R.string.unit_kbps), style = MaterialTheme.typography.bodyMedium) },
                     singleLine = true,
                     enabled = !device.unlimited,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -123,7 +125,7 @@ fun SettingsDrawer(
                         scope.launch { state.setGlobalDownloadLimit(digits.toIntOrNull() ?: 0) }
                     },
                     label = { Text(stringResource(R.string.p7_download)) },
-                    suffix = { Text(stringResource(R.string.unit_kbps)) },
+                    trailingIcon = { Text(stringResource(R.string.unit_kbps), style = MaterialTheme.typography.bodyMedium) },
                     singleLine = true,
                     enabled = !device.unlimited,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -145,7 +147,11 @@ fun SettingsDrawer(
             ) {
                 Text(stringResource(R.string.p7_unlimited))
                 Spacer(Modifier.weight(1f))
-                Switch(checked = device.unlimited, onCheckedChange = null)
+                Switch(
+                    checked = device.unlimited,
+                    onCheckedChange = null,
+                    colors = brandSwitchColors(),
+                )
             }
 
             Text(

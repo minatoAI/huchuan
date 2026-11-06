@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -39,6 +41,7 @@ import app.huchuan.HuchuanState
 import app.huchuan.R
 import app.huchuan.core.Comment
 import app.huchuan.core.FileState
+import app.huchuan.ui.theme.brandSwitchColors
 import kotlinx.coroutines.launch
 
 /**
@@ -71,7 +74,27 @@ fun FileScreen(
         mutableStateOf(if (file.uploadLimitKbps > 0) file.uploadLimitKbps.toString() else "")
     }
 
-    PageScaffold(title = file.name) { padding ->
+    PageScaffold(
+        title = file.name,
+        // 输入行脱离正文流，固定到底部（见 docs/ui-notes.md §3）：正文再高也不把它挤走，
+        // 正文自己 verticalScroll，两者互不影响。
+        bottomBar = {
+            CommentInputBar(
+                commentText = commentText,
+                onCommentTextChange = { commentText = it },
+                replyToAuthor = replyTo?.author,
+                onSend = {
+                    val body = commentText
+                    val parent = replyTo?.id
+                    commentText = ""
+                    replyTo = null
+                    // 评论要签名并广播给对端：必须离开界面线程，否则 Android 抛
+                    // NetworkOnMainThreadException（发送方会因此把连接关掉）。
+                    scope.launch { state.addComment(groupId, file.id, body, parent) }
+                },
+            )
+        },
+    ) { padding ->
         Column(
             modifier = Modifier
                 .padding(padding)
@@ -160,6 +183,7 @@ fun FileScreen(
                         scope.launch { state.setFileActive(groupId, file.id, active) }
                     },
                     modifier = Modifier.semantics { contentDescription = switchLabel },
+                    colors = brandSwitchColors(),
                 )
                 Spacer(Modifier.width(Spacing.item))
                 Text(
@@ -187,7 +211,9 @@ fun FileScreen(
                         scope.launch { state.setFileUploadLimit(groupId, file.id, digits.toIntOrNull() ?: 0) }
                     },
                     placeholder = { Text(stringResource(R.string.p4_unlimited)) },
-                    suffix = { Text(stringResource(R.string.unit_kbps)) },
+                    // 单位走 trailingIcon 而不是 suffix：M3 的 suffix 只在「有焦点 / 有文字」时出现，
+                    // 空框（P7 disabled、P7 空框）会把单位吞掉。trailingIcon 两种状态都画。
+                    trailingIcon = { Text(stringResource(R.string.unit_kbps), style = MaterialTheme.typography.bodyMedium) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.width(160.dp),
@@ -229,38 +255,53 @@ fun FileScreen(
                     }
                 }
             }
+        }
+    }
+}
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedTextField(
-                    value = commentText,
-                    onValueChange = { commentText = it },
-                    placeholder = {
-                        Text(
-                            text = replyTo?.let { stringResource(R.string.p4_reply, it.author) }
-                                ?: stringResource(R.string.p4_comment_hint),
-                        )
-                    },
-                    maxLines = 3,
-                    modifier = Modifier.weight(1f),
+/**
+ * P4 评论输入行：固定在 Scaffold 的 bottomBar 上，不再跟着正文流走。
+ *
+ * Insets：`.navigationBarsPadding()` 让开手势条 / 导航条（实测 OPPO 16dp、MIX 2S 24dp）；
+ * 键盘弹出时 `.imePadding()` 接管，与 navigationBars 重叠的那一段由 Compose 的 Insets
+ * 消费链去重，整条行落在键盘上沿，宿主窗口不再走 adjustPan 整体上推（标题栏因此不动）。
+ * 下内边距刻意留 0：输入框底边正好落在导航条 / 键盘上沿，配合底栏自身的 Insets 即"贴底"。
+ */
+@Composable
+private fun CommentInputBar(
+    commentText: String,
+    onCommentTextChange: (String) -> Unit,
+    replyToAuthor: String?,
+    onSend: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .imePadding()
+            .padding(
+                start = Spacing.pageHorizontal,
+                end = Spacing.pageHorizontal,
+                top = Spacing.item,
+                bottom = 0.dp,
+            ),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        OutlinedTextField(
+            value = commentText,
+            onValueChange = onCommentTextChange,
+            placeholder = {
+                Text(
+                    text = replyToAuthor?.let { stringResource(R.string.p4_reply, it) }
+                        ?: stringResource(R.string.p4_comment_hint),
                 )
-                TextButton(
-                    onClick = {
-                        val body = commentText
-                        val parent = replyTo?.id
-                        commentText = ""
-                        replyTo = null
-                        // 评论要签名并广播给对端：必须离开界面线程，否则 Android 抛
-                        // NetworkOnMainThreadException（发送方会因此把连接关掉）。
-                        scope.launch { state.addComment(groupId, file.id, body, parent) }
-                    },
-                    enabled = commentText.isNotBlank(),
-                ) {
-                    Text(stringResource(R.string.p4_send))
-                }
-            }
+            },
+            maxLines = 3,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onSend, enabled = commentText.isNotBlank()) {
+            Text(stringResource(R.string.p4_send))
         }
     }
 }
