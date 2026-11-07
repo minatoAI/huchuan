@@ -1,0 +1,160 @@
+# 构建与发布流水线。
+#
+# 哪些自动、哪些手动（不为了自动化而自动化）：
+#
+#   自动：Windows 绿色版。
+#     windows-latest 上 MSVC（vswhere 找 vcvars64）、CMake、Ninja 都有，
+#     scripts/package-windows.sh 从零到 dist/Huchuan 约 6-10 分钟，push 与 tag 都跑。
+#
+#   手动：Android APK。
+#     runner 上没有自编的 arm64 libtorrent4j.so（官方 Maven 的 .so 在 Android 13 会 Scudo abort，
+#     见 AGENTS.md §9），要现跑 tools/build-libtorrent-android/build.sh：下 NDK + Boost + OpenSSL
+#     交叉编译，30 分钟起步。按 tag 自动触发等于每次发布白烧半小时机器，所以走本地：
+#     bash scripts/release.sh <version>，再把 APK 传到 draft release（见 docs/release.md）。
+#     没在 GitHub runner 上验证过 Android 构建，这里就不放一条跑不通的 job。
+#
+#   tag 推送只建 **draft** release：Windows 包自动挂上去，APK 由人补。draft 不点发布，
+#   线上什么都没变。
+#
+# 关于 GRADLE_OPTS：:app 的 build.gradle.kts 在配置期就按路径检查自编 .so，缺了直接抛错，
+# 而 Windows runner 上既没有 Android SDK 也没有那份 .so。configure-on-demand 只配置任务图里
+# 用到的工程（:core、:daemon），绕开 :app；它与 configuration cache 互斥，所以两个开关一起给。
+
+name: build
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.configureondemand=true -Dorg.gradle.configuration-cache=false
+
+jobs:
+  windows:
+    name: Windows 绿色版
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 构建并打包（daemon.jar + Huchuan.exe + 精简 JRE + 冒烟）
+        shell: bash
+        run: bash scripts/package-windows.sh --clean
+
+      # 用 jar 而不是 PowerShell 的 Compress-Archive / CreateFromDirectory：
+      # Windows PowerShell 5.1 走 .NET Framework，会把条目名写成 Huchuan\Huchuan.exe，
+      # 在 macOS/Linux 上解开是一坨带反斜杠的怪文件。jar 随 JDK 17 一起在，条目分隔符固定 "/"。
+      - name: 打 zip 与 SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+          mkdir -p dist/release
+          zip_abs="$(pwd)/dist/release/Huchuan-windows-x64.zip"
+          rm -f "$zip_abs"
+          ( cd dist && jar cfM "$(cygpath -w "$zip_abs")" Huchuan )
+          # Git Bash 不一定带 unzip，缺了就用 jar 的清单（JDK 一定在）
+          if command -v unzip >/dev/null 2>&1; then names="$(unzip -Z1 "$zip_abs")"; else names="$(jar tf "$zip_abs")"; fi
+          case "$names" in
+            *"Huchuan/Huchuan.exe"*) ;;
+            *) echo "zip 里没有 Huchuan/Huchuan.exe"; exit 1 ;;
+          esac
+          case "$names" in
+            *'\'*) echo "zip 里有反斜杠条目（macOS/Linux 解压会出错）"; exit 1 ;;
+          esac
+          # 许可文本随包提供（BSD-3 / MIT 要求二进制分发带声明）
+          cp LICENSE dist/release/LICENSE.txt
+          cp THIRD_PARTY_NOTICES.md dist/release/THIRD_PARTY_NOTICES.md
+          ( cd dist/release && sha256sum Huchuan-windows-x64.zip LICENSE.txt THIRD_PARTY_NOTICES.md > SHA256SUMS )
+          ls -l dist/release
+          cat dist/release/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huchuan-windows-x64
+          path: |
+            dist/release/Huchuan-windows-x64.zip
+            dist/release/SHA256SUMS
+            dist/release/LICENSE.txt
+            dist/release/THIRD_PARTY_NOTICES.md
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: tag → draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: huchuan-windows-x64
+          path: dist/release
+
+      - name: 写发布说明
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # 用引号 heredoc：反引号与 $ 都当字面量，版本号最后用 sed 填。
+          cat > NOTES.md <<'EOF'
+          互传 __VERSION__（Windows 绿色版由 CI 构建）。
+
+          ## 下载
+
+          | 平台 | 文件 |
+          | --- | --- |
+          | Android 8.0+（arm64-v8a） | `Huchuan-__VERSION__-arm64-v8a.apk` |
+          | Windows 10/11 x64 | `Huchuan-windows-x64.zip`（解压后双击 `Huchuan/Huchuan.exe`） |
+
+          校验：`sha256sum -c SHA256SUMS`，细节见仓库 docs/release.md。
+
+          ## 本次构建
+
+          - 提交：`__SHA__`
+          - Windows 包由 CI 产出；Android APK 是手动构建的（runner 上没有自编 .so，
+            构建成本过高），见 docs/release.md。
+
+          ## 已知限制
+
+          - APK 用 release keystore 签名（签名与 keystore 保管见仓库 docs/release-signing.md）。
+            换了证书覆盖安装会失败，要先卸载旧版。
+          - 只有 arm64-v8a，不覆盖 x86_64 模拟器与 32 位设备。
+          - Windows 包未做代码签名，SmartScreen 会提示一次。
+          EOF
+          sed -i "s/__VERSION__/${VERSION#v}/g; s/__SHA__/$SHA/g" NOTES.md
+          cat NOTES.md
+
+      - name: 建 draft release（已存在则覆盖上传）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(dist/release/Huchuan-windows-x64.zip dist/release/SHA256SUMS
+                  dist/release/LICENSE.txt dist/release/THIRD_PARTY_NOTICES.md)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --title "互传 ${TAG#v}" \
+              --notes-file NOTES.md \
+              --draft
+          fi
+          echo "draft: ${TAG}（APK 手动补：bash scripts/release.sh <version> 后 gh release upload）"

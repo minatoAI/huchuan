@@ -1,0 +1,45 @@
+name: Feature
+description: 提一个需求或改进
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个项目默认极简：一个页面只做一件事，机器能判断的就不让用户点。
+        提需求时先说清「现在卡在哪一步」，再说什么改动能解决。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 现在的问题
+      description: 具体场景。是谁在什么情况下做不下去。
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 想要的改法
+      description: 一句话能说清的方案优先；有取舍就一起写。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响面
+      options:
+        - 只影响 Android
+        - 只影响 Windows
+        - 两端都要改
+        - 与界面无关（传输、发现、协议）
+    validations:
+      required: true
+
+  - type: textarea
+    id: alt
+    attributes:
+      label: 考虑过的替代方案（可选）
+    validations:
+      required: false

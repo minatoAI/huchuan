@@ -29,3 +29,9 @@ tools/build-libtorrent-android/host/
 # 构建与部署临时产物
 .wrangler/
 node_modules/
+
+# 本机与密钥
+/.kotlin/
+keystore.properties
+*.jks
+*.keystore

@@ -4,6 +4,17 @@
 
 Android 客户端用 Compose，Windows 客户端是 Win32 加 WebView2 壳。两端共用同一个 JVM 内核 `core/`：Android 在进程内嵌它，Windows 由独立 daemon 进程承载，壳只做界面。
 
+## 下载
+
+到 [Releases](https://github.com/minatoAI/huchuan/releases) 拿最新一版，没有应用商店版本：
+
+| 平台 | 下哪个文件 | 怎么用 |
+| --- | --- | --- |
+| Android 8.0 及以上，arm64 | `Huchuan-<version>-arm64-v8a.apk` | 手机上打开安装，允许「安装未知应用」；Android 17 首次启动要授权「本地网络」，不给内核起不来 |
+| Windows 10/11 x64 | `Huchuan-windows-x64.zip` | 解压后双击 `Huchuan\Huchuan.exe`，不用装 Java；需要 WebView2 Runtime（Windows 11 自带） |
+
+两个包旁边都有 `SHA256SUMS`。校验方法、版本号规则、哪些平台没验过，见 [docs/release.md](docs/release.md)。
+
 ## 能做什么
 
 | 能力 | 现状 | 说明 |

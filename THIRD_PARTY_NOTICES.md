@@ -109,8 +109,25 @@
 - 证据：`worker/package.json` 没有 `dependencies`、`devDependencies`、`peerDependencies` 任何一个字段；`worker/src/` 的 12 个模块只 import 彼此的相对路径；`worker/node_modules/` 是空目录。`wrangler` 只在部署时用 `npx --yes wrangler@3` 临时拉取（`docs/deploy-cloudflare.md`），不参与运行时。
 - 分发：否。Worker 由使用者自己部署到自己的 Cloudflare 账户，不随客户端发行物分发。
 
+## 链接分享（WebRTC）
+
+### WebRTC
+
+- 版本：未单独记上游 commit。实际随 `dev.onvoid.webrtc:webrtc-java:1.0.0` 的 `windows-x86_64` 原生包（下一条）进 `daemon.jar`，版本以该 jar 内自带文本为准。
+- 许可：BSD-3-Clause，外加 Google 的 WebRTC 专利授权（PATENTS 文件）。
+- 证据：`webrtc-java-1.0.0-windows-x86_64.jar`（本机 Gradle 缓存）内 `META-INF/licenses/webrtc/LICENSE.md`（132,641 B，首行 "Copyright (c) 2011, The WebRTC project authors. All rights reserved."，其后为三条款 BSD）与 `META-INF/licenses/webrtc/PATENTS`（1,412 B，首行 "Additional IP Rights Grant (Patents)"）。两份原文已复制进仓库：`assets/licenses/webrtc/LICENSE.md`、`assets/licenses/webrtc/PATENTS`（与 jar 内文本 sha256 一致），随发行物分发。
+- 分发：是，仅 Windows（`webrtc-java-windows-x86_64.dll` 是 WebRTC 的编译产物）。Android APK 不分发 WebRTC：分享端走系统 WebView 自带的 WebRTC（`app/src/main/assets/link/sharer.js`），那份代码由用户设备上的 WebView/Chrome 提供，不随包分发。
+
+### webrtc-java（WebRTC 的 JNI 绑定）
+
+- 版本：`1.0.0`，`dev.onvoid.webrtc:webrtc-java` 与 `dev.onvoid.webrtc:webrtc-java:1.0.0:windows-x86_64`（`daemon/build.gradle.kts` 的依赖坐标）
+- 许可：Apache-2.0（父 POM `dev.onvoid.webrtc:webrtc-java-parent:1.0.0` 的 `<licenses><license><name>The Apache Software License, Version 2.0</name>`，第 26 至 30 行）；jar 内 `META-INF/LICENSE`（15,651 B）是 Apache-2.0 全文。
+- 证据：本机 Gradle 缓存 `~/.gradle/caches/modules-2/files-2.1/dev.onvoid.webrtc/webrtc-java-parent/1.0.0/*/webrtc-java-parent-1.0.0.pom`。
+- 分发：是，仅 Windows。Java 类与 `webrtc-java-windows-x86_64.dll` 都进 `daemon.jar`；`daemon/build.gradle.kts` 的必含文件清单点名了这个 dll，缺了打包直接失败。同一个原生 jar 里还有 `META-INF/licenses/nvenc/LICENSE`（NVIDIA NVENC，1,213 B），已复制为 `assets/licenses/webrtc/nvenc-LICENSE.txt`。
+
 ## 分发义务与已知缺口
 
-- 二进制分发时，上面每条要求保留版权声明的许可（BSD-3-Clause、MIT、BSD 式 WebView2 许可）都要求把对应声明随发行物一起提供。本文件就是这份声明集合，发行时随包附上。
+- 二进制分发时，上面每条要求保留版权声明的许可（BSD-3-Clause、MIT、BSD 式 WebView2 许可）都要求把对应声明随发行物一起提供。本文件就是这份声明集合，发行时随包附上：`scripts/release.sh` 会把本文件与 `LICENSE` 一起放进 `dist/release/<version>/` 并挂到 GitHub Release 上。
+- WebRTC 的 BSD-3-Clause 与 PATENTS 同样要求随二进制分发声明。原文在 `assets/licenses/webrtc/`（LICENSE.md、PATENTS、nvenc-LICENSE.txt），发行时与本文件一同提供。
 - 缺口一：`assets/brand/android/assets/licenses/Kalam-OFL.txt` 目前没有打进 APK 的 assets 目录（`app/src/main/assets` 不存在），OFL 要求随字体一起分发全文。
 - 缺口二：APK 的 `jniLibs/arm64-v8a/libtorrent4j.so` 是 libtorrent、Boost、OpenSSL 三者的二进制合体，包内没有可查阅的声明页。发布 APK 前应把本文件一并附上（应用内"关于"页或随包文本）。
