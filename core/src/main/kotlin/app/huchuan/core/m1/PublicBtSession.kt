@@ -16,6 +16,9 @@ import org.libtorrent4j.alerts.MetadataReceivedAlert
 import org.libtorrent4j.alerts.SaveResumeDataAlert
 import org.libtorrent4j.alerts.TorrentAlert
 import org.libtorrent4j.alerts.TorrentFinishedAlert
+import org.libtorrent4j.alerts.TrackerAnnounceAlert
+import org.libtorrent4j.alerts.TrackerErrorAlert
+import org.libtorrent4j.alerts.TrackerReplyAlert
 import org.libtorrent4j.swig.settings_pack
 import org.libtorrent4j.swig.torrent_flags_t
 import java.io.File
@@ -56,6 +59,27 @@ class PublicBtSession(
         val savePath: File,
         val name: String,
         var seeding: Boolean,
+        /**
+         * 「只为取元数据而生」：磁力导入建的任务是 true —— 元数据一到位就把这个 torrent 从会话里
+         * **摘掉**（`.torrent` 已经落进缓存），用户点「激活」时再按缓存加种，一个数据字节都不下
+         * （docs/core.md §3.12）。发布 / 续种 / 激活路径建的任务是 false。
+         *
+         * 为什么是「摘掉」而不是 libtorrent 的 `pause()`：暂停过的 torrent 恢复之后要等下一次
+         * **周期** announce 才重新拉 peer（实测 57 s，且 `force_reannounce` 不生效），
+         * 用户点「激活」会先干等一分钟；按缓存重新加种当场就 announce + 连 peer（实测 1 s 内出数据）。
+         */
+        var importOnly: Boolean = false,
+    )
+
+    /** 一个 tracker 最近一次 announce 的结果（诊断读口用，不是判定）。 */
+    private class TrackerReport(
+        var url: String,
+        var ok: Boolean = false,
+        var state: String = "pending",
+        var lastAt: Long = 0L,
+        var peers: Int = 0,
+        var failures: Int = 0,
+        var error: String = "",
     )
 
     /** 一次磁力导入的等待槽：元数据到手 / 保存 .torrent 两个闸门。 */
@@ -80,10 +104,89 @@ class PublicBtSession(
         val privateTorrent: Boolean,
     )
 
+    /**
+     * 公开会话的诊断快照（daemon 的 `/api/state.public` 直接把它摊成 JSON）。
+     *
+     * 这三样以前都没有读口（docs/reports/public-swarm-real-world.md 风险 3）：
+     * DHT 节点数读的是**私有会话**（DHT 关，恒 0）、tracker announce 的结果只能靠外部探针猜、
+     * 当前 peer 端点列表干脆拿不到。全部在这里补齐，字段来源只有 libtorrent：
+     *
+     * | 字段 | 来源 |
+     * |---|---|
+     * | `dhtNodes` | `SessionManager.dhtNodes()`（公开会话自己的 DHT） |
+     * | `trackers[].ok/failures/error` | `tracker_reply` / `tracker_error` 告警 |
+     * | `trackers[].lastAnnounceAt` | `tracker_announce` 告警的时刻 |
+     * | `trackers[].nextAnnounceAt` | `torrent_status.next_announce`（内核给的下次间隔）+ 读的时刻 |
+     * | `peers[]` | `peer_info` 快照（与队友数同一个口径 [BtSession.snapshotOf]） |
+     *
+     * **只读、不参与任何判定**：状态机读的是 [isPaused] / [hasMetadata] 这些真值，不是这张表。
+     */
+    class Diagnostics(
+        val running: Boolean,
+        val port: Int,
+        val torrents: Int,
+        val dhtNodes: Long,
+        val dhtRunning: Boolean,
+        val portMapping: Boolean,
+        val lastError: String,
+        val trackers: List<Tracker>,
+        val peers: List<PeerEndpoint>,
+    ) {
+        /** 一条 tracker 的最近一次 announce 结果。 */
+        class Tracker(
+            val fileId: String,
+            val url: String,
+            /** true = 最近一次 announce 有应答；false = 失败或还没跑过。 */
+            val ok: Boolean,
+            /** replied / failed / announcing / pending。 */
+            val state: String,
+            /** 最近一次收到应答 / 报错的时刻（ms）；还没跑过是 0。 */
+            val lastAnnounceAt: Long,
+            /**
+             * 内核报的「距下次 announce 还有多少**毫秒**」（`torrent_status.next_announce`）。
+             * 拿不到 / 挂起中（暂停的 torrent 不排 announce）是 0。实测 2 s 采样每次减 2000，
+             * 单位是毫秒不是秒（探针见 docs/core.md §3.12）。
+             */
+            val nextAnnounceInMs: Long,
+            /** `nextAnnounceInMs` 换算出的绝对时刻（ms）；未知是 0。 */
+            val nextAnnounceAt: Long,
+            /** 最近一次应答里对端报的 peer 数（失败时为 0）。 */
+            val peers: Int,
+            /** 连续失败次数（成功即清零）。 */
+            val failures: Int,
+            /** 失败原因原文（跟踪的是 libtorrent 给的那句话，不是我们自己编的）。 */
+            val error: String,
+        )
+
+        /** 当前连着的一个 peer 端点（诊断用；队友数另有口径，不读这张表）。 */
+        class PeerEndpoint(
+            val fileId: String,
+            /** `host:port`（已去掉 tcp:// / utp:// 前缀）。 */
+            val endpoint: String,
+            val connected: Boolean,
+            val seed: Boolean,
+        )
+    }
+
     private val lock = Any()
     private var manager: SessionManager? = null
     private val tasks = LinkedHashMap<String, Task>()
     private val waiters = HashMap<String, MetadataWait>()
+
+    /**
+     * `fileId → tracker URL → 最近一次 announce 的结果`（告警线程写、诊断读口读，都在 [lock] 里）。
+     *
+     * 公开会话的 `alert_mask` 原本不含 tracker 类（docs/core.md §3.8），所以「announce 到底成没成」
+     * 一直只能靠外部探针猜。本轮把它加进 mask 与 listener，只为了这个读口 —— 判定逻辑一行没变。
+     */
+    private val trackerReports = HashMap<String, LinkedHashMap<String, TrackerReport>>()
+
+    /**
+     * 摘任务的专用线程（单线程、懒建、随会话关掉）：磁力导入的「元数据到手就摘掉」可能发生在
+     * libtorrent 的告警线程上，那边只该往队列里丢一件事，不该自己去改会话。
+     */
+    @Volatile
+    private var retireExecutor: java.util.concurrent.ExecutorService? = null
 
     /** 公开下载落盘目录（`<data>/public/data`，tech-options §6.4 的独立下载目录）。 */
     val dataDir: File get() = File(dataRoot, DATA_SUBDIR)
@@ -124,6 +227,13 @@ class PublicBtSession(
      */
     @Volatile
     var onMetadataArrived: ((MetadataArrival) -> Unit)? = null
+
+    /**
+     * 一条「只为取元数据」的任务退场之后的出口：内核据此重新判一次「公开会话还要不要留着」
+     * （public-swarm §7.1 的按需启停）。跑在摘任务线程上，只做一次判定，不碰会话。
+     */
+    @Volatile
+    var onImportRetired: (() -> Unit)? = null
 
     val isRunning: Boolean get() = manager?.isRunning == true
 
@@ -192,6 +302,11 @@ class PublicBtSession(
         try { mgr.removeListener(listener) } catch (_: Throwable) {}
         try { mgr.stop() } catch (_: Throwable) {}
         listenPort = 0
+        // 摘任务线程跟着会话一起收：会话已经没了，排着的摘任务动作没有意义。
+        synchronized(lock) {
+            try { retireExecutor?.shutdownNow() } catch (_: Throwable) {}
+            retireExecutor = null
+        }
         log("session_stop", mapOf("torrents" to "0"))
     }
 
@@ -232,13 +347,31 @@ class PublicBtSession(
      * private=1 的一律拒绝：那是私有会话的东西（public-swarm §1.2 的「加种前一律按
      * TorrentInfo.priv() 决定用哪个会话」）。返回 false 就是被拒 / 加不进去，不抛异常。
      */
-    fun addTorrent(ti: TorrentInfo, savePath: File, seedMode: Boolean = false): Boolean {
+    @JvmOverloads
+    fun addTorrent(
+        ti: TorrentInfo,
+        savePath: File,
+        seedMode: Boolean = false,
+        /**
+         * 额外要挂上的 tracker（磁力里原样带来的 `tr`）。
+         *
+         * 导入时落的 `.torrent` 缓存只有 info 字典（`save_resume_data(SAVE_INFO_DICT)` 的产物），
+         * **不带 announce**：从缓存加种时若不把磁力的 tracker 补回来，就只剩 DHT 一条路 ——
+         * 实测「按缓存激活」会干等 20 s 以上连不上做种者。磁力的 `tr` 是发布者的选择
+         * （public-swarm §2.2），导入时原样保留，激活时原样挂回去。
+         */
+        trackers: List<String> = emptyList(),
+    ): Boolean {
         if (!accepts(ti.isPrivate)) {
             log("reject_private_torrent", mapOf("infohash" to ti.infoHash().toString(), "scope" to "public"))
             return false
         }
         val fileId = ti.infoHash().toString()
-        synchronized(lock) { if (tasks.containsKey(fileId)) return true }
+        if (synchronized(lock) { tasks.containsKey(fileId) }) {
+            // 任务已经在会话里（导入还在找源的那条）：接管它，不重复加种。
+            adopt(fileId)
+            return true
+        }
         val mgr = manager ?: return false
         return try {
             savePath.mkdirs()
@@ -254,9 +387,16 @@ class PublicBtSession(
                 return false
             }
             synchronized(lock) { tasks[fileId] = Task(fileId, handle, savePath, ti.name(), seedMode) }
+            val attached = attachTrackers(handle, trackers)
             log(
                 "torrent_added",
-                mapOf("infohash" to fileId, "name" to ti.name(), "size" to ti.totalSize().toString(), "seed_mode" to seedMode.toString()),
+                mapOf(
+                    "infohash" to fileId,
+                    "name" to ti.name(),
+                    "size" to ti.totalSize().toString(),
+                    "seed_mode" to seedMode.toString(),
+                    "extra_trackers" to attached.toString(),
+                ),
             )
             true
         } catch (e: Throwable) {
@@ -273,10 +413,20 @@ class PublicBtSession(
      * 非法链接 / 重复 / 无源 / 超时 / 元数据无效。失败时 torrent 仍留在会话里继续找源（§3.1
      * 「无元数据不报错」），除了元数据无效那一种 —— 那一条确定没救，摘掉。
      */
+    @JvmOverloads
     fun addMagnet(
         magnetUri: String,
         savePath: File = dataDir,
         timeoutMs: Long = DEFAULT_METADATA_WAIT_MS,
+        /**
+         * 这条任务**只为取元数据**（默认 true = 导入语义）：元数据一到手就把它从会话里摘掉。
+         *
+         * 导入只为了拿 info 字典，拿到之后就不该再动用户一个字节：没有元数据时 libtorrent 根本
+         * 发不出 piece 请求，所以「等元数据」这一段天然不会下数据；到手那一刻起才是下载，
+         * 而这一刻被这个标记掐住 —— 任务当场退场，`.torrent` 留在缓存里，等用户点「激活」
+         * 再按缓存加种（[adopt] / [retire]）。产品语义见 docs/core.md §3.12。
+         */
+        importOnly: Boolean = true,
     ): PublicMagnetResult {
         val parsed = MagnetLink.parse(magnetUri)
             ?: return failure(PublicMagnetResult.INVALID_LINK, "")
@@ -313,7 +463,7 @@ class PublicBtSession(
             }
             val h = handle
             synchronized(lock) {
-                tasks[parsed.fileId] = Task(parsed.fileId, h, savePath, parsed.displayName, false)
+                tasks[parsed.fileId] = Task(parsed.fileId, h, savePath, parsed.displayName, false, importOnly)
             }
             log(
                 "magnet_added",
@@ -322,6 +472,8 @@ class PublicBtSession(
                     "name" to parsed.displayName,
                     "trackers" to parsed.trackers.size.toString(),
                     "save_path" to savePath.absolutePath,
+                    // 导入（import_only=true）只拉元数据，到手就退场；激活路径加完就开始下载。
+                    "import_only" to importOnly.toString(),
                 ),
             )
 
@@ -387,10 +539,14 @@ class PublicBtSession(
                 log("magnet_torrent_bytes_missing", mapOf("infohash" to parsed.fileId))
             }
             val metaPath = if (bytes != null) writeTorrentCache(parsed.fileId, bytes) else ""
+            // 导入语义在这里收口：元数据到手 + `.torrent` 已经落进缓存 = 「导入」这件事做完了，
+            // 任务当场退场（休眠）。激活时按缓存加种，不再重拉元数据。docs/core.md §3.12。
+            // 顺序不能反：先摘就拿不到字节、缓存写不下来。
+            if (importOnly) retire(parsed.fileId, "import_done")
             synchronized(lock) {
                 tasks[parsed.fileId]?.let {
-                    // 元数据到手后名字要按 info 字典修正（dn 可能是空的或对不上）
-                    tasks[parsed.fileId] = Task(it.fileId, it.handle, it.savePath, info.name(), it.seeding)
+                    // 元数据到手后名字要按 info 字典修正（dn 可能是空的或对不上）；import_only 原样保留。
+                    tasks[parsed.fileId] = Task(it.fileId, it.handle, it.savePath, info.name(), it.seeding, it.importOnly)
                 }
             }
             // private=1 的元数据**不收后账**：libtorrent 按 BEP 27 自己把这个 torrent 的 DHT/PEX 关掉，
@@ -426,6 +582,89 @@ class PublicBtSession(
         }
     }
 
+    // ------------------------------------------------------------------ 导入 → 休眠 → 激活
+
+    /**
+     * 「激活」时接管一条**已经在会话里**的导入任务（元数据还没到手、正在找源的那条）：
+     * 清掉「只为取元数据」的标记，使它到手之后不再被摘掉。
+     *
+     * 返回 false = 会话里没有这个 torrent（正常路径：导入时元数据已经到手，任务已经摘掉，
+     * 宿主按 `<data>/public/meta/<infohash>.torrent` 重新加种）。
+     */
+    fun adopt(fileId: String): Boolean {
+        val task = synchronized(lock) { tasks[fileId] } ?: return false
+        synchronized(lock) { task.importOnly = false }
+        log("torrent_adopted", mapOf("infohash" to fileId, "name" to task.name))
+        return true
+    }
+
+    /**
+     * 往一条已经在会话里的 torrent 补挂 tracker（磁力里带来的 `tr`）。
+     * 返回真的挂上去的条数；单条失败不影响其他条，也不抛异常。
+     */
+    private fun attachTrackers(handle: TorrentHandle, urls: List<String>): Int {
+        if (urls.isEmpty()) return 0
+        var n = 0
+        for (url in urls) {
+            val trimmed = url.trim()
+            if (trimmed.isEmpty()) continue
+            try {
+                handle.addTracker(org.libtorrent4j.AnnounceEntry(trimmed))
+                n++
+            } catch (_: Throwable) {
+                // 单条坏链接（不是 panic）不影响其他 tracker
+            }
+        }
+        return n
+    }
+
+    private fun retirer(): java.util.concurrent.ExecutorService {
+        synchronized(lock) {
+            retireExecutor?.let { if (!it.isShutdown) return it }
+            val created = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                val t = Thread(r, "huchuan-pub-retire")
+                t.isDaemon = true
+                t
+            }
+            retireExecutor = created
+            return created
+        }
+    }
+
+    /**
+     * 把一条「只为取元数据」的任务从会话里摘掉（导入路径做完事的收尾动作）。
+     *
+     * 摘掉 = 休眠：没有任务就没有传输，`kernelState` 是 `ABSENT`，界面是「休眠」；
+     * `.torrent` 已经在缓存里，激活时按它加种（当场 announce + 连 peer，实测 1 s 内出数据）。
+     * **不**用 libtorrent 的 `pause()`：暂停过的 torrent 恢复后要等下一次**周期** announce 才
+     * 重新拉 peer（实测 57 s，`force_reannounce` 也不生效），激活会先干等一分钟 —— 那是缺陷换缺陷。
+     *
+     * 可以在告警线程上调用：摘任务交给一条专门的单线程（libtorrent 的 remove 本身线程安全，
+     * 但把「改会话」与「收告警」分到两条线程上，告警循环不会被我们卡住）。
+     */
+    private fun retire(fileId: String, reason: String) {
+        val task = synchronized(lock) { tasks[fileId] } ?: return
+        log(
+            "torrent_parked",
+            mapOf("infohash" to fileId, "name" to task.name, "reason" to reason),
+        )
+        try {
+            retirer().execute {
+                try {
+                    removeTorrent(fileId)
+                    log("torrent_retired", mapOf("infohash" to fileId, "reason" to reason))
+                    onImportRetired?.invoke()
+                } catch (e: Throwable) {
+                    lastError = e.toString()
+                    log("torrent_retire_failed", mapOf("infohash" to fileId, "error" to e.toString()))
+                }
+            }
+        } catch (e: Throwable) {
+            lastError = e.toString()
+            log("torrent_retire_failed", mapOf("infohash" to fileId, "error" to e.toString()))
+        }
+    }
+
     // ------------------------------------------------------------------ 读口（LocalSession）
 
     override fun has(fileId: String): Boolean = synchronized(lock) { tasks.containsKey(fileId) }
@@ -436,6 +675,29 @@ class PublicBtSession(
     }
 
     override fun isFinished(fileId: String): Boolean = status(fileId, false)?.isFinished == true
+
+    override fun isPaused(fileId: String): Boolean {
+        val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return false
+        return try {
+            (handle.flags.to_int() and PAUSED_BIT) != 0
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    override fun hasMetadata(fileId: String): Boolean = status(fileId, false)?.hasMetadata() == true
+
+    override fun downloadedBytes(fileId: String): Long {
+        val st = status(fileId, false) ?: return 0L
+        val wanted = st.totalWantedDone()
+        return if (wanted > 0L) wanted else st.totalDone()
+    }
+
+    override fun totalBytes(fileId: String): Long {
+        val st = status(fileId, false) ?: return 0L
+        val wanted = st.totalWanted()
+        return if (wanted > 0L) wanted else st.total()
+    }
 
     override fun savedFile(fileId: String): File? {
         val task = synchronized(lock) { tasks[fileId] } ?: return null
@@ -522,6 +784,92 @@ class PublicBtSession(
     fun dhtNodes(): Long = manager?.dhtNodes() ?: 0L
 
     fun isDhtRunning(): Boolean = manager?.isDhtRunning ?: false
+
+    /**
+     * 公开会话的完整诊断快照（DHT 节点数 / tracker announce 结果 / 当前 peer 端点）。
+     *
+     * 永远不抛异常：会话没起来、任务在中途被摘掉都只是少几条记录。会话没起来时
+     * 除 `running=false` 外其余为 0 / 空表 —— 「没跑」本身也是答案。
+     */
+    fun diagnostics(): Diagnostics {
+        val mgr = manager
+        val running = mgr?.isRunning == true
+        val snapshot = synchronized(lock) { tasks.values.toList() }
+        val trackers = ArrayList<Diagnostics.Tracker>()
+        val peers = ArrayList<Diagnostics.PeerEndpoint>()
+        val now = System.currentTimeMillis()
+        for (task in snapshot) {
+            val st = status(task.fileId, false)
+            val nextMs = nextAnnounceMs(st)
+            val nextAt = if (nextMs > 0L) now + nextMs else 0L
+            val urls = LinkedHashSet<String>()
+            try {
+                task.handle.trackers()?.forEach { entry -> entry.url()?.takeIf { it.isNotEmpty() }?.let { urls.add(it) } }
+            } catch (_: Throwable) {}
+            try {
+                st?.currentTracker()?.takeIf { it.isNotEmpty() }?.let { urls.add(it) }
+            } catch (_: Throwable) {}
+            val known = synchronized(lock) {
+                trackerReports[task.fileId]?.values?.map { it.url } ?: emptyList()
+            }
+            urls.addAll(known)
+            for (url in urls) {
+                val report = synchronized(lock) { trackerReports[task.fileId]?.get(url) }
+                val state = when {
+                    report == null -> "pending"
+                    report.state == "announcing" -> "announcing"
+                    report.ok -> "replied"
+                    else -> "failed"
+                }
+                trackers.add(
+                    Diagnostics.Tracker(
+                        fileId = task.fileId,
+                        url = url,
+                        ok = report?.ok == true,
+                        state = state,
+                        lastAnnounceAt = report?.lastAt ?: 0L,
+                        nextAnnounceInMs = nextMs,
+                        nextAnnounceAt = nextAt,
+                        peers = report?.peers ?: 0,
+                        failures = report?.failures ?: 0,
+                        error = report?.error ?: "",
+                    ),
+                )
+            }
+            val snap = try {
+                BtSession.snapshotOf(task.handle)
+            } catch (_: Throwable) {
+                emptyList<BtSession.PeerSnapshot>()
+            }
+            for (p in snap.take(MAX_DIAG_PEERS)) {
+                peers.add(Diagnostics.PeerEndpoint(task.fileId, p.ip, p.connected, p.seed))
+            }
+        }
+        return Diagnostics(
+            running = running,
+            port = if (running) listenPort else 0,
+            torrents = snapshot.size,
+            dhtNodes = if (running) dhtNodes() else 0L,
+            dhtRunning = running && isDhtRunning(),
+            portMapping = portMappingEnabled,
+            lastError = lastError,
+            trackers = trackers,
+            peers = peers,
+        )
+    }
+
+    /**
+     * `torrent_status.next_announce`：libtorrent 报的「距下次 announce」的毫秒数（实测单位见类注释）。
+     * 取不到 / 明显离谱时按 0 处理，免得把一个坏读数换算成一个看似正常的「下次 announce 在 30 年后」。
+     */
+    private fun nextAnnounceMs(st: TorrentStatus?): Long {
+        val raw = try {
+            st?.nextAnnounce() ?: 0L
+        } catch (_: Throwable) {
+            0L
+        }
+        return if (raw in 1..MAX_NEXT_ANNOUNCE_MS) raw else 0L
+    }
 
     /** settings_pack 里 enable_dht 的真值（断言「公开会话 DHT 为开」用）。 */
     fun enableDhtSetting(): Boolean = settingBool { it.isEnableDht }
@@ -620,9 +968,13 @@ class PublicBtSession(
             return
         }
         val path = writeTorrentCache(fileId, bytes)
+        // 后台补元数据那条路（导入早超时、torrent 还留在会话里找源）：缓存落盘之后同样要退场，
+        // 否则它会在「休眠」的名义下继续下载（就是这次要修的缺陷）。
+        if (synchronized(lock) { tasks[fileId]?.importOnly == true }) retire(fileId, "background_metadata")
         synchronized(lock) {
             tasks[fileId]?.let { old ->
-                tasks[fileId] = Task(old.fileId, old.handle, old.savePath, info.name(), old.seeding)
+                // import_only 要带着走：后台补元数据的那条路同样要在到手后退场。
+                tasks[fileId] = Task(old.fileId, old.handle, old.savePath, info.name(), old.seeding, old.importOnly)
             }
         }
         log(
@@ -676,18 +1028,22 @@ class PublicBtSession(
      * `sp.setInteger(alert_mask, alertMask(logging))`（注释写着 "we always control the alert mask"），
      * 会话参数里的值一律被覆盖，只有 start 之后再 `apply_settings` 才生效。
      *
-     * 订的四类：
+     * 订的五类：
      * - `status`：metadata_received / torrent_finished / add_torrent / state_update（SessionManager 内部用）
      * - `error`：metadata_failed / alerts_dropped
      * - `storage`：save_resume_data(_failed)
      * - `port_mapping`：portmap（只用于 isFirewalled 标记，留着不增加风险）
+     * - `tracker`：tracker_announce / reply / error —— **只喂诊断读口**（[diagnostics]），
+     *   状态机一条都不读它。加它是为了回答「announce 成没成、下次什么时候」，那是外部探针
+     *   之前唯一能拿到的答案（docs/reports/public-swarm-real-world.md 风险 3）。
      *
-     * 不订 `dht` / `peer` / `tracker` / `ip_block`：公开会话不消费它们，而且 `ip_block` 正是
+     * 不订 `dht` / `peer` / `ip_block`：公开会话不消费它们，而且 `ip_block` 正是
      * 崩溃那条 `ip_ban_alert` 的类别 —— 不订它，libtorrent 连发都不会发（ban_ip 里有 should_post 判断）。
      * `session_stats` 不在此列但照样会到：它在 post_session_stats() 里直接 emplace，不看 mask，
      * 所以 dhtNodes() 的读口径不受影响。
      */
     private fun applyPublicAlertMask(mgr: SessionManager) {
+        // 类别集由 [publicAlertMask] 一处给出（tracker 类只为诊断读口，见 [diagnostics]）。
         try {
             val pack = SettingsPack()
             pack.setInteger(settings_pack.int_types.alert_mask.swigValue(), publicAlertMask())
@@ -714,6 +1070,10 @@ class PublicBtSession(
             AlertType.SAVE_RESUME_DATA.swig(),
             AlertType.SAVE_RESUME_DATA_FAILED.swig(),
             AlertType.TORRENT_FINISHED.swig(),
+            // 只喂诊断读口（[diagnostics]）。这几种都在 0..104 之内，不是 AlertTypeCompat 补的洞。
+            AlertType.TRACKER_ANNOUNCE.swig(),
+            AlertType.TRACKER_REPLY.swig(),
+            AlertType.TRACKER_ERROR.swig(),
         )
 
         override fun alert(a: Alert<*>) {
@@ -727,9 +1087,17 @@ class PublicBtSession(
             when (a.type()) {
                 AlertType.METADATA_RECEIVED -> {
                     val waiter = synchronized(lock) { waiters[fileId] }
+                    val handle = try { (a as? MetadataReceivedAlert)?.handle() } catch (_: Throwable) { null }
                     // 元数据到手当场让 libtorrent 把 info 字典吐出来（SAVE_INFO_DICT）。
                     // 无论有没有人在等都要做：后台补元数据的那条路也要把 .torrent 落进缓存（§3）。
-                    try { (a as? MetadataReceivedAlert)?.handle()?.saveResumeData(TorrentHandle.SAVE_INFO_DICT) } catch (_: Throwable) {}
+                    try { handle?.saveResumeData(TorrentHandle.SAVE_INFO_DICT) } catch (_: Throwable) {}
+                    // 到手就**停**（导入语义）：这之后一个数据字节都不该再下。暂停必须在 save_resume_data
+                    // 之前 —— 缓存那一步可能要几秒，而回环上 16 MiB 只要几百毫秒，不掐住就会在
+                    // 「休眠」的名义下真下载（这正是要修的缺陷）。暂停不影响 save_resume_data（纯磁盘操作）。
+                    // 退场（摘任务）在缓存落盘之后：先摘就拿不到字节，激活时只能重拉元数据。
+                    if (synchronized(lock) { tasks[fileId]?.importOnly == true } && handle != null) {
+                        try { handle.pause() } catch (_: Throwable) {}
+                    }
                     waiter?.received?.countDown()
                 }
                 AlertType.METADATA_FAILED -> {
@@ -759,7 +1127,52 @@ class PublicBtSession(
                 AlertType.TORRENT_FINISHED -> {
                     try { (a as? TorrentFinishedAlert)?.handle()?.let { onTorrentFinished?.invoke(fileId) } } catch (_: Throwable) {}
                 }
+                // tracker 三件事只落在诊断表里，不回灌任何判定（docs/core.md §3.12）。
+                AlertType.TRACKER_ANNOUNCE -> {
+                    val url = try { (a as? TrackerAnnounceAlert)?.trackerUrl() ?: "" } catch (_: Throwable) { "" }
+                    report(fileId, url) { it.state = "announcing" }
+                }
+                AlertType.TRACKER_REPLY -> {
+                    val url = try { (a as? TrackerReplyAlert)?.trackerUrl() ?: "" } catch (_: Throwable) { "" }
+                    val num = try { (a as? TrackerReplyAlert)?.numPeers() ?: 0 } catch (_: Throwable) { 0 }
+                    report(fileId, url) {
+                        it.state = "replied"
+                        it.ok = true
+                        it.lastAt = System.currentTimeMillis()
+                        it.peers = num
+                        it.failures = 0
+                        it.error = ""
+                    }
+                }
+                AlertType.TRACKER_ERROR -> {
+                    val url = try { (a as? TrackerErrorAlert)?.trackerUrl() ?: "" } catch (_: Throwable) { "" }
+                    val times = try { (a as? TrackerErrorAlert)?.timesInRow() ?: 0 } catch (_: Throwable) { 0 }
+                    val message = try { (a as? TrackerErrorAlert)?.errorMessage() ?: "" } catch (_: Throwable) { "" }
+                    report(fileId, url) {
+                        it.state = "failed"
+                        it.ok = false
+                        it.lastAt = System.currentTimeMillis()
+                        it.peers = 0
+                        it.failures = times
+                        it.error = message
+                    }
+                }
                 else -> {}
+            }
+        }
+    }
+
+    /** 改一条 tracker 的诊断记录（没有就建一条）。告警线程调，全程在 [lock] 里。 */
+    private fun report(fileId: String, url: String, mutate: (TrackerReport) -> Unit) {
+        val key = url.ifEmpty { UNKNOWN_TRACKER }
+        synchronized(lock) {
+            val byUrl = trackerReports.getOrPut(fileId) { LinkedHashMap() }
+            val entry = byUrl.getOrPut(key) { TrackerReport(key) }
+            mutate(entry)
+            // 一个 torrent 的真 tracker 不会超过个位数；表是诊断用的，别让它无限长。
+            while (byUrl.size > MAX_TRACKERS_PER_TORRENT) {
+                val first = byUrl.keys.firstOrNull() ?: break
+                byUrl.remove(first)
             }
         }
     }
@@ -830,7 +1243,22 @@ class PublicBtSession(
 
         private const val MAX_KBPS = Int.MAX_VALUE / 1024
 
+        /** 诊断读口里每个 torrent 最多报多少条 peer 端点（够定位问题，又不把 /api/state 撑大）。 */
+        private const val MAX_DIAG_PEERS = 64
+
+        /** 诊断表里每个 torrent 最多留几条 tracker 记录。 */
+        private const val MAX_TRACKERS_PER_TORRENT = 16
+
+        /** `next_announce` 的合理上限（30 天，毫秒）；超出当坏读数处理。 */
+        private const val MAX_NEXT_ANNOUNCE_MS = 30L * 24 * 60 * 60 * 1000
+
+        /** 告警里拿不到 tracker URL 时的占位键（仍然记结果，只是不知道是谁答的）。 */
+        private const val UNKNOWN_TRACKER = "-"
+
         private val SUPER_SEEDING_BIT: Int by lazy { TorrentFlags.SUPER_SEEDING.to_int() }
+
+        /** `torrent_flags::paused` 的位：挂起判定读它，不读我们自己记的 park 位。 */
+        private val PAUSED_BIT: Int by lazy { TorrentFlags.PAUSED.to_int() }
 
         /**
          * 公开 torrent 的 per-torrent flags：**显式清零**。
@@ -862,6 +1290,10 @@ class PublicBtSession(
                 .or_(Alert.ERROR_NOTIFICATION)
                 .or_(Alert.STORAGE_NOTIFICATION)
                 .or_(Alert.PORT_MAPPING_NOTIFICATION)
+                // tracker 类这一个是本轮新加的：订它只为了把「announce 成没成」记进诊断表
+                // （docs/core.md §3.12）。dht / peer / ip_block 依旧不订 —— 后者的 ip_ban_alert
+                // 正是崩溃那一条（§3.8），收益为零。
+                .or_(Alert.TRACKER_NOTIFICATION)
                 .to_int()
 
         /** 崩溃那条 ip_ban 的类别（断言「公开会话不订它」用）。 */

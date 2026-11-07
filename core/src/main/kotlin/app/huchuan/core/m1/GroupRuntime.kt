@@ -632,6 +632,16 @@ class GroupRuntime internal constructor(
 
     fun isComplete(fileId: String): Boolean = kernel.sessionOf(fileId).isFinished(fileId)
 
+    /** 已下载的字节数（内核真值；不在会话里 / 元数据未到 = 0）。见 [percent] 的口径说明。 */
+    fun downloadedBytes(fileId: String): Long = kernel.sessionOf(fileId).downloadedBytes(fileId)
+
+    /** 这个文件的总字节数（内核真值）；不在会话里 / 元数据未到时退回条目上的 size（可能是 0 = 未知）。 */
+    fun totalBytes(fileId: String): Long {
+        val fromKernel = kernel.sessionOf(fileId).totalBytes(fileId)
+        if (fromKernel > 0L) return fromKernel
+        return synchronized(lock) { files[fileId]?.size ?: 0L }
+    }
+
     fun savedFile(fileId: String): File? = kernel.sessionOf(fileId).savedFile(fileId)
 
     // ------------------------------------------------------------------ 宿主（Android UI / 桌面 daemon）读口
@@ -639,18 +649,72 @@ class GroupRuntime internal constructor(
     /** 本机对一个文件的参与状态：没挂进会话 / 在做种 / 在下载。 */
     enum class LocalRole { NONE, SEEDING, DOWNLOADING }
 
-    fun localRole(fileId: String): LocalRole = synchronized(lock) {
-        when {
-            !localTasks.contains(fileId) -> LocalRole.NONE
-            // 做种判定与做种数读同一个集合：下完转做种的文件这里立刻是 SEEDING，不会停在 DOWNLOADING。
-            seeding.isSeeding(fileId) -> LocalRole.SEEDING
-            else -> LocalRole.DOWNLOADING
-        }
+    /**
+     * 内核里这个文件此刻的**真实参与度** —— 宿主画面上那个 state 字段的唯一判据。
+     *
+     * 与 [LocalRole] 的差别是「谁说了算」：LocalRole 读的是本机的任务表（意图），
+     * KernelState 读的是 libtorrent 的真值（事实）。真实缺陷是这两者会分叉 ——
+     * 磁力导入把 torrent 加进了公开会话，任务表里却没有这一条，于是界面写「休眠 0%」
+     * 而同一时刻磁盘分配量在涨（docs/reports/public-swarm-real-world.md 风险 1）。
+     * 现在两者都从这一个函数出：**正在传**才算 DOWNLOADING，**挂起 / 没有元数据**都算没在参与，
+     * 界面读到的状态不可能比内核更激进。口径见 docs/core.md §3.12。
+     */
+    enum class KernelState {
+        /** 不在任何会话里：休眠（或从没挂过）。 */
+        ABSENT,
+        /** 在会话里但挂着（导入后等激活）：有 torrent、不传数据。 */
+        PARKED,
+        /** 在会话里、没挂起，但 info 字典还没到手：没有任何数据可传（「等待来源」）。 */
+        WAITING_METADATA,
+        /** 正在传数据。 */
+        DOWNLOADING,
+        /** 数据完整（或已进做种集合）：做种中。 */
+        SEEDING,
     }
 
-    /** 0–100 的整数进度；没挂进会话时返回 0。 */
-    fun percent(fileId: String): Int =
-        (kernel.sessionOf(fileId).progress(fileId) * 100.0).toInt().coerceIn(0, 100)
+    /**
+     * 内核真值。判定顺序有意义：做种 → 挂起 → 元数据 → 在下载。
+     *
+     * 「挂起」与「没有元数据」都**不算**在下载：libtorrent 在挂起时不发请求，
+     * 没有 info 字典时根本发不出 piece 请求 —— 两者都不会让字节数变，界面就不该写「下载中」。
+     */
+    fun kernelState(fileId: String): KernelState {
+        val session = kernel.sessionOf(fileId)
+        if (!session.has(fileId)) return KernelState.ABSENT
+        if (seeding.isSeeding(fileId) || session.isFinished(fileId)) return KernelState.SEEDING
+        if (session.isPaused(fileId)) return KernelState.PARKED
+        if (!session.hasMetadata(fileId)) return KernelState.WAITING_METADATA
+        return KernelState.DOWNLOADING
+    }
+
+    /**
+     * 本机角色 = 内核真值的投影：只有**真在传**才算 DOWNLOADING。
+     *
+     * 以前它读本地任务表（localTasks），磁力导入的任务不在表里 → 明明在下载却回 NONE；
+     * 现在唯一来源是 [kernelState]，任务表只决定「谁该被拨号 / 谁该被巡查」。
+     */
+    fun localRole(fileId: String): LocalRole = when (kernelState(fileId)) {
+        KernelState.SEEDING -> LocalRole.SEEDING
+        KernelState.DOWNLOADING -> LocalRole.DOWNLOADING
+        KernelState.ABSENT, KernelState.PARKED, KernelState.WAITING_METADATA -> LocalRole.NONE
+    }
+
+    /**
+     * 0–100 的整数进度；没挂进会话时返回 0。
+     *
+     * 优先用字节数算（downloadedBytes / totalBytes，向下取整），拿不到总量时退回 libtorrent 的比例。
+     * 两者都是内核真值，不会出现「百分比涨了字节没动」这种自相矛盾的读数；
+     * 真正需要细粒度的地方读 [downloadedBytes] / [totalBytes]，别把百分比当唯一判据。
+     */
+    fun percent(fileId: String): Int {
+        val session = kernel.sessionOf(fileId)
+        val total = session.totalBytes(fileId)
+        if (total > 0L) {
+            val done = session.downloadedBytes(fileId)
+            return ((done * 100L) / total).toInt().coerceIn(0, 100)
+        }
+        return (session.progress(fileId) * 100.0).toInt().coerceIn(0, 100)
+    }
 
     fun downloadRateBps(fileId: String): Long = kernel.sessionOf(fileId).downloadRate(fileId)
 
@@ -877,6 +941,9 @@ class GroupRuntime internal constructor(
                                 org.libtorrent4j.TorrentInfo(bytes),
                                 localFile.parentFile ?: kernel.publicDataDir(),
                                 true,
+                                // 缓存 .torrent 不带 announce：续种时把磁力的 tr 补挂回去，
+                                // 否则公开做种只靠 DHT，跨网要靠很久才被发现（同激活路径）。
+                                MagnetLink.parse(entry.magnet)?.trackers ?: emptyList(),
                             )
                         ) {
                             throw IllegalStateException("public session refused torrent")

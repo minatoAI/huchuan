@@ -2,7 +2,13 @@
 
 - 版本：2026-11-07 · 内核 agent · 对应协议 v0（docs/design/protocol.md，唯一事实源）
 - 状态：**M1 全流程在桌面 JVM 上用两个独立进程跑通**（建群 → 后 8 位加入 → 32 MiB 共享/下载/SHA 一致 → 评论 3 s 内入库 → 全程 dht_nodes=0）
-- 本轮（链接分享服务端交互层）：新增 `core/.../link/` 包（`app.huchuan.core.link`）—— `ShareRegistry`（创建 / 列出 / 查询 / 撤销，HttpURLConnection + 内核自带 Json，不引新依赖）、`SignalClient`（`/signal` 信令房间与 idle → signaling → connected → transferring → done/failed 状态机）、`Transport` 抽象（open/send/close/onMessage，core 不依赖 java.net.http，桌面与 Android 各自注入）。预算是两套：访客建链预算固定 15 s，分享者「挂着等访客」用等待预算（默认 = 分享剩余有效期，宿主不必再自己塞 TTL）；传输空闲 90 s、断线按 1/2/4/8/16 s（30 s 封顶）重新 join。**WebRTC 实现不在 core**，本层只到 SDP/ICE 收发；harness 用本机 mock HTTP+WS 跑 119 条断言。接口、口径与验收见 §3.11
+- 本轮（公开条目状态缺陷）：修掉「磁力导入后界面显示『休眠 0%』、公开会话其实正在真下载」的状态分叉（docs/reports/public-swarm-real-world.md 风险 1/2/3）。
+  判定：**导入只负责拿元数据，下载必须由「激活」开始**（product-spec §1「休眠 = 不参与传输」、§4-5「打开激活 → 下载中」、§5 状态机、public-swarm §3.1「只有用户主动要它下载（激活）之后才给连不上」）。
+  实现：导入路径建的任务**到手就挂起**（`torrent_flags::paused`），激活才 `resume`；状态唯一判据换成 `GroupRuntime.kernelState`
+  （`ABSENT / PARKED / WAITING_METADATA / DOWNLOADING / SEEDING`），`localRole` 只是它的投影 —— 界面读到的状态不可能比内核更激进。
+  顺带：文件对象补**字节级进度**（`downloadedBytes` / `totalBytes`，`percent` 与之同源）、公开会话补**诊断读口**
+  （`dhtNodes` / tracker announce 结果与下次时间 / peer 端点，走 daemon `/api/state.public`）。harness 新增第 7 组 29 条断言（自检总数 539 → 568）。口径与验收见 §3.12
+- 上一轮（链接分享服务端交互层）：新增 `core/.../link/` 包（`app.huchuan.core.link`）—— `ShareRegistry`（创建 / 列出 / 查询 / 撤销，HttpURLConnection + 内核自带 Json，不引新依赖）、`SignalClient`（`/signal` 信令房间与 idle → signaling → connected → transferring → done/failed 状态机）、`Transport` 抽象（open/send/close/onMessage，core 不依赖 java.net.http，桌面与 Android 各自注入）。预算是两套：访客建链预算固定 15 s，分享者「挂着等访客」用等待预算（默认 = 分享剩余有效期，宿主不必再自己塞 TTL）；传输空闲 90 s、断线按 1/2/4/8/16 s（30 s 封顶）重新 join。**WebRTC 实现不在 core**，本层只到 SDP/ICE 收发；harness 用本机 mock HTTP+WS 跑 119 条断言。接口、口径与验收见 §3.11
 - 本轮（告警线程 NPE）：修掉「公开会话开 DHT、导入磁力约 2 分钟后进程死在 `SessionManager-alertsLoop`」的致命崩溃。根因是**版本错配**：我们自编的 arm64 `.so`（libtorrent RC_2_1 head）报 `num_alert_types=108`，而 libtorrent4j-2.1.0-39 的 `AlertType` 映射表只填到 104 —— 105/106/107 三个槽是 null，其中 107 `ip_ban_alert`（`ip_block` 类）正是 DHT 探测流量会触发的那条，`AlertType.fromSwig` 返回 null 后在 `switch` 里取 `ordinal()` 直接 NPE。修法是在建会话前用反射把 null 槽补成 `AlertType.UNKNOWN`（只跳过真正未知的类型，已知类型一个不动）+ 公开会话 `alert_mask` 收窄到 `status|error|storage|port_mapping`（不订 `ip_block`）。**这是规避不是根治**，根治要换 .so 或升依赖。真机 MIX 2S 跑满 6 分钟存活、无 FATAL、crash=0、补表日志 `filled=105,106,107`。详见 §3.8
 - 上一轮（M1.7 跨网 BT 可达性）：修掉「ip_filter 只放行私网 → 公网 peer 被我们自己拒掉」的硬阻塞（AGENTS §9）。私有会话的 ip_filter 改成**动态白名单**：基础私网段 + 消息层确认的群成员公网地址（`peer.announce.btHost`、tracker 候选、手动 IP:port、上次建链端点），运行期整份重建；成员离线不移除、端点被新 announce 替换或退群时撤销（理由见 §3.7）。同时按 public-swarm §4.1 给 `peer.announce` 补可选 `pubBtPort`（协议 §10），公开条目不再整轮跳过，改为对每个成员各拨一次公开会话端口（`sess=pub`）。harness 新增 `selftest.crossnet checks=58`，`bash scripts/m1-headless.sh` 全 PASS。接口与断言见 §3.7，口径表见 §6
 - 上一轮（M1.6 跨网发现）：内核接上自建 tracker（协议 §3.2）—— 建群 / 入群时登记 `groupHash20`，每群一条线程按**服务端下发的 interval**（默认 600 s、下限 300 s）announce；passkey 每小时轮换（`hex(HMAC-SHA256(kGrp, "huchuan/trk1/v1"‖gid‖小时整数))`），换小时先重新注册（带 `prevPasskey` 做连续性证明）再 announce；回来的 peers 进候选表，与 mDNS / 手动地址按 §3.4 合并去重、**优先级最低**（`CandidateMerge`）。配置项 `trackerBaseUrl` 为空 = 整个功能关闭：只失去跨网那一档，局域网照常，不报错、零请求。私有群的 infohash 仍然不进 DHT / PEX / LSD（协议 §8 不变），上报给 tracker 的只有伪 swarm 的 `groupHash20`；日志里 passkey 只留前 4 字符。接口与口径见 §3.5，常量见 §6
@@ -26,12 +32,12 @@ bash scripts/m1-headless.sh
 
 1. `./gradlew :core:jar :core:m1Deps :core:m1Native`（构建内核 + 拉依赖 + 解出 `libtorrent4j.dll`）
 2. `javac` 编译 harness（`harness/src/main/java`）
-3. 跑字节层自检 `SelfTest`（539 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃；**公开种子一组 99 条**（§3.6 / §3.9：公开会话 DHT 开 / 私有会话 DHT 关、端口 ≥ 6881、per-torrent flags 清零与 0x380000、公开拒 private 与私有拒 public、磁力加种落进公开会话、五种失败文案、同 infohash 两种 scope 正反两种顺序去重、13 条告警类型映射表补洞与公开会话 alert_mask 收窄（含 30 s 真会话 DHT 收告警 soak，见 §3.8），以及本节 §3.9 的 31 条发布 / 取消公开 / 重启隐藏断言）；**本轮新增跨网可达性一组 58 条**（§3.7：私网 / 公网 / 主机名的 IP 字面量分类与归一、真 BtSession 的动态 filter 真值、群知识四类来源并入 + 端点替换 / 退群撤销、pubBtPort 的 JSON 往返与签名域、两个真内核的 pubBtPort 广播 + 公开条目拨公开会话）；**本轮链接分享一组 119 条**（§3.11：注册表请求体 / 撤销签名 / 列表鉴权、mock WS 上的 idle→connected 状态机、断线重连、两套预算（分享者挂 60 s 仍在线、3 s 等待预算反向、访客 15 s 建链、连接待两个访客）、撤销后新访客 410））
+3. 跑字节层自检 `SelfTest`（568 条：B32、HKDF（RFC 5869 向量）、邀请码、P-256 签名、join.ok/file.list/member.name 的签名口径、signBytes、JSON、帧；**本轮新增跨网发现一组**（见 §3.5：groupHash20 与 passkey 的公式用 JDK 原语独立复算、小时边界、passkey 打码、候选合并优先级与 128 上限；再起一个真内核对着本机 mock tracker 断言注册 / announce 的参数 / peers 并入候选表 / 回到 `stopped` / 空 baseUrl 时零请求）；会话级限速一组：设 512/0 的读回、连续改两次以最后一次为准、私网与回环对端是否也在限速范围内、以及 loopback 真流量（8 MiB 在 1024 KB/s 限额下必须 ≥5 s 才走完）；另有两组 —— 创建者用自己的公钥验自己的条目（含「没登记必须 no_pub」的反向断言）、peer.announce 的 plat/seeds 字段与「不进签名域」；未读游标的全序与落盘往返；做种集合与重启续种（下载完成 0→1、休眠回到 0、重启恢复仍为 1、文件缺失判定为不恢复且不抛异常）；冷启动重连的编排 `ReconnectPolicy`：退避表 1/2/4/8/16/30 s 与 30 s 封顶、每群并发 3、候选去重 / 在途跳过 / 预算截断 / 非法端口丢弃；**公开种子一组 128 条**（§3.6 / §3.9 / §3.12：公开会话 DHT 开 / 私有会话 DHT 关、端口 ≥ 6881、per-torrent flags 清零与 0x380000、公开拒 private 与私有拒 public、磁力加种落进公开会话、五种失败文案、同 infohash 两种 scope 正反两种顺序去重、13 条告警类型映射表补洞与公开会话 alert_mask 收窄（含 30 s 真会话 DHT 收告警 soak，见 §3.8），以及本节 §3.9 的 31 条发布 / 取消公开 / 重启隐藏断言）；**本轮新增跨网可达性一组 58 条**（§3.7：私网 / 公网 / 主机名的 IP 字面量分类与归一、真 BtSession 的动态 filter 真值、群知识四类来源并入 + 端点替换 / 退群撤销、pubBtPort 的 JSON 往返与签名域、两个真内核的 pubBtPort 广播 + 公开条目拨公开会话）；**本轮链接分享一组 119 条**（§3.11：注册表请求体 / 撤销签名 / 列表鉴权、mock WS 上的 idle→connected 状态机、断线重连、两套预算（分享者挂 60 s 仍在线、3 s 等待预算反向、访客 15 s 建链、连接待两个访客）、撤销后新访客 410））
 4. 起 A、B 两个 JVM 进程跑 M1 全流程，然后只用 grep 复核日志
 
 产物：`artifacts/m1/log-A.log`、`log-B.log`、`selftest.log`、`a-data/`、`b-data/`（含 `state.json`、`identity.txt`、`downloads/`）。`artifacts/` 不进版本库。
 
-一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **2 分 20 秒左右**（§3.8 的告警 soak 固定占 30 s）（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；跨网发现要起两个真内核 + 两个本机 mock tracker，~8 s；本轮跨网可达性自检要起一个 BtSession + 三个内核（含公开会话），~10 s）；脚本的 35 条 CHECK 全 PASS（自检 539 条另计，其中公开种子 99 条、跨网发现 68 条、跨网可达性 58 条、链接分享 119 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
+一次完整跑（Gradle 增量 + javac + 自检 + 两进程 + 断言）本机实测 **2 分 20 秒左右**（§3.8 的告警 soak 固定占 30 s）（B 角色多出两次内核重启，见 §3.2；A 现在还要等 B 冷启动后自己连回来，见 §3.3；loopback 限速用例固定多花 ~10 s；跨网发现要起两个真内核 + 两个本机 mock tracker，~8 s；本轮跨网可达性自检要起一个 BtSession + 三个内核（含公开会话），~10 s）；脚本的 35 条 CHECK 全 PASS（自检 568 条另计，其中公开种子 128 条、「导入 ≠ 下载」那一组 29 条、跨网发现 68 条、跨网可达性 58 条、链接分享 119 条，正向证据行 `selftest.tracker checks=68 failures=0 register_requests=1 announce_requests=2 candidates_from_tracker=3 tracker_http_uris=3 disabled_kernel_requests=0`）。
 
 本轮新增的三条硬断言在 harness 里。`scripts/m1-headless.sh` 本轮不动，它仍然只看 harness 的退出码（`process.rc_0_0` / `catchup.process_rc_0_0_0`）：harness 判 FAIL 即整轮 FAIL，脚本输出里也有对应的证据行。
 
@@ -89,10 +95,10 @@ G1/G3/G4 的运行时验证不在这条脚本里（脚本本轮不动），用�
 | `KernelEvents.kt` | 宿主事件出口 + 加入状态 + join 限速器 | §8 |
 | `Reconnect.kt` | 冷启动重连（缺口一）：退避与候选编排 `ReconnectPolicy`（1/2/4/8/16/30 s、每群并发 3）+ 驱动 `PeerReconnector`（mDNS / 落盘端点 / 手动地址三处候选，连上即 hello 绑定，不重新 join）。另含 ① 成员间 BT 拨号编排 `MemberDialPolicy`（每成员一次、幂等、同一套退避与预算）；② 撞车兜底开关 `LinkRaceGuard`（`-Dhuchuan.mutants=no_link_fallback` 只给反向验证用） | §3.1 §3.3 §3.4 §11 |
 | `M1Kernel.kt` | 门面：生命周期、建群/加入、公钥登记、持久化、后台巡查（心跳/补连/进度）、完成判定快通道、重连器装配、**公开会话装配与磁力导入**（`addPublicMagnet` / `sessionOf`，见 §3.6）、**公开到群外**（`publishPublic` / `unpublishPublic` / `publicTorrentBytes`，见 §3.9） | §11 |
-| `PublicBtSession.kt` | 公开会话（独立 SessionManager）：DHT 开 / LSD 关 / uTP 开 / PEX 开（per-torrent flags 显式清零）/ 不设 ip_filter / 端口 6881 起 / `<data>/public` / 按需启停；`cacheTorrent` 把发布 / 导入的 .torrent 落进 `<data>/public/meta` | 公开 swarm（public-swarm §2.3） |
+| `PublicBtSession.kt` | 公开会话（独立 SessionManager）：DHT 开 / LSD 关 / uTP 开 / PEX 开（per-torrent flags 显式清零）/ 不设 ip_filter / 端口 6881 起 / `<data>/public` / 按需启停；`cacheTorrent` 把发布 / 导入的 .torrent 落进 `<data>/public/meta`；**导入任务退场**（`importOnly` → 到手就 `pause()` → 缓存落盘后摘掉，`retire` / `adopt`，见 §3.12）；**诊断快照** `diagnostics()`（DHT 节点数 / tracker announce 结果与下次时间 / peer 端点） | 公开 swarm（public-swarm §2.3） |
 | `PublicMagnet.kt` | 磁力解析与规范化 `MagnetLink` + 导入结果 `PublicMagnetResult`（五种失败各一句中文） | BEP 9（public-swarm §3） |
 | `PublicPublish.kt` | 「公开到群外」的结果 `PublicPublishResult`（十个失败码各一句中文）与参数 `PublicPublishOptions`；建种逻辑在 `BtSession.kt` 的 `TorrentBuild` | 公开条目（public-swarm §6.1） |
-| `LocalSession.kt` | 私有 / 公开两个会话共用的读口（含 `peerSnapshot` / `connectPeer`），配合 `M1Kernel.sessionOf` 让「这文件在本机走到哪了、该拨哪一套会话」只有一套读数 | — |
+| `LocalSession.kt` | 私有 / 公开两个会话共用的读口（含 `peerSnapshot` / `connectPeer` / **挂起判定 `isPaused`** / **字节级进度 `downloadedBytes` + `totalBytes`** / `hasMetadata`），配合 `M1Kernel.sessionOf` 让「这文件在本机走到哪了、该拨哪一套会话」只有一套读数（§3.12） | — |
 | `IpAllowlist.kt` | ip_filter 动态白名单的纯函数口径：IP 字面量归一（去 `[]` / `%zone`，主机名不收）、私网段判定、公网候选筛选（排除回环 / CGNAT / 组播 / 保留段）、去重排序。SelfTest 直接钉住 | §8 · AGENTS §9 |
 | `EntryScope.kt` | 条目去重 `FileEntryMerge`：同一 infohash 同时存在 private 与 public 时只留 private（file.add 与 file.list 同一处） | 公开条目（public-swarm §1.1） |
 
@@ -983,7 +989,7 @@ guest.finish()                                        // bye{done} -> DONE
 4. **两套预算**（这一组的证伪支点）：`sharerWaitMs` / `reconnectDelayMs` 的纯函数口径（默认 = 剩余有效期、显式参数优先、过期不为负、1/2/4/8/16 s 与 30 s 封顶）；分享者等 60 s 无访客仍在 `SIGNALING`（等待预算 ≈120 s），第 10 s 由服务端掐一次连接后照样重连、预算不续满；等待预算只有 3 s（短 TTL）时第 1 s 也掐一次，仍在 ≈3.0 s `FAILED(wait-expired)`；分享者接待完一个访客（`bye{done}`）回到等待相，第二个访客仍能 `CONNECTED`；访客 15 s 没等来 offer → `FAILED(connect-failed)`。
 5. 撤销与等待到点：撤销时房间里的两端都 `FAILED(revoked)`，新访客 HTTP 410、且没有发出 `share-join`；显式等待预算 250 ms 的分享者到点 `FAILED(wait-expired)` 且不抛异常。
 
-正向证据：`selftest.link checks=119 failures=0 requests=17 ws_upgrades=14 join_frames=5`，整轮 `selftest.checks=539 failures=0`。可 grep 的实测值一行：
+正向证据：`selftest.link checks=119 failures=0 requests=17 ws_upgrades=14 join_frames=5`，整轮 `selftest.checks=568 failures=0`（本轮起 568）。可 grep 的实测值一行：
 
 ```
 selftest.link.budgets wait_budget_ms=120000 waited60_ms=60000 sharer_state_at60=SIGNALING \
@@ -1013,6 +1019,118 @@ java -Dlibtorrent4j.jni.path="<core/build/m1-native/libtorrent4j.dll>" -Dfile.en
 - 等待预算只管「信令房间还开多久」，不管传输：访客连上后的字节路径仍由 90 s 空闲预算与平台看门狗兜底。
 - `app/LinkSession.kt` 里的 TTL 补丁本轮没动（app/ 不归内核 agent 改），它现在无害；下一位改 app 时把 `LinkTimeouts(signalBudgetMs = budget)` 换成 `LinkTimeouts()` 即可。
 
+### 3.12 公开条目：导入 ≠ 下载（本轮，状态缺陷修复）
+
+**现象**（docs/reports/public-swarm-real-world.md 风险 1，真种子实测）：`POST /api/groups/{gid}/files/import-magnet`
+回 `state=sleeping / role=none / seeders=0 / progressPercent=0`，同一时刻公开会话里的 torrent 正在真下载
+（磁盘分配量 17.7 → 28.5 → 36.8 MB 连续增长）；再发一次 `POST …/active {"active":true}` 内核才开始报进度。
+
+**判定：导入只负责拿到元数据，下载必须由「激活」开始 —— 导入路径不许下数据。**
+
+依据（product-spec 与 public-swarm 都没有改，冲突时按这五条裁决）：
+
+| 出处 | 原文要点 | 推出的结论 |
+|---|---|---|
+| product-spec §1 术语表 | `激活` = 本机持有完整文件并为他人做种；`休眠` = **本机有该文件记录但不参与传输**（开关关，或无做种者可连） | 「休眠」的定义本身就是「不传」。休眠中还在传数据 = 状态在撒谎 |
+| product-spec §4-5 | 群友看到新行 → 点行进 P4 → **打开「激活」** → 状态「下载中 42%」 | 下载由用户点激活触发，不是由导入触发 |
+| product-spec §5 文件状态机 | `休眠 → 开关开 → 部分`（本机不完整且 ≥1 做种者才转） | 「开关」是唯一入口，没有第二条路径能把条目推进「部分」 |
+| public-swarm §3.1 | 「**无元数据不报错**…只有用户主动要它下载（激活）之后才给『连不上』」；元数据没到手时条目是「等待来源」，周期重试 | 导入这一步的产出是**元数据**；下载是另一件事 |
+| public-swarm §7.1 | 公开会话按需启停：「有非休眠公开条目才 start」 | 会话生命周期以「有没有在传」为准，不以「有没有导入过」为准 |
+
+**为什么不选「导入即下载」**：那条路要把 P4 的激活开关降级成装饰，等于推翻 product-spec §3 P4 的「唯一主动能」
+与 §4-5 的流程；而且导入的条目是群里别人广播来的种子，自动下载会让每台设备在不知情时替全网拉流量。
+本轮**只改内核**，产品文案、UI、协议一个字没动。
+
+**实现：导入建的任务「到手就停、缓存落盘就摘掉」，激活才按缓存重新加种**（`PublicBtSession`）
+
+| 阶段 | 内核做什么 | `kernelState` |
+|---|---|---|
+| 导入 `addMagnet(..., importOnly = true)` | 加种 → 等 `metadata_received` → **当场 `handle.pause()`** → 等 `save_resume_data` 吐出 info 字典 → 落 `.torrent` 缓存 → 把 torrent 从会话里摘掉 | 没有元数据 `WAITING_METADATA`，摘掉之后 `ABSENT` |
+| 等元数据期间 | torrent 在会话里跑着，但 libtorrent 没有 piece 表，一个数据字节都发不出请求 | `WAITING_METADATA` |
+| 激活 `group.startDownload` → 按缓存加种 | 会话里还有这条（元数据没到手）就 `adopt` 接管；缓存种子在就按它加种（并把磁力的 `tr` 补挂回去）；都没有就按磁力加种且 `importOnly = false` | `DOWNLOADING` |
+| 休眠 `group.stopFile` | 摘掉 torrent（磁盘文件不动） | `ABSENT` |
+
+**为什么是「摘掉」而不是 `pause()`**：先按字面实现成「元数据到手就 `handle.pause()`」，实测两个问题 ——
+① 暂停过的 torrent 恢复之后要等**下一次周期 announce** 才重新拉 peer：导入 → 挂起 3 s → 激活，要 **57 s** 才有
+第一个 peer，而 public-swarm §3.1 正好把「点了激活 60 s 内无 peer」判成「连不上做种者」；
+② `force_reannounce`（含 `IGNORE_MIN_INTERVAL`）在这个状态下不生效（tracker 的 announce 计数一动不动）。
+改成「元数据 + 缓存都到手 → 摘掉任务」之后，激活按缓存重新加种当场就 announce：**实测 517 ms 下完 16 MiB**。
+两者的对外事实完全一致（`ABSENT` = 休眠 = 不传），而「摘掉」还顺带让公开会话在没人用时真的能停（§7.1）。
+
+- **到手先停，再摘**：元数据一到就在告警线程上 `pause()`，不等 `save_resume_data`（那一步可能要几秒，
+  而回环上 16 MiB 只要几百毫秒 —— 不掐住就会在「休眠」的名义下真下完一整份，实测出现过 16 MiB / 16 MiB）。
+  暂停不影响 `save_resume_data`（纯磁盘操作）。
+- 摘掉是**异步**的（`huchuan-pub-retire` 单线程）：它可能发生在 libtorrent 的告警线程上，那条线只该入队，不该改会话。
+- **顺序不能反**：先摘 torrent 再取 `.torrent` 字节，`save_resume_data` 就取不到东西，缓存写不下来、
+  下一次激活只能重拉元数据（实测会退化成 `bad_metadata`）。所以退场点在「缓存落盘之后」。
+- 缓存的 `.torrent` 只有 info 字典（`SAVE_INFO_DICT` 的产物，**不带 announce**）：从缓存加种时必须把磁力的 `tr`
+  原样补挂回去（`PublicBtSession.addTorrent(..., trackers = ...)`），否则只剩 DHT 一条路 —— 实测「按缓存激活」
+  干等 20 s 以上连不上做种者。续种（`resumeSeeds`）走同一条路，同样补挂。
+- 后台补元数据那条路（导入早超时、元数据几分钟后才到）同样退场，`importOnly` 在建任务时就记下了、重建 Task 时带着走。
+
+**状态与真实一致：唯一事实源 `GroupRuntime.kernelState`**
+
+```kotlin
+enum class KernelState { ABSENT, PARKED, WAITING_METADATA, DOWNLOADING, SEEDING }
+group.kernelState(fileId)   // 宿主 state 字段的唯一判据
+group.localRole(fileId)     // = kernelState 的投影：只有真在传才 DOWNLOADING
+```
+
+判定顺序：不在会话里 → `ABSENT`；进做种集合或 `isFinished` → `SEEDING`；`isPaused` → `PARKED`；
+`!hasMetadata` → `WAITING_METADATA`；其余 `DOWNLOADING`。
+
+- **为什么不再拿本地任务表（`localTasks`）当判据**：磁力导入把 torrent 加进了公开会话、任务表里却没有这一条，
+  这正是本次缺陷的形状。任务表只回答「谁该被拨号 / 谁该被巡查」，**不回答「内核在不在传」**。
+- 改法对照：修复前 `localRole` 只查 `localTasks`，导入的条目永远 `NONE` → 界面「休眠」；现在 `localRole` 查
+  `kernelState`，`PARKED` 与「真在下载」分得开，**界面读到的状态不可能比内核更激进**。
+- 宿主不用改判定：daemon 的 `state` / `role` / `paused` 与 app 的 `M1GroupStore` 都从这两个口出（app/ 本轮未改）。
+
+**字节级进度（`progressPercent` 太粗的另一半）**
+
+| 读口 | 数据来源 | 口径 |
+|---|---|---|
+| `group.downloadedBytes(fileId)` | libtorrent `total_wanted_done`（取不到退回 `total_done`） | 已完成且校验过的字节；不在会话里 / 无元数据 = 0 |
+| `group.totalBytes(fileId)` | `total_wanted`（取不到退回 `total`，再退回条目 `size`） | 这个 torrent 要下的总字节 |
+| `group.percent(fileId)` | 有总量时**向下取整 `done*100/total`**，否则退回 `progress()` | 与字节同源，不会出现「百分比涨了字节没动」 |
+
+`progressPercent` 保留（页面在用），但它不再是唯一判据：21.4 GB 的种子 1% = 214 MB，只有字节数看得出「8 MB 真的动了」。
+
+**公开会话诊断读口**（`kernel.publicDiagnostics()` → daemon `/api/state.public`）
+
+| 字段 | 来源 | 以前为什么拿不到 |
+|---|---|---|
+| `dhtNodes` / `dhtRunning` | 公开会话自己的 `SessionManager` | `/api/state.daemon.dhtNodes` 读的是私有会话（DHT 关，恒 0） |
+| `trackers[]`：`ok` / `state` / `lastAnnounceAt` / `nextAnnounceInMs` / `nextAnnounceAt` / `peers` / `failures` / `error` | `tracker_announce` / `tracker_reply` / `tracker_error` 告警 | 公开会话 `alert_mask` 不含 tracker 类，TrackerAlert 根本不到 |
+| `peers[]`：`endpoint` / `connected` / `seed` | `peer_info` 快照（与队友数同一个口径） | 没有读口，归因只能靠 netstat 猜 |
+
+- 为了让 tracker 结果可读，公开会话 `alert_mask` 多了 `tracker` 类（`0x4d` → 含 `TRACKER_NOTIFICATION`）；
+  **dht / peer / ip_block 仍然不订**（`ip_block` 正是 §3.8 那条崩溃的类别）。tracker 告警只写诊断表，不参与任何判定。
+- `next_announce` 的单位是**毫秒**（实测：2 s 采样每次减 2000；挂起中是 0 —— 暂停的 torrent 不排 announce）。
+  这是一开始按「秒」写、读出来是 64000 这种没人能用的数之后，用一次性探针钉住的口径。
+- 挂起中的 torrent 会断开 peer：诊断里 `peers` 为空是**正确**的，不是缺陷。
+
+**验收**（`harness/PublicSwarmSelfTest.java` 第 7 组，检查名 `public.park_*` / `public.activate_*` / `public.diag_*`）
+
+装置：本机一个公开会话做种 16 MiB + 一个本机 BEP 3 tracker 牵线 + 一个真内核跑 导入 → 激活 → 休眠 → 再激活。
+
+| 断言 | 判据 | 打红方式 |
+|---|---|---|
+| `public.park_kernel_state` / `park_not_in_session` / `park_role_none` / `park_bytes_zero` / `park_percent_zero` | 导入（元数据已到手）后是 `ABSENT`、会话里 0 个任务、角色 `NONE`、字节 0、百分比 0 | 把 `addMagnet` 的 `importOnly` 改回 false |
+| `public.park_no_data_on_disk` / `park_bytes_still_zero` | 休眠 3 s 后 `<data>/public/data/<name>` 长度 0（或不存在）、字节仍为 0 | 同上 |
+| `public.activate_started` / `activate_downloading` / `activate_percent_matches_bytes` / `activate_total_bytes` | 激活后进入 `DOWNLOADING` 或 `SEEDING`、字节在涨、`percent == floor(bytes*100/total)`、总量 = 种子大小 | 让 `localRole` 退回读 `localTasks` |
+| `public.park_metadata_received` / `park_torrent_cached` | 元数据到手、`.torrent` 落进 `<data>/public/meta` | 提前摘 torrent（`save_resume_data` 取不到字节） |
+| `public.download_seeding` / `download_percent_100` | 下完转 `SEEDING`、百分比 100 | — |
+| `public.hibernate_*` | 休眠后 `ABSENT`、角色 `NONE`、内核字节回 0 | — |
+| `public.reactivate_*` | 再激活能从 `.torrent` 缓存挂回来并立刻做种 | — |
+| `public.diag_*` | DHT 在跑、tracker `replied`、下次 announce 有绝对时刻、激活后看得到做种端点 | 去掉 tracker 告警类别 / 把 diagnostics 写死 |
+
+**边界**
+
+- 挂起的导入任务仍留在会话里（这是「暂停该 torrent 直到 activate」的本义）。§7.1 的「全部休眠即 stop」
+  因此按「会话里还有任务」判：只有休眠（`stopFile`）或移除才会把会话停掉，退出活性由那条路径保证。
+- 元数据没到手时 torrent 不挂起（否则永远拿不到 info 字典）——这一段的字节数是恒 0，不是「偷偷在下」。
+- 本轮不动 `app/`、`windows/resources/web/`、`pages/`、`worker/`：宿主读的是同一批字段，多出来的
+  `downloadedBytes` / `totalBytes` / `paused` / `public.*` 对老页面是无害的多余字段。
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。

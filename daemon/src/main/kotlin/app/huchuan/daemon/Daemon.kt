@@ -35,6 +35,11 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
     /** stop 是幂等的：Main 的正常退出路径与 JVM 的 shutdown hook 会各调一次。 */
     private val stoppedOnce = AtomicBoolean(false)
     private val highWater = java.util.Collections.synchronizedMap(HashMap<String, Int>())
+    /**
+     * 字节数的高水位：休眠之后 torrent 已经不在会话里，内核答 0；界面上的「已下载 N B」不能跟着掉回 0。
+     * 与 [highWater] 同一个口径（只涨不落），两者描述的是同一件事的两种粒度。
+     */
+    private val bytesHighWater = java.util.Collections.synchronizedMap(HashMap<String, Long>())
     private val stopLatch = CountDownLatch(1)
     private var ticker: Thread? = null
     private var lastTransferSignature = ""
@@ -266,7 +271,8 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
                 if (role == GroupRuntime.LocalRole.NONE) continue
                 val pct = g.percent(f.fileId)
                 updateHighWater(f.fileId, pct)
-                sb.append(f.fileId).append(':').append(pct)
+                // 字节数也进签名：百分比不动、字节在动的时候（大种子的头几百 MB）页面照样要刷。
+                sb.append(f.fileId).append(':').append(pct).append(':').append(g.downloadedBytes(f.fileId))
                     .append(':').append(g.downloadRateBps(f.fileId))
                     .append(':').append(g.uploadRateBps(f.fileId))
                     .append(':').append(g.peerCount(f.fileId))
@@ -375,7 +381,64 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
             ),
             "device" to deviceJson(),
             "settings" to settingsJson(),
+            // 公开会话的诊断读口（dhtNodes / tracker announce 结果 / 当前 peer 端点）。
+            // 以前这三样只能靠外部探针与 netstat 猜，见 docs/reports/public-swarm-real-world.md 风险 3。
+            "public" to publicJson(),
             "groups" to jarr(groups.map { groupJson(it, withComments = true) }),
+        )
+    }
+
+    /**
+     * 公开会话诊断（`/api/state.public`）：DHT 节点数、每个 tracker 的 announce 结果与下次时间、
+     * 当前 peer 端点列表。数据全部来自内核（[M1Kernel.publicDiagnostics]），daemon 只做投影，
+     * 一个数都不推算。会话没起来时给一份 `running=false` 的空表 —— 「没在跑」也是答案。
+     *
+     * 为什么不放在 `daemon` 块里：那个块的每个字段都是私有会话 / 进程本身的读数（`dhtNodes` 甚至是
+     * 私有 DHT，恒 0）；公开会话是另一套 SessionManager，混在一起又会回到「读的是谁」这个问题上。
+     */
+    fun publicJson(): J.Obj {
+        val d = kernel?.publicDiagnostics()
+            ?: return jobj(
+                "running" to jbool(false),
+                "port" to jnum(0),
+                "torrents" to jnum(0),
+                "dhtNodes" to jnum(0),
+                "dhtRunning" to jbool(false),
+                "portMapping" to jbool(false),
+                "lastError" to jstr("daemon 还没起好"),
+                "trackers" to jarr(emptyList()),
+                "peers" to jarr(emptyList()),
+            )
+        return jobj(
+            "running" to jbool(d.running),
+            "port" to jnum(d.port.toLong()),
+            "torrents" to jnum(d.torrents.toLong()),
+            "dhtNodes" to jnum(d.dhtNodes),
+            "dhtRunning" to jbool(d.dhtRunning),
+            "portMapping" to jbool(d.portMapping),
+            "lastError" to jstr(d.lastError),
+            "trackers" to jarr(d.trackers.map { t ->
+                jobj(
+                    "fileId" to jstr(t.fileId),
+                    "url" to jstr(t.url),
+                    "ok" to jbool(t.ok),
+                    "state" to jstr(t.state),
+                    "lastAnnounceAt" to jnum(t.lastAnnounceAt),
+                    "nextAnnounceInMs" to jnum(t.nextAnnounceInMs),
+                    "nextAnnounceAt" to jnum(t.nextAnnounceAt),
+                    "peers" to jnum(t.peers.toLong()),
+                    "failures" to jnum(t.failures.toLong()),
+                    "error" to jstr(t.error),
+                )
+            }),
+            "peers" to jarr(d.peers.map { p ->
+                jobj(
+                    "fileId" to jstr(p.fileId),
+                    "endpoint" to jstr(p.endpoint),
+                    "connected" to jbool(p.connected),
+                    "seed" to jbool(p.seed),
+                )
+            }),
         )
     }
 
@@ -469,21 +532,29 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
     }
 
     fun fileJson(g: GroupRuntime, f: FileEntry, withComments: Boolean = false): J.Obj {
-        val role = g.localRole(f.fileId)
-        val live = role != GroupRuntime.LocalRole.NONE
-        val percent = if (live) g.percent(f.fileId).also { updateHighWater(f.fileId, it) } else (highWater[f.fileId] ?: 0)
-        val complete = if (live) g.isComplete(f.fileId) else percent >= 100
-        // role 是「内核里有没有这个文件」，state 是「画面上该显示什么」：
-        // 下载完但还没被内核改判成 SEEDING 的那几百毫秒里，两者必须一致地显示「做种中」。
+        // state / role / 进度只有一个判据：内核真值（GroupRuntime.kernelState）。
+        // 「本机任务表里有没有这一条」只是意图，磁力导入那次缺陷就是两者分叉：界面写「休眠 0%」，
+        // 内核同一时刻在真下载（docs/reports/public-swarm-real-world.md 风险 1、docs/core.md §3.12）。
+        val kernelState = g.kernelState(f.fileId)
+        val attached = kernelState != GroupRuntime.KernelState.ABSENT
+        val seeding = kernelState == GroupRuntime.KernelState.SEEDING
+        val downloading = kernelState == GroupRuntime.KernelState.DOWNLOADING
+        val percent = if (attached) g.percent(f.fileId).also { updateHighWater(f.fileId, it) } else (highWater[f.fileId] ?: 0)
+        // 不在会话里（休眠）时沿用「进度到过 100 就算完整」的老口径；在会话里一律问内核。
+        val complete = if (attached) seeding || g.isComplete(f.fileId) else percent >= 100
+        // 下载完但还没被内核改判成 SEEDING 的那几百毫秒里，role 与 state 必须一致地显示「做种中」。
         val roleName = when {
-            !live -> "none"
-            complete -> "seeding"
-            else -> "downloading"
+            !attached -> "none"
+            complete || seeding -> "seeding"
+            downloading -> "downloading"
+            // 挂着（paused）/ 元数据未到：内核里有任务，但没有在传 —— 与 state=sleeping 对齐。
+            else -> "none"
         }
         val state = when {
-            !live -> "sleeping"
-            complete || role == GroupRuntime.LocalRole.SEEDING -> "seeding"
-            else -> "downloading"
+            !attached -> "sleeping"
+            complete || seeding -> "seeding"
+            downloading -> "downloading"
+            else -> "sleeping"
         }
         val self = kernel?.deviceId ?: ""
         val source = g.memberName(f.addedBy).ifEmpty { if (f.addedBy == self) options.deviceName else f.addedBy.take(8) }
@@ -505,15 +576,28 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         fields["state"] = jstr(state)
         fields["role"] = jstr(roleName)
         fields["progressPercent"] = jnum(percent.toLong())
+        // 字节级进度（内核真值）：percent 是整数，21.4 GB 的种子 1% = 214 MB，看不出「8 MB 真的动了」。
+        // 两个字段永远同源、同时给：totalBytes = 0 表示「内核还不知道总量」（元数据未到手 / 不在会话里）。
+        val downloaded = if (attached) {
+            val bytes = g.downloadedBytes(f.fileId)
+            if (bytes > (bytesHighWater[f.fileId] ?: 0L)) bytesHighWater[f.fileId] = bytes
+            bytes
+        } else {
+            bytesHighWater[f.fileId] ?: 0L
+        }
+        fields["downloadedBytes"] = jnum(downloaded)
+        fields["totalBytes"] = jnum(if (attached) g.totalBytes(f.fileId) else if (f.size > 0) f.size else 0L)
+        // 内核里这条 torrent 挂着等激活（磁力导入之后、点激活之前）：界面仍是「休眠」，但确实是挂着而不是没挂。
+        fields["paused"] = jbool(attached && kernelState == GroupRuntime.KernelState.PARKED)
         fields["complete"] = jbool(complete)
-        fields["seeders"] = jnum((if (live) g.peerCount(f.fileId) else 0).toLong())
+        fields["seeders"] = jnum((if (attached) g.peerCount(f.fileId) else 0).toLong())
         fields["teammates"] = jnum(teammates.toLong())
         fields["uploadLimitKbps"] = jnum(uploadLimit.toLong())
         // 这条单文件限速此刻是不是真在生效：文件挂在会话里、还没到 100%（到 100% 内核会把
         // torrent 限速清零），而且确实设了值。core 没有按 torrent 读回限速的口子（缺口 G9）。
-        fields["uploadLimitInForce"] = jbool(live && !complete && uploadLimit > 0)
-        fields["downloadRateBps"] = jnum(if (live) g.downloadRateBps(f.fileId) else 0L)
-        fields["uploadRateBps"] = jnum(if (live) g.uploadRateBps(f.fileId) else 0L)
+        fields["uploadLimitInForce"] = jbool(attached && !complete && uploadLimit > 0)
+        fields["downloadRateBps"] = jnum(if (attached) g.downloadRateBps(f.fileId) else 0L)
+        fields["uploadRateBps"] = jnum(if (attached) g.uploadRateBps(f.fileId) else 0L)
         fields["commentCount"] = jnum(g.visibleOps(f.fileId).size.toLong())
         fields["savedPath"] = jstr(g.savedFile(f.fileId)?.absolutePath ?: settings.seedPathOf(f.fileId) ?: "")
         fields["magnet"] = jstr(f.magnet)

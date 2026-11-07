@@ -511,8 +511,18 @@ APP_JS=$(get "http://127.0.0.1:$PORT_A/js/app.js")
 STATE_A=$(get "http://127.0.0.1:$PORT_A/api/state")
 
 chk "web.index_served" "$(printf '%s' "$INDEX" | grep -q 'js/data.js' && echo 1 || echo 0)"
-chk "web.app_js_served" "$(printf '%s' "$APP_JS" | grep -q 'function render' && echo 1 || echo 0)"
-chk "web.data_js_talks_to_daemon" "$(printf '%s' "$DATA_JS" | grep -q '/api/state' && echo 1 || echo 0)"
+# app.js 有 70 KB+，比管道缓冲区大：`printf | grep -q` 里 grep 命中就退出，printf 会吃 SIGPIPE，
+# 在 `set -o pipefail` 下整条管道返回非 0 —— 断言会误报「没服务到」。这里改用 shell 通配，不走管道。
+case "$APP_JS" in
+  *"function render"*) APP_JS_OK=1 ;;
+  *) APP_JS_OK=0 ;;
+esac
+chk "web.app_js_served (bytes=${#APP_JS})" "$APP_JS_OK"
+case "$DATA_JS" in
+  *"/api/state"*) DATA_JS_OK=1 ;;
+  *) DATA_JS_OK=0 ;;
+esac
+chk "web.data_js_talks_to_daemon (bytes=${#DATA_JS})" "$DATA_JS_OK"
 chk "web.state_has_group ($GROUP_NAME)" "$(printf '%s' "$STATE_A" | grep -q "$GROUP_NAME" && echo 1 || echo 0)"
 chk "web.state_has_file (payload-32m.bin)" "$(printf '%s' "$STATE_A" | grep -q 'payload-32m.bin' && echo 1 || echo 0)"
 chk "web.state_has_comment" "$(printf '%s' "$STATE_A" | grep -q "$COMMENT_BODY" && echo 1 || echo 0)"
@@ -863,6 +873,36 @@ else
   SIZE_CONTRACT=$([ "$SIZE_KNOWN" = "true" ] && [ "$HAS_SIZE_BYTES" = "1" ] && echo 1 || echo 0)
 fi
 chk "magnet.size_known_contract (sizeKnown=$SIZE_KNOWN sizeBytes=$HAS_SIZE_BYTES)" "$SIZE_CONTRACT"
+
+# 状态口径（docs/core.md §3.12）：导入之后它只能是「休眠 + 0 字节」，一个字节都不能真在下。
+# 这个磁力没有来源，所以 state=sleeping 与「内核确实没在传」是同一件事；有元数据的那条路
+# （导入 → 休眠 → 激活 → 下载）由 harness 的自检第 7 组用真 swarm 钉住。
+chk "magnet.entry_state_sleeping (state=$(sval "$PUB_ENTRY" state))" \
+  "$(printf '%s' "$PUB_ENTRY" | grep -q '"state":"sleeping"' && echo 1 || echo 0)"
+DL_BYTES=$(ival "$PUB_ENTRY" downloadedBytes)
+TOTAL_BYTES=$(ival "$PUB_ENTRY" totalBytes)
+chk "magnet.entry_bytes (downloaded=$DL_BYTES total=$TOTAL_BYTES)" \
+  "$([ "$DL_BYTES" = "0" ] && echo 1 || echo 0)"
+
+# 公开会话诊断读口：/api/state.public 要有真值（DHT / tracker / peer 三块都得在）。
+# 这三个键只出现在 public 块里（文件对象用 seeders，没有 peers），所以直接在整份 state 里找。
+pub_has() { printf '%s' "$STATE_PUB" | grep -q -- "$1"; }
+# DHT 是会话起来之后才 bootstrap 的：给它最多 10 s 把 dhtRunning 变真，别把启动延迟判成缺陷。
+i=0
+while [ "$i" -lt 20 ]; do
+  pub_has '"dhtRunning":true' && break
+  STATE_PUB=$(get "http://127.0.0.1:$PORT_A/api/state")
+  sleep 0.5
+  i=$((i + 1))
+done
+PUB_DIAG_HEAD=$(printf '%s' "$STATE_PUB" | grep -o '"public":{"running":[a-z]*' | head -1)
+chk "magnet.public_diag_block (head=$PUB_DIAG_HEAD)" "$([ -n "$PUB_DIAG_HEAD" ] && echo 1 || echo 0)"
+chk "magnet.public_diag_running ($PUB_DIAG_HEAD torrents=$(printf '%s' "$STATE_PUB" | grep -o '"torrents":[0-9]*' | head -1))" \
+  "$(pub_has '"public":{"running":true' && pub_has '"torrents":1' && echo 1 || echo 0)"
+chk "magnet.public_diag_dht (nodes=$(printf '%s' "$STATE_PUB" | grep -o '"dhtNodes":[0-9]*' | tail -1))" \
+  "$(pub_has '"dhtRunning":true' && pub_has '"dhtNodes":[0-9]' && echo 1 || echo 0)"
+chk "magnet.public_diag_lists" \
+  "$(pub_has '"trackers":\[' && pub_has '"peers":\[' && pub_has '"portMapping":' && echo 1 || echo 0)"
 
 # 同一合法磁力再导入一次：同群按 infohash 去重，第二次是 409 duplicate。
 DUP_STATUS=$(post_file "$MAGNET_URL" "{\"magnet\":\"$PUB_MAGNET\"}" "$ART/import-2.json")

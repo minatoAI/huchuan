@@ -165,6 +165,8 @@ class M1Kernel @JvmOverloads constructor(
         publicBt = PublicBtSession(File(dataDir, PUBLIC_DIR), PublicBtSession.DEFAULT_PORT, events)
         publicBt.onTorrentFinished = { fileId -> onTorrentFinishedAlert(fileId) }
         publicBt.onMetadataArrived = { arrival -> onPublicMetadata(arrival) }
+        // 导入任务退场之后重新判一次「公开会话还要不要留着」（§7.1 的按需启停）。
+        publicBt.onImportRetired = { maybeStopPublicSession() }
 
         // 重启续种（缺口 G2）：state.json 里记着「上次在做种」的条目，会话一起来就按判定挂回去。
         // 放在 PeerServer / mDNS 之前：先让本机有东西可做种，再开始对外通告端口。
@@ -413,6 +415,20 @@ class M1Kernel @JvmOverloads constructor(
     /** 公开会话里的 torrent 数（诊断与验收读口）。 */
     fun publicTorrentCount(): Int = if (this::publicBt.isInitialized) publicBt.torrentCount() else 0
 
+    /**
+     * 公开会话的诊断快照：DHT 节点数、每个 tracker 的 announce 结果与下次时间、当前 peer 端点。
+     *
+     * 宿主（daemon 的 /api/state）直接把它摊成 JSON；会话没起来时是一份 running=false 的空表，
+     * **不抛异常**。这三样以前都没有读口（docs/reports/public-swarm-real-world.md 风险 3），
+     * 口径见 docs/core.md §3.12。
+     */
+    fun publicDiagnostics(): PublicBtSession.Diagnostics =
+        if (this::publicBt.isInitialized) {
+            publicBt.diagnostics()
+        } else {
+            PublicBtSession.Diagnostics(false, 0, 0, 0L, false, false, "", emptyList(), emptyList())
+        }
+
     /** 私有会话里的 torrent 数（诊断与验收读口）。 */
     fun privateTorrentCount(): Int = if (this::bt.isInitialized) bt.torrentCount() else 0
 
@@ -471,9 +487,20 @@ class M1Kernel @JvmOverloads constructor(
     internal fun startPublicDownload(group: GroupRuntime, entry: FileEntry): Boolean {
         val pub = ensurePublicSession() ?: return false
         val cached = pub.cachedTorrent(entry.fileId)
-        val ok = if (cached != null) {
+        val ok = if (pub.has(entry.fileId)) {
+            // 已经在会话里：这是「导入还在找源」的那条任务（还没有元数据）。激活 = 接管它
+            // （清掉「只为取元数据」的标记），不重复加种、也不重拉元数据（docs/core.md §3.12）。
+            pub.adopt(entry.fileId)
+        } else if (cached != null) {
             try {
-                pub.addTorrent(org.libtorrent4j.TorrentInfo(cached), pub.dataDir)
+                // 缓存里的 .torrent 只有 info 字典（导入时 SAVE_INFO_DICT 的产物，不带 announce）：
+                // 磁力里的 tr 要原样补挂回去，否则公开条目只剩 DHT 一条路，激活会干等（实测 > 20 s）。
+                pub.addTorrent(
+                    org.libtorrent4j.TorrentInfo(cached),
+                    pub.dataDir,
+                    false,
+                    MagnetLink.parse(entry.magnet)?.trackers ?: emptyList(),
+                )
             } catch (e: Throwable) {
                 events.log("public_download_bad_torrent", mapOf("file_id" to entry.fileId, "error" to e.toString()))
                 false
@@ -483,8 +510,9 @@ class M1Kernel @JvmOverloads constructor(
             events.log("public_download_no_magnet", mapOf("file_id" to entry.fileId))
             false
         } else {
-            // 没有元数据缓存：把磁力重新挂进公开会话（0 = 不阻塞宿主，元数据由后台继续找）。
-            pub.addMagnet(entry.magnet, pub.dataDir, 0L)
+            // 没有元数据缓存：把磁力挂进公开会话（0 = 不阻塞宿主，元数据由后台继续找）。
+            // 这条是**激活**路径，importOnly=false：元数据一到就开始下载，不再退场一次。
+            pub.addMagnet(entry.magnet, pub.dataDir, 0L, false)
             pub.has(entry.fileId)
         }
         if (!ok) {
@@ -856,6 +884,9 @@ class M1Kernel @JvmOverloads constructor(
     internal fun maybeStopPublicSession() {
         if (!this::publicBt.isInitialized || !publicBt.isRunning) return
         if (allGroups().any { it.hasActivePublicTask() }) return
+        // 会话里还有任务同样算「有事做」：磁力导入在等元数据的那条就不是本地任务，
+        // 只看任务表会在别的导入还没等到元数据时把会话停掉（把它那条 torrent 一起带走）。
+        if (publicBt.torrentCount() > 0) return
         publicBt.stop()
         // 端口已经没了：重报一条 pubBtPort=0，对端下一轮就会跳过公开拨号。
         broadcastPeerAnnounceAll()

@@ -539,6 +539,41 @@ class BtSession(
         return st.isFinished
     }
 
+    /**
+     * 挂起判定读的是 **torrent 自己的 flags**（libtorrent 的 `torrent_flags::paused`），
+     * 不是我们记的某张表：宿主问的是「内核此刻在不在传」，只有一个答案来源。
+     */
+    override fun isPaused(fileId: String): Boolean {
+        val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return false
+        return try {
+            (handle.flags.to_int() and PAUSED_BIT) != 0
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    override fun hasMetadata(fileId: String): Boolean {
+        val st = status(fileId, false) ?: return false
+        return st.hasMetadata()
+    }
+
+    /**
+     * 字节级进度：`total_wanted_done` 是「想要的片里已经完成且校验过的字节数」，
+     * 比 `progress()` 的浮点比例细，也比 `total_done` 诚实（后者把不需要的文件也算进来）。
+     * 都取不到时退回 `total_done`，再取不到就是 0。
+     */
+    override fun downloadedBytes(fileId: String): Long {
+        val st = status(fileId, false) ?: return 0L
+        val wanted = st.totalWantedDone()
+        return if (wanted > 0L) wanted else st.totalDone()
+    }
+
+    override fun totalBytes(fileId: String): Long {
+        val st = status(fileId, false) ?: return 0L
+        val wanted = st.totalWanted()
+        return if (wanted > 0L) wanted else st.total()
+    }
+
     override fun peers(fileId: String): Int {
         val st = status(fileId, false) ?: return 0
         return st.numPeers()
@@ -862,6 +897,12 @@ class BtSession(
 
         /** 同一位的整数形式（读回真值用）。 */
         private val SUPER_SEEDING_BIT: Int by lazy { superSeedingFlag().to_int() }
+
+        /**
+         * `torrent_flags::paused` 的位：公开条目「导入后挂起、激活才传」的读回判据
+         * （docs/core.md §3.12）。同样延后取，类加载阶段不碰 swig。
+         */
+        internal val PAUSED_BIT: Int by lazy { TorrentFlags.PAUSED.to_int() }
 
         /**
          * peer_info.flags 的两个位，第一次用时才取。

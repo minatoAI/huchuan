@@ -23,6 +23,7 @@ import org.libtorrent4j.alerts.Alerts;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -118,6 +119,7 @@ final class PublicSwarmSelfTest {
         }
         entries(check);
         publish(check);
+        importParking(check);
         deleteTree(root);
         // 正向证据（可 grep）：这一组断言了几条、红了几条。RESULT=PASS 与它必须同时成立。
         System.out.println("selftest.public checks=" + COUNTS[0] + " failures=" + COUNTS[1]);
@@ -729,6 +731,266 @@ final class PublicSwarmSelfTest {
             deleteTree(dir);
         }
     }
+
+    // ---------------------------------------------------------------- 7. 导入后不下载（状态与内核一致）
+
+    /**
+     * 真实缺陷的回归（docs/reports/public-swarm-real-world.md 风险 1）：磁力导入回了「休眠 0%」，
+     * 但同一时刻公开会话里的 torrent 已经在真下载。判据不是「谁说了什么」而是内核读数：
+     *
+     *   1. 导入之后（元数据与 .torrent 缓存都到手）内核里**没有这条任务**：kernelState=ABSENT、
+     *      字节数 0、盘上无数据 —— 界面写「休眠」时内核必须真的没在传；
+     *   2. 激活之后必须真的在传：kernelState=DOWNLOADING/SEEDING、字节数在涨、percent 与字节自洽；
+     *   3. 休眠之后必须真的停：kernelState=ABSENT、角色 NONE、内核字节数回 0；
+     *   4. 诊断读口要有值：dhtNodes / tracker announce 结果与下次时间 / peer 端点列表。
+     *
+     * 装置是真的：本机一个公开会话做种（16 MiB）、一个本机 BEP 3 tracker（[MockTracker]）负责牵线、
+     * 一个真内核跑导入 → 激活 → 休眠。打红方式：把 [PublicBtSession.addMagnet] 的 importOnly
+     * 改回 false（导入即下载 → 第 1 组红），或者把 GroupRuntime.localRole 改回读本地任务表
+     * （角色永远 NONE → 第 2 组红）。
+     */
+    private static void importParking(BiConsumer<String, Boolean> check) {
+        File root = new File(System.getProperty("java.io.tmpdir"), "huchuan-selftest-park-" + System.nanoTime());
+        root.mkdirs();
+        MockTracker tracker = null;
+        PublicBtSession seeder = null;
+        M1Kernel kernel = null;
+        try {
+            // --- 装置：真种子 + 真做种会话 + 本机 tracker
+            File seedDir = new File(root, "seed-data");
+            seedDir.mkdirs();
+            File payload = new File(seedDir, PAYLOAD_NAME);
+            writeRandom(payload, PAYLOAD_BYTES);
+            tracker = new MockTracker();
+            // 短 interval：导入时 announce 一次拿到做种端点，激活后 libtorrent 会很快再 announce 一次。
+            // 默认的 600 s 会让「激活 → 连上」等上几十秒，测试就变成在等一个与本缺陷无关的超时。
+            tracker.setIntervalSeconds(10, 5);
+            String announce = tracker.baseUrl() + "/announce";
+            byte[] torrentBytes = new TorrentBuilder()
+                    .path(payload)
+                    .setPrivate(false)
+                    .flags(TorrentBuilder.V1_ONLY)
+                    .pieceSize(65536)
+                    .addTracker(announce)
+                    .generate().entry().bencode();
+            TorrentInfo ti = new TorrentInfo(torrentBytes);
+            String fileId = ti.infoHash().toString();
+
+            seeder = new PublicBtSession(new File(root, "seed-public"), SEEDER_PORT, null);
+            int seederPort = seeder.start();
+            boolean offered = seeder.addTorrent(ti, seedDir, true);
+            tracker.addPeer("127.0.0.1", seederPort);
+            check.accept("public.park_seeder_up (port=" + seederPort + ")", offered);
+
+            KernelEvents sink = new KernelEvents() {
+                @Override
+                public void log(String event, Map<String, String> fields) {
+                }
+            };
+            kernel = new M1Kernel(new File(root, "kernel"), "park-selftest", 47490, 53490, sink);
+            kernel.start();
+            GroupRuntime group = kernel.createGroup("导入后不下载");
+
+            String magnet = "magnet:?xt=urn:btih:" + fileId + "&dn=" + PAYLOAD_NAME
+                    + "&tr=" + URLEncoder.encode(announce, "UTF-8");
+            PublicMagnetResult result = kernel.addPublicMagnet(
+                    group.getGroupId(), magnet, PAYLOAD_NAME, METADATA_WAIT_MS);
+            check.accept("public.park_metadata_received (reason=" + result.getReason() + ")", result.getOk());
+            check.accept("public.park_torrent_cached (path=" + result.getMetadataPath() + ")",
+                    !result.getMetadataPath().isEmpty() && new File(result.getMetadataPath()).isFile());
+
+            // --- 1. 导入之后：不在会话里（休眠），一个字节都不下
+            final M1Kernel importing = kernel;
+            // 摘任务是异步的（告警线程只入队）：等它退场，再断言状态。
+            boolean retired = waitUntil(
+                    () -> group.kernelState(fileId) == GroupRuntime.KernelState.ABSENT,
+                    PARK_OBSERVE_MS);
+            check.accept("public.park_kernel_state (state=" + group.kernelState(fileId) + ")", retired);
+            check.accept("public.park_not_in_session (torrents=" + importing.publicTorrentCount() + ")",
+                    importing.publicTorrentCount() == 0);
+            check.accept("public.park_role_none (role=" + group.localRole(fileId) + ")",
+                    group.localRole(fileId) == GroupRuntime.LocalRole.NONE);
+            check.accept("public.park_percent_zero (percent=" + group.percent(fileId) + ")",
+                    group.percent(fileId) == 0);
+            check.accept("public.park_bytes_zero (bytes=" + group.downloadedBytes(fileId) + ")",
+                    group.downloadedBytes(fileId) == 0L);
+            // 停三秒再看：休眠期间内核不该往盘上写一个字节（真缺陷里这 3 s 涨了 10 MB 量级）。
+            // 导入路径最早能在「元数据到手」那一刻叫停（再早连 info 字典都拿不到），所以这里要求 0 字节；
+            // 另一个方向也钉住：三秒里不能有任何增长（增长=还在下）。
+            File onDisk = new File(new File(new File(kernel.getDataDir(), "public"), "data"), PAYLOAD_NAME);
+            long diskAtImport = onDisk.isFile() ? onDisk.length() : 0L;
+            Thread.sleep(PARK_OBSERVE_MS);
+            long diskBytes = onDisk.isFile() ? onDisk.length() : 0L;
+            check.accept("public.park_no_data_on_disk (at_import=" + diskAtImport + " after_3s=" + diskBytes + ")",
+                    diskAtImport == 0L && diskBytes == 0L);
+            check.accept("public.park_bytes_still_zero (bytes=" + group.downloadedBytes(fileId) + ")",
+                    group.downloadedBytes(fileId) == 0L);
+
+
+            // --- 3. 激活：真的开始下载，且 state 与字节数自洽
+            check.accept("public.activate_started", group.startDownload(fileId));
+            // 4 MiB 走回环可能一瞬间就下完：从激活那一刻起每 5 ms 采一次样，
+            // 同时收集「字节真的动了」与「诊断读口里真的出现了对端」这两个事实。
+            final boolean[] sawBytes = {false};
+            final StringBuilder endpoints = new StringBuilder();
+            boolean observed = observeTransfer(group, fileId, importing, ACTIVATE_WAIT_MS, sawBytes, endpoints);
+            check.accept("public.activate_downloading (state=" + group.kernelState(fileId)
+                    + " bytes=" + group.downloadedBytes(fileId) + ")", sawBytes[0]);
+            check.accept("public.diag_peers (loopback_seen=" + hasLoopback(endpoints) + " endpoints=" + endpoints + ")",
+                    observed && hasLoopback(endpoints));
+            PublicBtSession.Diagnostics live = kernel.publicDiagnostics();
+            PublicBtSession.Diagnostics.Tracker liveTracker = repliedTracker(live, announce);
+            System.out.println("selftest.info public.diag.live loopback_seen=" + hasLoopback(endpoints)
+                    + " endpoints=" + endpoints
+                    + " dht_nodes=" + live.getDhtNodes()
+                    + " torrents=" + live.getTorrents()
+                    + " next_announce_ms=" + (liveTracker == null ? -1 : liveTracker.getNextAnnounceInMs()));
+            // 诊断读口（DHT / tracker announce / peer 端点）：会话里有任务、真的在传时必须读得到真值。
+            check.accept("public.diag_running (running=" + live.getRunning() + ")", live.getRunning());
+            check.accept("public.diag_port (port=" + live.getPort() + ")",
+                    live.getPort() >= PublicBtSession.DEFAULT_PORT);
+            check.accept("public.diag_torrents (n=" + live.getTorrents() + ")", live.getTorrents() == 1);
+            check.accept("public.diag_dht (running=" + live.getDhtRunning() + " nodes=" + live.getDhtNodes() + ")",
+                    live.getDhtRunning() && live.getDhtNodes() >= 0L);
+            check.accept("public.diag_tracker_replied (state=" + (liveTracker == null ? "none" : liveTracker.getState())
+                            + " peers=" + (liveTracker == null ? 0 : liveTracker.getPeers()) + ")",
+                    liveTracker != null && liveTracker.getOk() && "replied".equals(liveTracker.getState())
+                            && liveTracker.getLastAnnounceAt() > 0L && liveTracker.getFailures() == 0);
+            check.accept("public.diag_tracker_next_announce (ms=" + (liveTracker == null ? -1 : liveTracker.getNextAnnounceInMs())
+                            + " at=" + (liveTracker == null ? -1 : liveTracker.getNextAnnounceAt()) + ")",
+                    liveTracker != null && liveTracker.getNextAnnounceInMs() > 0L
+                            && liveTracker.getNextAnnounceAt() > liveTracker.getLastAnnounceAt());
+            long done = group.downloadedBytes(fileId);
+            long total = group.totalBytes(fileId);
+            int expected = total > 0L ? (int) (done * 100L / total) : -1;
+            check.accept("public.activate_total_bytes (total=" + total + ")", total == PAYLOAD_BYTES);
+            check.accept("public.activate_percent_matches_bytes (percent=" + group.percent(fileId)
+                    + " expected=" + expected + ")",
+                    expected >= 0 && group.percent(fileId) == expected);
+            check.accept("public.activate_progress_in_range", group.percent(fileId) >= 0 && group.percent(fileId) <= 100);
+
+            boolean finished = waitUntil(() -> group.kernelState(fileId) == GroupRuntime.KernelState.SEEDING,
+                    DOWNLOAD_WAIT_MS);
+            check.accept("public.download_seeding (state=" + group.kernelState(fileId)
+                    + " percent=" + group.percent(fileId) + ")", finished);
+            check.accept("public.download_percent_100 (percent=" + group.percent(fileId) + ")",
+                    group.percent(fileId) == 100);
+
+            // --- 4. 休眠：内核里真停（torrent 摘掉、字节数回 0），界面回「休眠」
+            check.accept("public.hibernate_stopped", group.stopFile(fileId));
+            check.accept("public.hibernate_state_sleeping (state=" + group.kernelState(fileId)
+                    + " role=" + group.localRole(fileId) + ")",
+                    group.kernelState(fileId) == GroupRuntime.KernelState.ABSENT
+                            && group.localRole(fileId) == GroupRuntime.LocalRole.NONE);
+            check.accept("public.hibernate_bytes_zero (bytes=" + group.downloadedBytes(fileId) + ")",
+                    group.downloadedBytes(fileId) == 0L);
+
+            // --- 5. 再激活：从 .torrent 缓存挂回来，立刻能做种（开关两个方向都成立）
+            check.accept("public.reactivate_started", group.startDownload(fileId));
+            check.accept("public.reactivate_seeding (state=" + group.kernelState(fileId) + ")",
+                    waitUntil(() -> group.kernelState(fileId) == GroupRuntime.KernelState.SEEDING, DOWNLOAD_WAIT_MS));
+        } catch (Throwable t) {
+            check.accept("public.park_exception (" + t + ")", false);
+            t.printStackTrace(System.out);
+        } finally {
+            if (kernel != null) {
+                try {
+                    kernel.close();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            if (seeder != null) {
+                try {
+                    seeder.stop();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            if (tracker != null) {
+                try {
+                    tracker.close();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            deleteTree(root);
+        }
+    }
+
+    private static PublicBtSession.Diagnostics.Tracker repliedTracker(
+            PublicBtSession.Diagnostics diag, String url) {
+        for (PublicBtSession.Diagnostics.Tracker t : diag.getTrackers()) {
+            if (t.getUrl().equals(url)) {
+                return t;
+            }
+        }
+        return null;
+    }
+
+    private static boolean anyConnectedPeer(PublicBtSession.Diagnostics diag) {
+        for (PublicBtSession.Diagnostics.PeerEndpoint p : diag.getPeers()) {
+            if (p.getConnected()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 激活之后的观测：从这一刻起每 5 ms 采一次公开会话诊断，直到「字节真的动了」与
+     * 「诊断读口里出现回环对端」两个事实都拿到，或者预算用完。
+     *
+     * 为什么这么密：回环上 16 MiB 可能在几十毫秒里传完，慢采样会把整段传输采样漏掉。
+     * 判据用回环**主机**而不是做种会话的监听端口：连接可能是对端拨进来的，那时 peer_info 给的是
+     * 它的临时源端口。本装置里除做种会话外没有别的回环 peer。
+     */
+    private static boolean observeTransfer(GroupRuntime group, String fileId, M1Kernel kernel,
+                                          long budgetMs, boolean[] sawBytes, StringBuilder endpoints) {
+        long deadline = System.currentTimeMillis() + budgetMs;
+        boolean sawLoopback = false;
+        while (System.currentTimeMillis() < deadline) {
+            for (PublicBtSession.Diagnostics.PeerEndpoint p : kernel.publicDiagnostics().getPeers()) {
+                if (endpoints.indexOf(p.getEndpoint()) < 0) {
+                    endpoints.append(p.getEndpoint()).append(' ');
+                }
+                if (p.getEndpoint().startsWith("127.0.0.1:")) {
+                    sawLoopback = true;
+                }
+            }
+            if (group.downloadedBytes(fileId) > 0L) {
+                sawBytes[0] = true;
+            }
+            if (sawLoopback && sawBytes[0]) {
+                return true;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        return sawLoopback && sawBytes[0];
+    }
+
+    /** 观测到的端点串里有没有回环主机（本机做种会话拨进来 / 被拨出去都算）。 */
+    private static boolean hasLoopback(CharSequence endpoints) {
+        return endpoints.toString().contains("127.0.0.1:");
+    }
+
+    /** 16 MiB：小到几秒下完，又足够让「百分比与字节」可分、连接能被采样到。 */
+    private static final int PAYLOAD_BYTES = 16 * 1024 * 1024;
+    private static final String PAYLOAD_NAME = "park-payload.bin";
+    /** 做种侧的公开会话端口：避开内核默认的 6881 段，免得两边抢同一批端口。 */
+    private static final int SEEDER_PORT = 6960;
+    private static final long METADATA_WAIT_MS = 20000L;
+    private static final long PARK_OBSERVE_MS = 3000L;
+    private static final long DIAG_WAIT_MS = 20000L;
+    private static final long ACTIVATE_WAIT_MS = 90000L;
+    /** 等 peer 端点出现在诊断读口里的上限（激活之后连接要重新建立）。 */
+    private static final long PEER_WAIT_MS = 60000L;
+    private static final long DOWNLOAD_WAIT_MS = 90000L;
 
     // ---------------------------------------------------------------- 工具
 

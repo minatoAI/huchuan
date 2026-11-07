@@ -135,6 +135,8 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
                 "trackerEnabled": true,
                 "trackerBaseUrl": "https://huchuan-a9f.pages.dev",
                 "trackerActive": true, "trackerRestartRequired": false },
+  "public": { "running": false, "port": 0, "torrents": 0, "dhtNodes": 0, "dhtRunning": false,
+              "portMapping": false, "lastError": "", "trackers": [], "peers": [] },
   "groups": [ /* 见 3.2 的群对象；每个文件额外带 comments */ ]
 }
 ```
@@ -146,6 +148,27 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
 跨网发现的四项也在 `settings` 里：`trackerEnabled` / `trackerBaseUrl` 是落盘设置，
 `trackerActive` 是内核此刻有没有在跑，`trackerRestartRequired` 表示两者差一次进程重启
 （内核只在启动时装配 tracker，详见本节的 `/api/settings/tracker`）。
+
+`public` 块是**公开会话**的诊断（`kernel.publicDiagnostics()`，口径见 docs/core.md §3.12）：
+
+```json
+{ "running": true, "port": 6881, "torrents": 1, "dhtNodes": 37, "dhtRunning": true,
+  "portMapping": false, "lastError": "",
+  "trackers": [ { "fileId": "0123…", "url": "http://tracker.example/announce", "ok": true,
+                  "state": "replied", "lastAnnounceAt": 1793921122426,
+                  "nextAnnounceInMs": 202000, "nextAnnounceAt": 1793921324426,
+                  "peers": 8, "failures": 0, "error": "" } ],
+  "peers": [ { "fileId": "0123…", "endpoint": "5.193.143.34:51413",
+               "connected": true, "seed": false } ] }
+```
+
+- `dhtNodes` 是**公开会话自己**的 DHT（`daemon.dhtNodes` 那个读的是私有会话，私有 DHT 恒关、永远是 0）。
+- `trackers[].ok` / `failures` / `error` / `lastAnnounceAt` 来自 libtorrent 的 tracker 告警（本轮才把该类告警
+  加进公开会话的 `alert_mask`），`nextAnnounceInMs` 是内核报的「距下次 announce 的毫秒数」，`nextAnnounceAt` 是它换算出的时刻；
+  挂起中的 torrent 不排 announce，三个字段都是 0。`state` 取值 `replied` / `failed` / `announcing` / `pending`。
+- `peers[]` 是当前 peer 端点（`host:port`，已去掉 `tcp://` / `utp://` 前缀）；挂起（`paused=true`）的条目会断开 peer，
+  所以这时候它是空的 —— 空不等于缺陷。
+- 会话没起来时整块是 `running=false` 加零值/空表，不返回 404，也不抛错。
 
 **为什么带评论**：Web UI 每次刷新只发一个请求。传输中页面每秒重绘，若再按文件拉评论，
 请求数会跟着文件数涨。`/api/state` 是 UI 的唯一读口，评论就一起给；其余接口（`/api/groups`
@@ -298,7 +321,8 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
   "name": "travel-photos.zip", "sizeBytes": 4194304, "pieceSize": 65536,
   "addedAt": 1793921122426, "sourceMember": "WIN11-0715", "sourceDev": "3ACYGKG4Q1Q9R2BP",
   "mine": true, "state": "seeding", "role": "seeding",
-  "progressPercent": 100, "complete": true, "seeders": 0, "teammates": 1,
+  "progressPercent": 100, "downloadedBytes": 4194304, "totalBytes": 4194304, "paused": false,
+  "complete": true, "seeders": 0, "teammates": 1,
   "uploadLimitKbps": 512, "uploadLimitInForce": true,
   "downloadRateBps": 0, "uploadRateBps": 0,
   "commentCount": 1, "savedPath": "E:\\...\\travel-photos.zip",
@@ -318,6 +342,13 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
 - `state`：`seeding` / `downloading` / `sleeping`，是「画面上该显示什么」。
 - `role`：`seeding` / `downloading` / `none`，是「内核里挂没挂这个文件」。两者在下载刚完成的那几百毫秒里
   可能不同步，daemon 统一按 `complete` 归一。
+- `downloadedBytes` / `totalBytes`：**字节级进度**，来自内核（`total_wanted_done` / `total_wanted`）。
+  `progressPercent` 是整数，21.4 GB 的种子 1% = 214 MB，看不出「8 MB 真的动了」；这两个字段才是细判据，
+  且与 `progressPercent` 同源（百分比就是 `downloadedBytes*100/totalBytes` 向下取整）。
+  `totalBytes=0` 表示内核还不知道总量（元数据没到手 / 不在会话里）。休眠之后这两个数保持最后一次读到的值。
+- `paused`：内核里这条 torrent 是不是被 libtorrent 挂着（`torrent_flags::paused`）。正常流程里它是 `false`：
+  磁力导入后条目是**没有任务**的休眠（内核把导入任务摘掉了，见 docs/core.md §3.12），不是「挂着」。
+  这个字段留着是为了让「挂着」与「没任务」在诊断上分得开 —— 两者界面都是「休眠」，但内核事实不同。
 - `seeders`：当前连上的 peer 数（协议里没有「全群做种数」这个概念，缺口 G3）。
 - `teammates`：**队友数**（产品规格 §306 的观测口径），直接来自 `kernel.teammates(gid, fid)`：
   当前与这个文件的 torrent 真互连、对端**不是做种者**、且本机仍处于「部分」的成员数。
@@ -395,6 +426,10 @@ core 没有按 torrent 读回限速的口子（缺口 G9），所以不给「内
   - `message`：内核给的一句中文，成功时为 `""`。
 - `timeoutMs`：等元数据的上限，0–120000，**默认 0 = 不等**。daemon 是异步状态模型，导入立即回包；
   要拿同步结果就显式给（内核默认 60 s）。给 0 时通常回 `no_source`，条目照样在。
+- **导入不等于开始下载**（docs/core.md §3.12）：元数据与 `.torrent` 缓存到手之后，内核把这条任务**从公开会话里摘掉**
+  （休眠），文件对象是 `state=sleeping` + `downloadedBytes=0` + `totalBytes=0`，一个字节都不下；
+  用户在 P4 点「激活」（`POST …/files/{fid}/active {"active":true}`）才按缓存加种开始下载（实测 0.5 s 内出数据）。
+  判据来自 product-spec §1「休眠 = 不参与传输」与 public-swarm §3.1「只有用户主动要它下载（激活）之后才给连不上」。
 - `name`：可选，只用于列表显示（最多 120 字）；不给时依次用元数据里的名字、磁力的 `dn`、
   「未命名种子」。
 
