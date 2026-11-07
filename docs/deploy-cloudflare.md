@@ -1,12 +1,12 @@
 # 部署：Cloudflare Worker（tracker + 信令 + 分享管理）
 
-**已部署，2026-11-06**：<https://huchuan-relay.autoai233.workers.dev>（Worker 名 `huchuan-relay`，免费的 `*.workers.dev` 子域，未绑自定义域名，账户 `f72eb4995b4129225c4761434d61b733`）
+**已部署，2026-11-06**：<https://huchuan-relay.autoai233.workers.dev>（Worker 名 `huchuan-relay`，免费的 `*.workers.dev` 子域，未绑自定义域名，账户 `<your-account-id>`）
 
 - 健康检查：<https://huchuan-relay.autoai233.workers.dev/health> → `{"ok":true,"service":"huchuan-worker","version":"0.1.0","bindings":{"SWARM":true,"REGISTRY":true,"ROOM":true}}`
 - 撤销这次部署（删干净，不留资源）：
 
   ```bash
-  cd worker && CLOUDFLARE_ACCOUNT_ID=f72eb4995b4129225c4761434d61b733 npx --yes wrangler@3 delete --name huchuan-relay
+  cd worker && CLOUDFLARE_ACCOUNT_ID=<your-account-id> npx --yes wrangler@3 delete --name huchuan-relay
   ```
 
 > 用 wrangler **3**（本次是 3.114.17）。v4 的配置格式与命令行为不同，别顺手升级。
@@ -193,11 +193,11 @@ pages/
 cd pages
 
 # 1) 首次：建项目（之后跳过）
-CLOUDFLARE_ACCOUNT_ID=f72eb4995b4129225c4761434d61b733 \
+CLOUDFLARE_ACCOUNT_ID=<your-account-id> \
   npx --yes wrangler@3 pages project create huchuan --production-branch main
 
 # 2) 部署（目录参数必须是 public，函数目录取当前工作目录下的 ./functions）
-CLOUDFLARE_ACCOUNT_ID=f72eb4995b4129225c4761434d61b733 \
+CLOUDFLARE_ACCOUNT_ID=<your-account-id> \
   npx --yes wrangler@3 pages deploy public --project-name=huchuan --branch main
 ```
 
@@ -262,7 +262,7 @@ export async function onRequest({ request }) {
 或者把 Pages 项目删掉：
 
 ```bash
-CLOUDFLARE_ACCOUNT_ID=f72eb4995b4129225c4761434d61b733 \
+CLOUDFLARE_ACCOUNT_ID=<your-account-id> \
   npx --yes wrangler@3 pages project delete huchuan
 ```
 

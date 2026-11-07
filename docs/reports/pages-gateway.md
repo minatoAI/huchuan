@@ -2,7 +2,7 @@
 
 - 日期：2026-11-06 20:32–20:55（Asia/Shanghai）
 - 设备：Mi MIX 2S（5b94673a，Android 13，curl 7.80.0 / Android 系统自带）
-- 账户：`f72eb4995b4129225c4761434d61b733`；wrangler 3.114.17
+- 账户：`<your-account-id>`；wrangler 3.114.17
 - 产物：`pages/`（新增）、`docs/deploy-cloudflare.md` §5、本报告、`artifacts/pages-gateway/`
 - 边界：没动 `worker/`。Worker 的代码、配置、`workers_dev` 全部保持原样，这一层只是转发。
 
