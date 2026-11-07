@@ -292,21 +292,26 @@ final class LinkSelfTest {
         check.accept("link.signal.guest_start", guestClient.start());
         check.accept("link.signal.guest_connected", guestClient.awaitState(LinkState.CONNECTED, 8_000L));
         check.accept("link.signal.sharer_connected", sharer.awaitState(LinkState.CONNECTED, 8_000L));
-        check.accept("link.signal.share_incoming", ownerEvents.incomingCount.get() == 1
-                && !ownerEvents.lastVisitorId.isEmpty());
-        check.accept("link.signal.offer_delivered", guestEvents.offerCount.get() == 1);
-        check.accept("link.signal.offer_signature_verified", verifyOffer(owner, created, guestEvents));
+        // awaitState 在锁内 notify，日志与 stateChanged 回调在其后写；事件类断言一律有界等待，
+        // 不能「看到状态就立刻数事件」。
+        check.accept("link.signal.share_incoming", await(
+                () -> ownerEvents.incomingCount.get() == 1
+                        && !ownerEvents.lastVisitorId.isEmpty(), 3_000L));
+        check.accept("link.signal.offer_delivered", await(
+                () -> guestEvents.offerCount.get() == 1, 3_000L));
+        check.accept("link.signal.offer_signature_verified", await(
+                () -> verifyOffer(owner, created, guestEvents), 3_000L));
 
-        check.accept("link.signal.state_order_sharer",
-                ownerEvents.transitions.contains("IDLE->SIGNALING")
-                        && ownerEvents.transitions.contains("SIGNALING->CONNECTED"));
-        check.accept("link.signal.state_order_guest",
-                guestEvents.transitions.contains("IDLE->SIGNALING")
-                        && guestEvents.transitions.contains("SIGNALING->CONNECTED"));
-        check.accept("link.signal.logs_present",
-                ownerEvents.logEvents.contains("link_open")
+        check.accept("link.signal.state_order_sharer", await(
+                () -> ownerEvents.transitions.contains("IDLE->SIGNALING")
+                        && ownerEvents.transitions.contains("SIGNALING->CONNECTED"), 3_000L));
+        check.accept("link.signal.state_order_guest", await(
+                () -> guestEvents.transitions.contains("IDLE->SIGNALING")
+                        && guestEvents.transitions.contains("SIGNALING->CONNECTED"), 3_000L));
+        check.accept("link.signal.logs_present", await(
+                () -> ownerEvents.logEvents.contains("link_open")
                         && ownerEvents.logEvents.contains("link_connected")
-                        && guestEvents.logEvents.contains("link_offer_verified"));
+                        && guestEvents.logEvents.contains("link_offer_verified"), 3_000L));
 
         MockLinkServer.WsUpgrade sharerUpgrade = server.lastUpgrade("sharer");
         check.accept("link.signal.sharer_ws_auth", sharerUpgrade != null
@@ -450,7 +455,8 @@ final class LinkSelfTest {
         long t0 = System.nanoTime();
         check.accept("link.wait.sharer_start", sharer.start());
         check.accept("link.wait.sharer_open", await(() -> ownerEvents.logEvents.contains("link_open"), 5_000L));
-        check.accept("link.wait.budget_logged", countEvent(ownerEvents, "link_wait") >= 1);
+        check.accept("link.wait.budget_logged",
+                await(() -> countEvent(ownerEvents, "link_wait") >= 1, 3_000L));
 
         // 10 s 处由服务端掐一次连接：重连照旧，但等待预算不因此续满。
         sleepUntil(t0, 10_000L);
@@ -460,6 +466,9 @@ final class LinkSelfTest {
             dropRoom.sharer.close(1001, "test-drop");
         }
         boolean reconnected = await(() -> countEvent(ownerEvents, "link_open") >= 2, 10_000L);
+        // link_reconnect 由 scheduleReconnect 先写日志再排重连任务；这里仍有界等一下，
+        // 不把「日志比 link_open 慢」这种时序当成失败。
+        boolean reconnectLogged = await(() -> countEvent(ownerEvents, "link_reconnect") >= 1, 3_000L);
 
         sleepUntil(t0, 60_000L);
         long waitedMs = (System.nanoTime() - t0) / 1_000_000L;
@@ -468,7 +477,7 @@ final class LinkSelfTest {
                 sharer.getState() == LinkState.SIGNALING && !sharer.isTerminal());
         check.accept("link.wait.sharer_reconnected_during_wait (opens="
                         + countEvent(ownerEvents, "link_open") + " attempts=" + sharer.getReconnectAttempts() + ")",
-                aliveBeforeDrop && reconnected && countEvent(ownerEvents, "link_reconnect") >= 1);
+                aliveBeforeDrop && reconnected && reconnectLogged);
         check.accept("link.wait.sharer_no_timeout_while_waiting", countEvent(ownerEvents, "link_timeout") == 0);
 
         // ---- ② 反向：等待预算只有 3 s（短 TTL）→ 到点 FAILED(wait-expired)，重连不续满 ----
@@ -498,8 +507,10 @@ final class LinkSelfTest {
         check.accept("link.wait.short_reason", "wait-expired".equals(shortSharer.getFailureReason()));
         check.accept("link.wait.short_reconnect_not_refilled (elapsed=" + shortElapsed + "ms)",
                 shortElapsed >= 2_700L && shortElapsed < 3_900L);
-        check.accept("link.wait.short_reconnect_happened", countEvent(shortEvents, "link_reconnect") >= 1);
-        check.accept("link.wait.short_timeout_logged", countEvent(shortEvents, "link_timeout") >= 1);
+        check.accept("link.wait.short_reconnect_happened",
+                await(() -> countEvent(shortEvents, "link_reconnect") >= 1, 3_000L));
+        check.accept("link.wait.short_timeout_logged",
+                await(() -> countEvent(shortEvents, "link_timeout") >= 1, 3_000L));
 
         // ---- ③ 接待完一个访客后仍能接待下一个（等待预算没被一次访问吃光）----
         ShareLookupResult lookup = registry.get(longShare.getToken());
@@ -513,7 +524,8 @@ final class LinkSelfTest {
         check.accept("link.wait.guest1_start", guest1.start());
         check.accept("link.wait.guest1_connected", guest1.awaitState(LinkState.CONNECTED, 8_000L)
                 && sharer.awaitState(LinkState.CONNECTED, 8_000L));
-        check.accept("link.wait.guest1_incoming", ownerEvents.incomingCount.get() == incomingBefore + 1);
+        check.accept("link.wait.guest1_incoming",
+                await(() -> ownerEvents.incomingCount.get() == incomingBefore + 1, 3_000L));
         sharer.markTransferring();
         guest1.markTransferring();
         check.accept("link.wait.guest1_transferring", sharer.awaitState(LinkState.TRANSFERRING, 3_000L)
@@ -522,8 +534,13 @@ final class LinkSelfTest {
         check.accept("link.wait.guest1_done", guest1.awaitState(LinkState.DONE, 3_000L));
         check.accept("link.wait.sharer_back_to_waiting", await(
                 () -> sharer.getState() == LinkState.SIGNALING && !sharer.isTerminal(), 5_000L));
-        check.accept("link.wait.visit_end_logged", countEvent(ownerEvents, "link_visit_end") >= 1
-                && countEvent(ownerEvents, "link_wait") >= 2);
+        // endVisit 先写 link_visit_end、再 setState(SIGNALING)、最后 enterWaiting 写第二个
+        // link_wait；sharer_back_to_waiting 看到 SIGNALING 时后两个事件可能还没落，
+        // 所以这里必须有界等待，不能判完状态就立刻数事件。
+        check.accept("link.wait.visit_end_logged", await(
+                () -> countEvent(ownerEvents, "link_visit_end") >= 1
+                        && countEvent(ownerEvents, "link_wait") >= 2,
+                3_000L));
 
         await(() -> {
             MockLinkServer.Share room = server.shareByToken(longShare.getToken());
@@ -536,7 +553,8 @@ final class LinkSelfTest {
         check.accept("link.wait.guest2_start", guest2.start());
         check.accept("link.wait.guest2_connected", guest2.awaitState(LinkState.CONNECTED, 8_000L)
                 && sharer.awaitState(LinkState.CONNECTED, 8_000L));
-        check.accept("link.wait.guest2_incoming", ownerEvents.incomingCount.get() == incomingBefore + 2);
+        check.accept("link.wait.guest2_incoming",
+                await(() -> ownerEvents.incomingCount.get() == incomingBefore + 2, 3_000L));
         check.accept("link.wait.sharer_not_failed", !sharer.isTerminal());
 
         // ---- ④ 访客口径：15 s 没等来 offer → FAILED(connect-failed) ----
@@ -571,7 +589,8 @@ final class LinkSelfTest {
         check.accept("link.wait.guest_15s_reason", "connect-failed".equals(slowGuest.getFailureReason()));
         check.accept("link.wait.guest_15s_measured (elapsed=" + guestElapsed + "ms)",
                 guestElapsed >= 14_500L && guestElapsed < 20_000L);
-        check.accept("link.wait.guest_15s_logged", countEvent(guestTimeoutEvents, "link_timeout") >= 1);
+        check.accept("link.wait.guest_15s_logged",
+                await(() -> countEvent(guestTimeoutEvents, "link_timeout") >= 1, 3_000L));
 
         // 可 grep 的实测值（断言只判上下界，这里把数字也留进日志）。
         System.out.println("selftest.link.budgets"
