@@ -91,6 +91,8 @@ mkdir -p "$OUT" || die "建目录失败：$OUT"
 
 # ---------------------------------------------------------------- Android
 APK_SIGNER=""
+APK_CERT_SHA=""
+APK_CERT_TEXT=""
 APK_DEBUG=0
 if [ "$ONLY" != "win" ]; then
   if [ "$SKIP_BUILD" = "1" ]; then
@@ -140,20 +142,43 @@ if [ "$ONLY" != "win" ]; then
       die "APK 没有有效签名（$OUT/$APK_NAME）。缺 keystore 时 release 变体按设计不签名，见 docs/release-signing.md；\
    内测要装的话用 scripts/build-android.sh 打 debug 包，别拿未签名包发。"
     fi
-    CERT="$("$SIGNER_BIN" verify --print-certs "$(winpath "$OUT/$APK_NAME")" 2>&1 \
-            | grep -m1 'Signer #1 certificate DN')"
-    if [ -n "$CERT" ]; then
-      APK_SIGNER="${CERT#*: }"
+    # 别按 "Signer #1" 匹配：只有 V2/V3 签名时 apksigner 打印的是 "V2 Signer: certificate DN:"，
+    # 不同 build-tools 版本前缀不一样，认 "certificate DN" 这一段才稳。
+    APK_CERT_TEXT="$("$SIGNER_BIN" verify --print-certs "$(winpath "$OUT/$APK_NAME")" 2>&1 || true)"
+    DN_LINE="$(printf '%s\n' "$APK_CERT_TEXT" | grep -m1 'certificate DN' || true)"
+    SHA_LINE="$(printf '%s\n' "$APK_CERT_TEXT" | grep -m1 'certificate SHA-256 digest' || true)"
+    APK_SIGNER="${DN_LINE#*certificate DN: }"
+    APK_CERT_SHA="${SHA_LINE##*: }"
+    [ "$APK_SIGNER" = "$DN_LINE" ] && APK_SIGNER=""   # 没匹配上时上面那步会原样返回
+    [ "$APK_CERT_SHA" = "$SHA_LINE" ] && APK_CERT_SHA=""
+    if [ -n "$APK_SIGNER" ]; then
       case "$APK_SIGNER" in
         *"Android Debug"*) APK_DEBUG=1 ;;
       esac
       ok "签名证书：$APK_SIGNER"
+      [ -n "$APK_CERT_SHA" ] && ok "证书 SHA-256：$APK_CERT_SHA"
     else
-      warn "apksigner 验过了，但没打印证书 DN。"
+      warn "apksigner 验过了，但没解析出证书 DN（输出格式变了？原始输出见 APK-SIGNATURE.txt）"
     fi
   else
     warn "没找到 apksigner（SDK build-tools），跳过签名校验。"
   fi
+
+  # 签名信息单独落一份，和 SHA256SUMS 并排放：换机器、换 build-tools 之后能对得上证书。
+  {
+    echo "# APK 签名信息"
+    echo
+    echo "- 文件：$APK_NAME"
+    echo "- 证书 DN：${APK_SIGNER:-（未解析出）}"
+    echo "- 证书 SHA-256 指纹：${APK_CERT_SHA:-（未解析出）}"
+    echo "- 校验命令：apksigner verify --print-certs $APK_NAME"
+    echo
+    echo "## apksigner 原始输出"
+    echo
+    echo '```'
+    printf '%s\n' "${APK_CERT_TEXT:-（本机没找到 apksigner，未校验）}"
+    echo '```'
+  } > "$OUT/APK-SIGNATURE.txt" || warn "写 APK-SIGNATURE.txt 失败（不影响发布）"
 fi
 
 # ---------------------------------------------------------------- Windows
@@ -240,7 +265,9 @@ step "写 NOTES.md"
   if [ "$APK_DEBUG" = "1" ]; then
     echo "- APK 是 debug 签名（${APK_SIGNER:-debug keystore}），只适合内部测试，不是发布签名。"
   elif [ -n "$APK_SIGNER" ]; then
-    echo "- APK 签名证书：$APK_SIGNER。首次安装认这个证书；换证书覆盖安装会失败，要先卸载。"
+    echo "- APK 签名证书：$APK_SIGNER"
+    [ -n "$APK_CERT_SHA" ] && echo "- 证书 SHA-256 指纹：$APK_CERT_SHA（apksigner 原始输出见 APK-SIGNATURE.txt）"
+    echo "- 覆盖安装认这个证书，换 keystore 之后必须先卸载旧版。"
   fi
   echo "- APK 只含 arm64-v8a，没有 x86_64 模拟器包与 32 位包。"
   echo "- Windows 包没有代码签名，SmartScreen 会拦一次，选「仍要运行」。"
@@ -254,7 +281,7 @@ step "写 SHA256SUMS"
 (
   cd "$OUT" || exit 1
   rm -f SHA256SUMS
-  for f in "$APK_NAME" "$ZIP_NAME" LICENSE.txt THIRD_PARTY_NOTICES.md; do
+  for f in "$APK_NAME" "$ZIP_NAME" APK-SIGNATURE.txt LICENSE.txt THIRD_PARTY_NOTICES.md; do
     [ -f "$f" ] && sha256sum "$f" >> SHA256SUMS
   done
   [ -s SHA256SUMS ] || exit 1
@@ -265,7 +292,8 @@ step "产物"
 for f in "$OUT"/*; do printf '    %-40s %s\n' "$(basename "$f")" "$(mib "$(bytes_of "$f")")"; done
 
 ASSETS=""
-for f in "$OUT/$APK_NAME" "$OUT/$ZIP_NAME" "$OUT/SHA256SUMS" "$OUT/LICENSE.txt" "$OUT/THIRD_PARTY_NOTICES.md"; do
+for f in "$OUT/$APK_NAME" "$OUT/$ZIP_NAME" "$OUT/APK-SIGNATURE.txt" "$OUT/SHA256SUMS" \
+         "$OUT/LICENSE.txt" "$OUT/THIRD_PARTY_NOTICES.md"; do
   [ -f "$f" ] && ASSETS="$ASSETS $f"
 done
 [ -n "${ASSETS// /}" ] || die "没有可发布的文件"

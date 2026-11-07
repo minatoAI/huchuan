@@ -31,8 +31,10 @@ tag 推送只建 **draft** release：Windows 包自动挂上，APK 由人补传�
 | --- | --- |
 | `Huchuan-<version>-arm64-v8a.apk` | Android arm64-v8a，release keystore 签名 |
 | `Huchuan-windows-x64.zip` | 解压出 `Huchuan/{Huchuan.exe, daemon.jar, runtime/}`，目标机不用装 Java |
-| `SHA256SUMS` | 上面两个文件的校验值 |
+| `APK-SIGNATURE.txt` | APK 的证书 DN、证书 SHA-256 指纹、apksigner 原始输出 |
+| `SHA256SUMS` | 上面文件的校验值 |
 | `NOTES.md` | 发布页正文，`gh release create --notes-file` 用它 |
+| `LICENSE.txt` / `THIRD_PARTY_NOTICES.md` | 随包许可与第三方声明（BSD-3 / MIT 要求二进制分发带声明） |
 
 ## 校验
 
@@ -41,6 +43,8 @@ sha256sum -c SHA256SUMS                                        # macOS / Linux /
 Get-FileHash .\Huchuan-windows-x64.zip -Algorithm SHA256        # Windows PowerShell
 apksigner verify --print-certs Huchuan-<version>-arm64-v8a.apk  # 看签名证书是谁
 ```
+
+自己验出来的证书 DN 与 SHA-256 指纹，应与 `APK-SIGNATURE.txt` 一致；不一致说明包被换过。
 
 ## 已知限制
 
