@@ -203,6 +203,7 @@
     <string name="p8_verify_failed">校验不一致</string>
     <string name="p8_send_failed">发送失败</string>
     <string name="p8_connect_failed">连接失败</string>
+    <string name="p8_unsupported">这台设备的浏览器内核不支持分享链接</string>
     <!-- 结束分享（页面内 / 通知栏同一个动作）：撤销链接 + 停前台服务 -->
     <string name="p8_end">结束分享</string>
     <string name="p8_ended">分享已结束</string>

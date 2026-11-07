@@ -82,9 +82,12 @@ dependencies {
     implementation(libs.compose.material3)
     debugImplementation(libs.compose.ui.tooling)
 
-    // 链接分享（P8/P9）：WebRTC DataChannel（spike 已真机验证）、信令 WebSocket、二维码。
-    // 不进版本目录：这三项只服务 app，不污染 core/daemon 的依赖表。
-    implementation("io.github.webrtc-sdk:android:150.7871.01")
+    // 链接分享（P8/P9）：信令 WebSocket（OkHttp）+ 二维码（zxing）。
+    // 不进版本目录：这两项只服务 app，不污染 core/daemon 的依赖表。
+    //
+    // 这里**没有** io.github.webrtc-sdk：分享端整条 WebRTC 链路改成系统 WebView 承载
+    // （link/LinkWebSender + assets/link/sharer.js），APK 少掉 12.3 MB 的
+    // libjingle_peerconnection_so.so 与约 12.3 MB 的 AAR 类。取舍见 docs/link-share-webview.md。
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // zxing 只用来出 BitMatrix，二维码由 Compose Canvas 自己画（link-share.md §4.2）。
     implementation("com.google.zxing:core:3.5.3")

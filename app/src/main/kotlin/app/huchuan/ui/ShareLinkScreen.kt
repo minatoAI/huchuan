@@ -50,6 +50,7 @@ import app.huchuan.link.LinkCreate
 import app.huchuan.link.LinkLive
 import app.huchuan.link.LinkNotify
 import app.huchuan.link.LinkPhase
+import app.huchuan.link.LinkWebCapability
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
@@ -125,6 +126,8 @@ fun ShareLinkScreen(
     }
 
     val live = controller?.live?.collectAsState()?.value?.get(currentId)
+    // 启动期探到的内核能力（link/LinkWebCapability）：只有明确探到不支持时才是 false。
+    val capability by LinkWebCapability.supported.collectAsState()
     // 通知现在看不看得见决定了 P8 上要不要写那句「离开此页可能中断分享」。
     val notifyVisible = LinkNotify.canShow(context)
 
@@ -153,6 +156,22 @@ fun ShareLinkScreen(
         ) {
             val stored = record
             when {
+                // 浏览器内核不支持（WebView 缺 RTCPeerConnection / createDataChannel）：一句话，不弹窗。
+                // 出口照给：链接要是已经建出来了，用户仍能在这里结束它。
+                capability == false -> {
+                    Text(
+                        text = stringResource(R.string.p8_unsupported),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center,
+                    )
+                    if (stored != null && stored.active()) {
+                        TextButton(onClick = { scope.launch { controller?.revoke(currentId) } }) {
+                            Text(stringResource(R.string.p8_end))
+                        }
+                    }
+                }
+
                 creating -> Text(
                     text = stringResource(R.string.p8_creating),
                     style = MaterialTheme.typography.bodyLarge,
@@ -365,6 +384,7 @@ fun linkFailureLabel(code: String): String = when {
     code == "transfer-timeout" -> stringResource(R.string.p8_transfer_timeout)
     code == "verify" || code == "verify-timeout" -> stringResource(R.string.p8_verify_failed)
     code == "send" -> stringResource(R.string.p8_send_failed)
+    code == "unsupported" -> stringResource(R.string.p8_unsupported)
     else -> stringResource(R.string.p8_connect_failed)
 }
 

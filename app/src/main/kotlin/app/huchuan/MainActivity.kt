@@ -2,10 +2,12 @@ package app.huchuan
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import app.huchuan.link.LinkNotifyRoute
+import app.huchuan.link.LinkWebHost
 import app.huchuan.notify.NotifyRoute
 import app.huchuan.share.ShareInTake
 import app.huchuan.ui.theme.HuchuanTheme
@@ -42,6 +44,20 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+        // 分享链接的发送页面跑在一个隐藏的 1×1 WebView 里（link/LinkWebHost）：给它一个真窗口，
+        // 渲染进程才不会被按"不可见"降频。它挂在 content 的最底层，收不到触摸。
+        val content: ViewGroup? = findViewById(android.R.id.content)
+        if (content != null) LinkWebHost.attach(content)
+    }
+
+    /**
+     * 只把隐藏页面从窗口上摘下来，**不销毁**：Activity 重建（旋转 / 主题变更）或用户返回再进来时，
+     * 正在跑的 PeerConnection 与 DataChannel 不能断 —— 分享要在这之后仍然 available。
+     * 真正的销毁在发送端 close() 里（会话结束时）。
+     */
+    override fun onDestroy() {
+        LinkWebHost.detach()
+        super.onDestroy()
     }
 
     /**

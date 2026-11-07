@@ -162,6 +162,11 @@ class LinkShareController(private val runtime: M1Runtime) {
      */
     suspend fun create(groupId: String, fileId: String): LinkCreate = withContext(Dispatchers.IO) {
         if (!enabled) return@withContext LinkCreate(false, failure = "not-configured")
+        // 浏览器内核不支持（WebView 缺 RTCPeerConnection / createDataChannel）：当场说清楚，
+        // 不去起注定失败的页面与会话（P8 也会显示同一句话）。
+        if (LinkWebCapability.supportedNow().not()) {
+            return@withContext LinkCreate(false, failure = "unsupported")
+        }
         val device = identityOrNull() ?: return@withContext LinkCreate(false, failure = "not-started")
         val group = runtime.kernel.group(groupId) ?: return@withContext LinkCreate(false, failure = "missing-file")
         val entry = group.file(fileId) ?: return@withContext LinkCreate(false, failure = "missing-file")

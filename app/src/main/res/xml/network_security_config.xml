@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  分享链接的页面与文件由 App 自己的 loopback 服务提供（link/LinkHttpServer，127.0.0.1 随机端口）。
+
+  targetSdk >= 28 时明文 HTTP 默认被禁：不写这个文件，WebView.loadUrl("http://127.0.0.1:...")
+  直接 net::ERR_CLEARTEXT_NOT_PERMITTED，表现是白屏（spike 实测）。这里只对回环地址开口子，
+  其余域名照旧禁止明文 —— 线上分享服务（pages.dev）必须是 https。
+
+  注意 127.0.0.1 本身仍是可信来源：页面 isSecureContext=true，crypto.subtle 与
+  RTCPeerConnection 都可用，所以设备身份签名与 WebRTC 不受影响。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

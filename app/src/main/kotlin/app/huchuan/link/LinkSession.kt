@@ -91,7 +91,7 @@ internal class LinkSession(
         update(LinkLive(LinkPhase.INCOMING, visitorId = visitorId))
         closeSender()
         val client = signal ?: return
-        val created = LinkSender(
+        val created = LinkWebSender(
             context = context,
             shareId = record.shareId,
             file = file,

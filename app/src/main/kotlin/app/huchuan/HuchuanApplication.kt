@@ -4,6 +4,7 @@ import android.app.Application
 import android.util.Log
 import app.huchuan.kernel.LocalNetworkPermission
 import app.huchuan.kernel.M1Runtime
+import app.huchuan.link.LinkWebCapability
 
 /** 进程级持有 M1 内核：Activity 重建不影响内核与传输。 */
 class HuchuanApplication : Application() {
@@ -24,5 +25,10 @@ class HuchuanApplication : Application() {
         } else {
             Log.i(LocalNetworkPermission.LOG_TAG, "event=app_kernel_deferred reason=local_network_denied")
         }
+        // 分享链接的能力探测（启动时一次，异步）：这个 WebView 内核有没有 RTCPeerConnection /
+        // crypto.subtle。先跑分支自检（日志里 link_capability_selftest ok=true 就是每条分支都在），
+        // 再按真机结果落 link_capability。探测失败不拦功能，只在 P8 上写一句话。
+        LinkWebCapability.selfCheck()
+        LinkWebCapability.probeAsync(this)
     }
 }
