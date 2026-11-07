@@ -102,6 +102,13 @@ data class GroupFile(
     val magnet: String = "",
     /** 分片大小；0 = 未知（公开条目在元数据到手前就是 0）。 */
     val pieceSize: Int = 0,
+    /**
+     * 已经点了激活、内核还在找源（元数据没到手，`kernelState == ACQUIRING`）。
+     *
+     * 这不是第四种文件状态：它仍然是「休眠」那个状态（没在传、百分比 0），只是用户在 P4 拨了开关，
+     * 界面必须给出反馈 —— 说「正在寻找来源」，开关保持打开（docs/core.md §3.12）。
+     */
+    val searchingSource: Boolean = false,
 ) {
     /** 组队只存在于「部分」（下载中）；队友数 = 同时下载的同组成员 − 1。 */
     val inTeam: Boolean get() = state == FileState.DOWNLOADING && teammates > 0

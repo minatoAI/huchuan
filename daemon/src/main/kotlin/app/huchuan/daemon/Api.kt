@@ -562,6 +562,18 @@ class Api(private val daemon: Daemon) {
             group.stopFile(fileId)
         }
         daemon.bump("file_active")
+        daemon.log.event(
+            "api_file_active",
+            mapOf(
+                "gid" to group.groupId,
+                "file_id" to fileId,
+                "active" to active.toString(),
+                "role_before" to role.name.lowercase(),
+                // 激活之后的内核态：元数据没到手时点激活会立刻变成 acquiring（「正在寻找来源」），
+                // 这一行是可 grep 的证据（docs/core.md §3.12）。
+                "kernel_state" to group.kernelState(fileId).name.lowercase(),
+            ),
+        )
         return ok(jobj("file" to daemon.fileJson(group, entry)))
     }
 

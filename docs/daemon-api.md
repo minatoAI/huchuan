@@ -320,8 +320,9 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
   "id": "2b3017a6c140cea19e2dcb4ec31c2e61b77abb43",
   "name": "travel-photos.zip", "sizeBytes": 4194304, "pieceSize": 65536,
   "addedAt": 1793921122426, "sourceMember": "WIN11-0715", "sourceDev": "3ACYGKG4Q1Q9R2BP",
-  "mine": true, "state": "seeding", "role": "seeding",
-  "progressPercent": 100, "downloadedBytes": 4194304, "totalBytes": 4194304, "paused": false,
+  "mine": true, "state": "seeding", "role": "seeding", "kernelState": "seeding",
+  "progressPercent": 100, "downloadedBytes": 4194304, "diskBytes": 4194304,
+  "totalBytes": 4194304, "paused": false,
   "complete": true, "seeders": 0, "teammates": 1,
   "uploadLimitKbps": 512, "uploadLimitInForce": true,
   "downloadRateBps": 0, "uploadRateBps": 0,
@@ -342,10 +343,23 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
 - `state`：`seeding` / `downloading` / `sleeping`，是「画面上该显示什么」。
 - `role`：`seeding` / `downloading` / `none`，是「内核里挂没挂这个文件」。两者在下载刚完成的那几百毫秒里
   可能不同步，daemon 统一按 `complete` 归一。
+- `kernelState`：内核态的**线上写法**，比 `state` 细一档（docs/core.md §3.12）：
+  `absent`（不在会话里）/ `parked`（挂着等激活）/ `waiting_metadata`（导入后没激活、在等来源）/
+  `acquiring`（**已激活、内核正在找源**，元数据还没到手）/ `downloading` / `seeding`。
+  `state` 只有三个值时，`waiting_metadata` 与 `acquiring` 都被归成 `sleeping`；要区分「放着等来源」
+  与「用户点了激活」只能看这个字段。它也不改 `role`：`acquiring` 的角色仍是 `none`（没有元数据，
+  一个数据字节都没动）。
 - `downloadedBytes` / `totalBytes`：**字节级进度**，来自内核（`total_wanted_done` / `total_wanted`）。
   `progressPercent` 是整数，21.4 GB 的种子 1% = 214 MB，看不出「8 MB 真的动了」；这两个字段才是细判据，
   且与 `progressPercent` 同源（百分比就是 `downloadedBytes*100/totalBytes` 向下取整）。
   `totalBytes=0` 表示内核还不知道总量（元数据没到手 / 不在会话里）。休眠之后这两个数保持最后一次读到的值。
+- `diskBytes`：**已写到磁盘的字节**，与 `downloadedBytes` 并列、不是同一个口径。`downloadedBytes` 只数
+  校验通过的片，长文件上会长时间卡在一个数上（真种子实测 120 s 一字节不涨，同期磁盘 +3 MB）；
+  `diskBytes` = 已校验 + 已落盘但还没凑成完整片的那部分（libtorrent 下载队列里 `finished` 的块）。
+  恒有 `downloadedBytes ≤ diskBytes ≤ totalBytes`，下完时三者相等。判「完成没完成」用
+  `downloadedBytes` / `progressPercent`，判「下了多少 / 在不在动」用 `diskBytes`。
+  不能用 `total_done` 替代它：本产品全部文件都要，`total_done` 与 `total_wanted_done` 恒等
+  （docs/core.md §3.12）。休眠之后同样保持最后一次读到的值。
 - `paused`：内核里这条 torrent 是不是被 libtorrent 挂着（`torrent_flags::paused`）。正常流程里它是 `false`：
   磁力导入后条目是**没有任务**的休眠（内核把导入任务摘掉了，见 docs/core.md §3.12），不是「挂着」。
   这个字段留着是为了让「挂着」与「没任务」在诊断上分得开 —— 两者界面都是「休眠」，但内核事实不同。
@@ -393,6 +407,10 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
 `<data-dir>/downloads`，不区分这两种情况（缺口 G7），所以这一步在 daemon 侧分流。
 磁盘上的文件被改过（内容变了、infohash 不再是这个 id）会返回 409 `E_FILE_CHANGED`。
 
+元数据还没到手时点激活不会失败：内核接管那条找源任务，回包里的 `kernelState` 立刻是 `acquiring`
+（`state` 仍是 `sleeping`、`role` 仍是 `none` —— 没有元数据就没有字节在动），元数据一到自己转
+`downloading`。日志：`api_file_active gid=… file_id=… active=… role_before=… kernel_state=…`。
+
 #### `POST /api/groups/{gid}/files/{fid}/upload-limit`
 
 ```json
@@ -424,11 +442,18 @@ core 没有按 torrent 读回限速的口子（缺口 G9），所以不给「内
   - `fileId`：40 位 hex 的 infohash，就是群里的文件 id。
   - `code`：`""` 表示成功；否则是下面五种之一。
   - `message`：内核给的一句中文，成功时为 `""`。
-- `timeoutMs`：等元数据的上限，0–120000，**默认 0 = 不等**。daemon 是异步状态模型，导入立即回包；
+- `timeoutMs`：**同步等待**元数据的上限，0–120000，默认 0 = 不等。daemon 是异步状态模型，导入立即回包；
   要拿同步结果就显式给（内核默认 60 s）。给 0 时通常回 `no_source`，条目照样在。
+  超时**不结束寻找**：torrent 留在公开会话里继续找源，元数据到手时后台落 `.torrent` 缓存、回填
+  `sizeBytes` / `pieceSize` 并推 WS（内核事件 `public_metadata_arrived`）。真种子实测导入 120 s
+  超时、元数据 15 min 后才到，条目从「等待来源」自己补成带尺寸的正常条目 —— 不是一条静止的记录。
+  这期间文件对象的 `kernelState` 是 `waiting_metadata`（用户点了激活则是 `acquiring`，见 §3.3）。
 - **导入不等于开始下载**（docs/core.md §3.12）：元数据与 `.torrent` 缓存到手之后，内核把这条任务**从公开会话里摘掉**
-  （休眠），文件对象是 `state=sleeping` + `downloadedBytes=0` + `totalBytes=0`，一个字节都不下；
-  用户在 P4 点「激活」（`POST …/files/{fid}/active {"active":true}`）才按缓存加种开始下载（实测 0.5 s 内出数据）。
+  （休眠），文件对象是 `state=sleeping` + `kernelState=absent` + `downloadedBytes=0` + `diskBytes=0` + `totalBytes=0`，
+  一个字节都不下；元数据还没到手时是 `state=sleeping` + `kernelState=waiting_metadata`。
+  用户在 P4 点「激活」（`POST …/files/{fid}/active {"active":true}`）才按缓存加种开始下载（实测 0.5 s 内出数据）；
+  元数据还没到手时点激活，文件对象立刻变成 `kernelState=acquiring`（「正在寻找来源」），元数据一到自己转
+  `downloading` —— 不要求宿主再点一次。
   判据来自 product-spec §1「休眠 = 不参与传输」与 public-swarm §3.1「只有用户主动要它下载（激活）之后才给连不上」。
 - `name`：可选，只用于列表显示（最多 120 字）；不给时依次用元数据里的名字、磁力的 `dn`、
   「未命名种子」。

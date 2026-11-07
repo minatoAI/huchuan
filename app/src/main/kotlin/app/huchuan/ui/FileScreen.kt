@@ -52,7 +52,6 @@ import app.huchuan.HuchuanState
 import app.huchuan.R
 import app.huchuan.core.Comment
 import app.huchuan.core.FileScope
-import app.huchuan.core.FileState
 import app.huchuan.kernel.M1Runtime
 import app.huchuan.ui.theme.brandSwitchColors
 import kotlinx.coroutines.launch
@@ -202,7 +201,7 @@ fun FileScreen(
                 } else {
                     StateChip(
                         text = fileStateLabel(file),
-                        highlighted = file.state != FileState.SLEEPING,
+                        highlighted = file.isActive(),
                     )
                 }
                 // 元数据没到手时没有尺寸可写：左上的状态 chip 已经是「等待来源」，
@@ -303,7 +302,7 @@ fun FileScreen(
                 )
                 Spacer(Modifier.width(Spacing.item))
                 Switch(
-                    checked = file.state != FileState.SLEEPING,
+                    checked = file.isActive(),
                     onCheckedChange = { active ->
                         scope.launch { state.setFileActive(groupId, file.id, active) }
                     },

@@ -699,6 +699,19 @@ class PublicBtSession(
         return if (wanted > 0L) wanted else st.total()
     }
 
+    /**
+     * 会话里这条任务是不是「用户要的」：导入（`importOnly = true`）只为取元数据，不算；
+     * 激活时 [adopt] 把标记清掉，之后元数据一到就开始下（docs/core.md §3.12）。
+     */
+    override fun wantsData(fileId: String): Boolean =
+        synchronized(lock) { tasks[fileId]?.let { !it.importOnly } ?: false }
+
+    override fun diskBytes(fileId: String): Long {
+        val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return 0L
+        val st = status(fileId, false) ?: return 0L
+        return BtSession.diskBytesOf(handle, st)
+    }
+
     override fun savedFile(fileId: String): File? {
         val task = synchronized(lock) { tasks[fileId] } ?: return null
         return File(task.savePath, task.name)

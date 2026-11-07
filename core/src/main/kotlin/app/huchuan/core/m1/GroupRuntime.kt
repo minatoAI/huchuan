@@ -632,8 +632,17 @@ class GroupRuntime internal constructor(
 
     fun isComplete(fileId: String): Boolean = kernel.sessionOf(fileId).isFinished(fileId)
 
-    /** 已下载的字节数（内核真值；不在会话里 / 元数据未到 = 0）。见 [percent] 的口径说明。 */
+    /** 已校验的字节数（内核真值；不在会话里 / 元数据未到 = 0）。见 [percent] 的口径说明。 */
     fun downloadedBytes(fileId: String): Long = kernel.sessionOf(fileId).downloadedBytes(fileId)
+
+    /**
+     * 已写到磁盘上的字节数（内核真值；不在会话里 / 元数据未到 = 0）。
+     *
+     * 与 [downloadedBytes] **不是**同一个口径，别互相替代：前者只数校验通过的片，在长文件上会
+     * 长时间不动；这个读口把「已落盘、还没通过校验」的块也算进来，判「下了多少 / 在不在动」用它。
+     * 两者差别与为什么不用 `total_done` 见 [LocalSession.diskBytes]。
+     */
+    fun diskBytes(fileId: String): Long = kernel.sessionOf(fileId).diskBytes(fileId)
 
     /** 这个文件的总字节数（内核真值）；不在会话里 / 元数据未到时退回条目上的 size（可能是 0 = 未知）。 */
     fun totalBytes(fileId: String): Long {
@@ -664,8 +673,22 @@ class GroupRuntime internal constructor(
         ABSENT,
         /** 在会话里但挂着（导入后等激活）：有 torrent、不传数据。 */
         PARKED,
-        /** 在会话里、没挂起，但 info 字典还没到手：没有任何数据可传（「等待来源」）。 */
+        /**
+         * 在会话里、没挂起，但 info 字典还没到手，而且**用户没点激活**：没有任何数据可传，
+         * 是导入之后「放着等来源」的那一段（界面「等待来源」）。
+         */
         WAITING_METADATA,
+        /**
+         * 同上但没有元数据，而且**用户已经点了激活**：内核正在替这条任务找源（DHT / tracker / peer），
+         * 元数据一到就自动开始下载（界面「正在寻找来源」）。
+         *
+         * 与 [WAITING_METADATA] 的差别只有一个事实：会话里那条任务是「只为取元数据」的导入任务
+         * （`importOnly`），还是用户要的（激活 / adopt 过）。把它单列一个状态，是因为两者在界面上
+         * 该说两句不同的话 —— 「等待来源」是被动的，「正在寻找来源」是用户刚点了开关、必须有反馈的
+         * （docs/reports/public-swarm-recheck.md 问题 1）。它同样**不算在下载**：没有 info 字典时
+         * libtorrent 发不出 piece 请求，一个数据字节都不会动。
+         */
+        ACQUIRING,
         /** 正在传数据。 */
         DOWNLOADING,
         /** 数据完整（或已进做种集合）：做种中。 */
@@ -677,13 +700,19 @@ class GroupRuntime internal constructor(
      *
      * 「挂起」与「没有元数据」都**不算**在下载：libtorrent 在挂起时不发请求，
      * 没有 info 字典时根本发不出 piece 请求 —— 两者都不会让字节数变，界面就不该写「下载中」。
+     *
+     * 没有元数据那一段再按「用户要没要它」分成两态：导入任务（`importOnly`）是 [WAITING_METADATA]
+     * （放着等来源），激活 / adopt 过的是 [ACQUIRING]（内核正在替用户找源）。这一位只看会话里的
+     * 任务标记，不看本地任务表：谁在会话里、以什么身份跑，是 libtorrent 那边的事实。
      */
     fun kernelState(fileId: String): KernelState {
         val session = kernel.sessionOf(fileId)
         if (!session.has(fileId)) return KernelState.ABSENT
         if (seeding.isSeeding(fileId) || session.isFinished(fileId)) return KernelState.SEEDING
         if (session.isPaused(fileId)) return KernelState.PARKED
-        if (!session.hasMetadata(fileId)) return KernelState.WAITING_METADATA
+        if (!session.hasMetadata(fileId)) {
+            return if (session.wantsData(fileId)) KernelState.ACQUIRING else KernelState.WAITING_METADATA
+        }
         return KernelState.DOWNLOADING
     }
 
@@ -696,7 +725,8 @@ class GroupRuntime internal constructor(
     fun localRole(fileId: String): LocalRole = when (kernelState(fileId)) {
         KernelState.SEEDING -> LocalRole.SEEDING
         KernelState.DOWNLOADING -> LocalRole.DOWNLOADING
-        KernelState.ABSENT, KernelState.PARKED, KernelState.WAITING_METADATA -> LocalRole.NONE
+        // ACQUIRING 同样不算在传：没有元数据就没有字节，角色不跟着意图走，只跟着事实走。
+        KernelState.ABSENT, KernelState.PARKED, KernelState.WAITING_METADATA, KernelState.ACQUIRING -> LocalRole.NONE
     }
 
     /**

@@ -56,6 +56,8 @@
     <!-- 公开条目（M3）：行内「公开」chip；元数据未到手时状态说「等待来源」 -->
     <string name="p3_scope_public">公开</string>
     <string name="p3_waiting_source">等待来源</string>
+    <!-- 已经点了激活、内核还在找源（元数据没到手）：说「正在寻找来源」，不是「休眠 0%」 -->
+    <string name="p3_finding_source">正在寻找来源</string>
     <string name="p3_members">成员（%1$d 人）</string>
     <string name="p3_state_seeding">做种中</string>
     <string name="p3_state_sleeping">休眠</string>

@@ -120,6 +120,7 @@ final class PublicSwarmSelfTest {
         entries(check);
         publish(check);
         importParking(check);
+        acquiringSource(check);
         deleteTree(root);
         // 正向证据（可 grep）：这一组断言了几条、红了几条。RESULT=PASS 与它必须同时成立。
         System.out.println("selftest.public checks=" + COUNTS[0] + " failures=" + COUNTS[1]);
@@ -918,6 +919,189 @@ final class PublicSwarmSelfTest {
         }
     }
 
+    // ---------------------------------------------------------------- 8. 激活了但还没有元数据
+
+    /**
+     * 「点了激活、内核还在找源」这一段必须是一个**看得见的状态**，元数据一到就自己转下载
+     * （docs/reports/public-swarm-recheck.md 问题 1 与问题 3）。
+     *
+     * 装置是真的：一个本机 tracker、一个**后上线**的公开做种会话、一个真内核。先导入 —— 此刻没有
+     * 做种者，元数据必然拿不到，导入按 §3.1 超时回 no_source，条目与那条「只为取元数据」的任务都留着。
+     * 然后激活（adopt 那条任务），最后做种者上线；中间**不再调用任何接口**，只看内核自己会不会把
+     * 状态从「找源」推到「下载」。
+     *
+     * 打红方式：
+     *   - wantsData 写成恒 true（没激活的导入任务也算 ACQUIRING）→ public.acquire_waiting_state 红；
+     *   - kernelState 不看 importOnly（激活前后一个样）→ public.acquire_kernel_state 红；
+     *   - 激活路径没清掉 importOnly（元数据到手就退场）→ public.acquire_metadata_arrived 红；
+     *   - diskBytes 直接回 downloadedBytes（两个读口同一个口径）→ public.acquire_disk_ahead 红。
+     */
+    private static void acquiringSource(BiConsumer<String, Boolean> check) {
+        File root = new File(System.getProperty("java.io.tmpdir"), "huchuan-selftest-acquire-" + System.nanoTime());
+        root.mkdirs();
+        MockTracker tracker = null;
+        PublicBtSession seeder = null;
+        M1Kernel kernel = null;
+        try {
+            File seedDir = new File(root, "seed-data");
+            seedDir.mkdirs();
+            File payload = new File(seedDir, ACQUIRE_NAME);
+            writeRandom(payload, ACQUIRE_BYTES);
+            tracker = new MockTracker();
+            // 短 announce：做种者上线之后，找源中的客户端要在几秒内拿到端点，别把「周期 announce 慢」
+            // 测成本缺陷。
+            tracker.setIntervalSeconds(2, 1);
+            String announce = tracker.baseUrl() + "/announce";
+            byte[] torrentBytes = new TorrentBuilder()
+                    .path(payload)
+                    .setPrivate(false)
+                    .flags(TorrentBuilder.V1_ONLY)
+                    .pieceSize(65536)
+                    .addTracker(announce)
+                    .generate().entry().bencode();
+            TorrentInfo ti = new TorrentInfo(torrentBytes);
+            String fileId = ti.infoHash().toString();
+
+            KernelEvents sink = new KernelEvents() {
+                @Override
+                public void log(String event, Map<String, String> fields) {
+                }
+            };
+            kernel = new M1Kernel(new File(root, "kernel"), "acquire-selftest", 47492, 53492, sink);
+            kernel.start();
+            final GroupRuntime group = kernel.createGroup("激活后找源");
+
+            String magnet = "magnet:?xt=urn:btih:" + fileId + "&dn=" + ACQUIRE_NAME
+                    + "&tr=" + URLEncoder.encode(announce, "UTF-8");
+            // 没有做种者在线上：导入只等到超时，条目与找源任务都留着（§3.1「无元数据不报错」）。
+            PublicMagnetResult imported = kernel.addPublicMagnet(
+                    group.getGroupId(), magnet, ACQUIRE_NAME, ACQUIRE_IMPORT_WAIT_MS);
+            check.accept("public.acquire_import_no_metadata (reason=" + imported.getReason() + ")",
+                    !imported.getOk() && imported.getEntry() != null
+                            && imported.getEntry().getScope() == FileScope.PUBLIC
+                            && imported.getEntry().getSize() == 0L);
+
+            // --- 1. 导入之后（用户没点激活）：等着，内核不装作用户要它
+            check.accept("public.acquire_waiting_state (state=" + group.kernelState(fileId) + ")",
+                    group.kernelState(fileId) == GroupRuntime.KernelState.WAITING_METADATA);
+            check.accept("public.acquire_waiting_in_session (torrents=" + kernel.publicTorrentCount() + ")",
+                    kernel.publicTorrentCount() == 1);
+            check.accept("public.acquire_waiting_role_none (role=" + group.localRole(fileId) + ")",
+                    group.localRole(fileId) == GroupRuntime.LocalRole.NONE);
+
+            // --- 2. 激活：接管那条任务，状态必须是「正在寻找来源」，不是「休眠」
+            check.accept("public.acquire_started", group.startDownload(fileId));
+            check.accept("public.acquire_kernel_state (state=" + group.kernelState(fileId) + ")",
+                    group.kernelState(fileId) == GroupRuntime.KernelState.ACQUIRING);
+            check.accept("public.acquire_role_none (role=" + group.localRole(fileId) + ")",
+                    group.localRole(fileId) == GroupRuntime.LocalRole.NONE);
+            check.accept("public.acquire_bytes_zero (verified=" + group.downloadedBytes(fileId)
+                            + " disk=" + group.diskBytes(fileId) + ")",
+                    group.downloadedBytes(fileId) == 0L && group.diskBytes(fileId) == 0L);
+
+            // --- 3. 做种者上线：不再调任何接口，只等内核自己把状态推到「下载中」
+            seeder = new PublicBtSession(new File(root, "seed-public"), ACQUIRE_SEEDER_PORT, null);
+            int seederPort = seeder.start();
+            boolean offered = seeder.addTorrent(ti, seedDir, true);
+            check.accept("public.acquire_seeder_up (port=" + seederPort + ")", offered);
+            // 做种侧限速 1 MB/s：回环不限速时这一份几十毫秒就传完，两个字节读口根本来不及分开；
+            // 慢下来以后「已落盘、还没凑成完整片」的块才会稳定出现在磁盘读口里（真种子在公网上
+            // 就是这个形状：字节卡住、磁盘在涨）。
+            seeder.setUploadLimit(fileId, ACQUIRE_UPLOAD_KBPS);
+            // 做种者上线后由它拨进来要元数据。这条测试要钉的是「内核自己会不会转下载」，
+            // 不该被 libtorrent 的 min_announce_interval（默认 5 min，测试里改不动）拖成 5 分钟等待：
+            // tracker 照报，直连也拨一次，两条路都能把对端送上门。
+            tracker.addPeer("127.0.0.1", seederPort);
+            int leecherPort = kernel.publicSessionPort();
+
+            // --- 4. 采样从头开始：回环上 32 MiB 可能几十毫秒就传完，等状态变了再采就晚了。
+            //   同时收集三件事：状态自己从 ACQUIRING 走到 DOWNLOADING、两个字节读口的关系、下完收敛。
+            boolean orderOk = true;
+            boolean diskAhead = false;
+            boolean sawDownloading = false;
+            long samples = 0L;
+            long deadline = System.currentTimeMillis() + ACQUIRE_WAIT_MS;
+            boolean dialed = seeder.connectPeer(fileId, "127.0.0.1", leecherPort);
+            check.accept("public.acquire_seeder_dial (port=" + leecherPort + ")", dialed);
+            boolean finished = false;
+            while (System.currentTimeMillis() < deadline) {
+                long verified = group.downloadedBytes(fileId);
+                long disk = group.diskBytes(fileId);
+                long total = group.totalBytes(fileId);
+                GroupRuntime.KernelState now = group.kernelState(fileId);
+                samples++;
+                if (now == GroupRuntime.KernelState.DOWNLOADING) {
+                    sawDownloading = true;
+                }
+                if (disk < verified) {
+                    orderOk = false;
+                }
+                if (total > 0L && disk > total) {
+                    orderOk = false;
+                }
+                // 磁盘读口比校验读口多出来的那部分 = 已落盘、还没凑成完整片的块。
+                // 它出现就说明两个读口不是同一份数据（也是复验里「字节卡住、磁盘在涨」的那一段）。
+                if (disk > verified) {
+                    diskAhead = true;
+                }
+                if (total > 0L && verified == total) {
+                    finished = true;
+                    break;
+                }
+                if (now == GroupRuntime.KernelState.SEEDING && total > 0L) {
+                    finished = true;
+                    break;
+                }
+                Thread.yield();
+            }
+            System.out.println("selftest.info public.acquire.byte_reads samples=" + samples
+                    + " disk_ahead=" + diskAhead
+                    + " verified=" + group.downloadedBytes(fileId)
+                    + " disk=" + group.diskBytes(fileId)
+                    + " total=" + group.totalBytes(fileId));
+            check.accept("public.acquire_metadata_arrived (state=" + group.kernelState(fileId)
+                    + " total=" + group.totalBytes(fileId) + ")", sawDownloading || finished);
+            check.accept("public.acquire_total_bytes (total=" + group.totalBytes(fileId) + ")",
+                    group.totalBytes(fileId) == ACQUIRE_BYTES);
+            check.accept("public.acquire_bytes_order (samples=" + samples + ")", orderOk);
+            check.accept("public.acquire_disk_ahead", diskAhead);
+            check.accept("public.acquire_download_finished (verified=" + group.downloadedBytes(fileId)
+                    + " total=" + group.totalBytes(fileId) + ")", finished);
+            // 下完那一刻两个读口收敛到同一个数：磁盘读口不是另一份进度，只是更细的同一个进度。
+            check.accept("public.acquire_disk_converges (disk=" + group.diskBytes(fileId)
+                            + " verified=" + group.downloadedBytes(fileId)
+                            + " total=" + group.totalBytes(fileId) + ")",
+                    group.diskBytes(fileId) == group.totalBytes(fileId)
+                            && group.downloadedBytes(fileId) == group.totalBytes(fileId));
+        } catch (Throwable t) {
+            check.accept("public.acquire_exception (" + t + ")", false);
+            t.printStackTrace(System.out);
+        } finally {
+            if (kernel != null) {
+                try {
+                    kernel.close();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            if (seeder != null) {
+                try {
+                    seeder.stop();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            if (tracker != null) {
+                try {
+                    tracker.close();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            deleteTree(root);
+        }
+    }
+
     private static PublicBtSession.Diagnostics.Tracker repliedTracker(
             PublicBtSession.Diagnostics diag, String url) {
         for (PublicBtSession.Diagnostics.Tracker t : diag.getTrackers()) {
@@ -991,6 +1175,20 @@ final class PublicSwarmSelfTest {
     /** 等 peer 端点出现在诊断读口里的上限（激活之后连接要重新建立）。 */
     private static final long PEER_WAIT_MS = 60000L;
     private static final long DOWNLOAD_WAIT_MS = 90000L;
+
+    /**
+     * 「激活了但还没有元数据」那一组：2 MiB + 做种侧 1 MB/s 限速 ≈ 2 s 的可观测窗口。
+     * 不限速的话回环上几十毫秒就传完，两个字节读口的差别根本采不到。
+     */
+    private static final int ACQUIRE_BYTES = 2 * 1024 * 1024;
+    private static final int ACQUIRE_UPLOAD_KBPS = 1024;
+    private static final String ACQUIRE_NAME = "acquire-payload.bin";
+    /** 做种侧端口：与上一组的 6960 错开，避免同一轮里抢端口。 */
+    private static final int ACQUIRE_SEEDER_PORT = 6962;
+    /** 导入只等到这一步就回包：这一次必超时（没有做种者），条目照样留在列表里等来源。 */
+    private static final long ACQUIRE_IMPORT_WAIT_MS = 1500L;
+    /** 做种者上线后「拿元数据 → 自动开下 → 传完」的整段预算（1 MB/s × 2 MiB ≈ 2 s）。 */
+    private static final long ACQUIRE_WAIT_MS = 60000L;
 
     // ---------------------------------------------------------------- 工具
 

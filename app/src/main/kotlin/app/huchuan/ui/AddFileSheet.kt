@@ -41,7 +41,8 @@ import kotlinx.coroutines.launch
  *
  * 不新开页面。本机文件照旧转给 SAF 选择器；磁力链接在这一层里填、点「导入」。
  * 失败一律显示在输入框下一行（内核五个 reason 各一句，§3.1），不弹窗、不要求重试。
- * 导入最长 60 s：进行中按钮变「导入中」，并且不许下滑关掉弹层。
+ * 导入最多同步等 15 s（[app.huchuan.kernel.M1Runtime.importPublicMagnet]）：进行中按钮变「导入中」，
+ * 并且不许下滑关掉弹层。超时不是失败 —— 条目已经建好，列表里显示「等待来源」，元数据到手后自己补上。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

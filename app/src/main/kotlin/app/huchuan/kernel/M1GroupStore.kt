@@ -82,7 +82,12 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
             if (copy.isFile) {
                 rt.shareFile(group, copy)
             } else {
+                // 私有目录里没有副本 = 这条不是本机共享出来的文件，最常见的是**磁力导入的公开条目**
+                // （addedBy 也是本机）。激活它只有一个正确动作：交给内核开始下载，
+                // 元数据没到手时内核会接管那条找源任务并进入「正在寻找来源」（docs/core.md §3.12）。
+                // 这里以前只记一行 reseed_missing 就返回，用户点了激活什么都不会发生。
                 Log.w(M1Runtime.TAG, "event=reseed_missing file_id=" + fileId + " name=" + entry.name)
+                group.startDownload(fileId)
             }
         } else {
             group.startDownload(fileId)
@@ -164,6 +169,9 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
      * 留着只会让「下完但内核还没对账」的文件提前显示成做种中，属于两套口径，故删除。
      */
     fun toGroupFile(group: GroupRuntime, entry: FileEntry): GroupFile {
+        // 内核态是唯一的判据（docs/core.md §3.12）：localRole 只回答「在不在传」，
+        // 「已激活但还在等元数据」那一段要靠 kernelState 才看得见。
+        val kernelState = group.kernelState(entry.fileId)
         val role = group.localRole(entry.fileId)
         val saved = group.savedFile(entry.fileId)
         // 休眠的文件不挂在 BT 会话里，percent() 恒为 0：盘上有完整数据就按 100% 显示。
@@ -212,6 +220,8 @@ class M1GroupStore(private val rt: M1Runtime) : GroupStore {
             scope = entry.scope,
             magnet = entry.magnet,
             pieceSize = entry.pieceSize,
+            // 用户点了激活、内核还在找源（没有元数据）：界面说「正在寻找来源」、开关保持打开。
+            searchingSource = kernelState == GroupRuntime.KernelState.ACQUIRING,
         )
     }
 

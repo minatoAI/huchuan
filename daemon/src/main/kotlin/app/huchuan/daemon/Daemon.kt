@@ -40,6 +40,11 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
      * 与 [highWater] 同一个口径（只涨不落），两者描述的是同一件事的两种粒度。
      */
     private val bytesHighWater = java.util.Collections.synchronizedMap(HashMap<String, Long>())
+    /**
+     * 「已写到磁盘的字节」的高水位，口径与 [bytesHighWater] 相同：休眠之后内核答 0，
+     * 界面上的读数不能跟着掉回 0。
+     */
+    private val diskHighWater = java.util.Collections.synchronizedMap(HashMap<String, Long>())
     private val stopLatch = CountDownLatch(1)
     private var ticker: Thread? = null
     private var lastTransferSignature = ""
@@ -267,12 +272,17 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         val sb = StringBuilder(128)
         for (g in k.groups()) {
             for (f in g.files()) {
-                val role = g.localRole(f.fileId)
-                if (role == GroupRuntime.LocalRole.NONE) continue
+                // 不在任何会话里（休眠 / 从没挂过）的条目不采样；「挂在会话里但没在传」的要采样，
+                // 否则「等待来源 → 正在寻找来源 → 下载中」这三步之间的状态变化推不出去。
+                val kernelState = g.kernelState(f.fileId)
+                if (kernelState == GroupRuntime.KernelState.ABSENT) continue
                 val pct = g.percent(f.fileId)
                 updateHighWater(f.fileId, pct)
                 // 字节数也进签名：百分比不动、字节在动的时候（大种子的头几百 MB）页面照样要刷。
+                // kernelState 一起进签名：激活那一刻字节与百分比都不变，只有它变（等待来源 → 寻找来源）。
                 sb.append(f.fileId).append(':').append(pct).append(':').append(g.downloadedBytes(f.fileId))
+                    .append(':').append(g.diskBytes(f.fileId))
+                    .append(':').append(kernelState.name)
                     .append(':').append(g.downloadRateBps(f.fileId))
                     .append(':').append(g.uploadRateBps(f.fileId))
                     .append(':').append(g.peerCount(f.fileId))
@@ -575,6 +585,10 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         fields["mine"] = jbool(f.addedBy == self)
         fields["state"] = jstr(state)
         fields["role"] = jstr(roleName)
+        // 内核态：state 只有三个值（画面上该显示什么）。没有元数据的那一段在 state 里都是 sleeping，
+        // 但「导入挂着等来源」与「用户点了激活、内核正在找源」是两件事，界面要能说两句不同的话
+        // （docs/core.md §3.12、docs/reports/public-swarm-recheck.md 问题 1）。
+        fields["kernelState"] = jstr(kernelStateWire(kernelState))
         fields["progressPercent"] = jnum(percent.toLong())
         // 字节级进度（内核真值）：percent 是整数，21.4 GB 的种子 1% = 214 MB，看不出「8 MB 真的动了」。
         // 两个字段永远同源、同时给：totalBytes = 0 表示「内核还不知道总量」（元数据未到手 / 不在会话里）。
@@ -586,6 +600,17 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
             bytesHighWater[f.fileId] ?: 0L
         }
         fields["downloadedBytes"] = jnum(downloaded)
+        // 「已写到磁盘的字节」= 已校验 + 已落盘但还没通过校验的块（core 的 diskBytes）。
+        // 与 downloadedBytes 并列、不是同一个口径：downloadedBytes 才是「完成度」，
+        // 这个数才看得出「在不在动 / 下了多少」（docs/core.md §3.12）。
+        val diskBytes = if (attached) {
+            val bytes = g.diskBytes(f.fileId)
+            if (bytes > (diskHighWater[f.fileId] ?: 0L)) diskHighWater[f.fileId] = bytes
+            bytes
+        } else {
+            diskHighWater[f.fileId] ?: 0L
+        }
+        fields["diskBytes"] = jnum(diskBytes)
         fields["totalBytes"] = jnum(if (attached) g.totalBytes(f.fileId) else if (f.size > 0) f.size else 0L)
         // 内核里这条 torrent 挂着等激活（磁力导入之后、点激活之前）：界面仍是「休眠」，但确实是挂着而不是没挂。
         fields["paused"] = jbool(attached && kernelState == GroupRuntime.KernelState.PARKED)
@@ -629,6 +654,21 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
                 "parentId" to jstr(op.parent),
             )
         })
+    }
+
+    /**
+     * 内核态 → 线上写法（docs/daemon-api.md §3.3 文件对象）。
+     *
+     * `state` 是「画面上该显示什么」（三值），这个是 libtorrent 侧的真值（六值）；
+     * 多出来的 `acquiring` 就是「用户点了激活、内核还在找源」那一段。
+     */
+    private fun kernelStateWire(state: GroupRuntime.KernelState): String = when (state) {
+        GroupRuntime.KernelState.ABSENT -> "absent"
+        GroupRuntime.KernelState.PARKED -> "parked"
+        GroupRuntime.KernelState.WAITING_METADATA -> "waiting_metadata"
+        GroupRuntime.KernelState.ACQUIRING -> "acquiring"
+        GroupRuntime.KernelState.DOWNLOADING -> "downloading"
+        GroupRuntime.KernelState.SEEDING -> "seeding"
     }
 
     fun kernelOrNull(): M1Kernel? = kernel

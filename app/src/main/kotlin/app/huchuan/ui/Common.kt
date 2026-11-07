@@ -126,11 +126,22 @@ fun formatRate(bytesPerSecond: Long): String = formatSize(bytesPerSecond) + "/s"
 fun GroupFile.awaitingSource(): Boolean = scope == FileScope.PUBLIC && sizeBytes <= 0
 
 /**
- * 状态文案。三种原有状态不变；公开条目多出的唯一状态是「等待来源」（public-swarm §6.2）——
+ * 开关是不是「开」：在传（做种 / 下载）或者用户已经点了激活、内核还在找源。
+ *
+ * 寻找来源那一段内核读数仍然是「没在传」（[GroupFile.state] 是 SLEEPING、百分比 0），
+ * 但用户刚拨过开关，开关不能自己弹回去 —— 那是「点了激活没反应」的另一半
+ * （docs/reports/public-swarm-recheck.md 问题 1）。
+ */
+fun GroupFile.isActive(): Boolean = state != FileState.SLEEPING || searchingSource
+
+/**
+ * 状态文案。三种原有状态不变；公开条目多出的两种都在「没有元数据」这一段（public-swarm §6.2）——
+ * 放着等来源说「等待来源」，用户点了激活、内核在找源说「正在寻找来源」；
  * 没有元数据就既不能下载也不能做种，说「休眠」等于撒谎。
  */
 @Composable
 fun fileStateLabel(file: GroupFile): String = when {
+    file.searchingSource -> stringResource(R.string.p3_finding_source)
     file.awaitingSource() -> stringResource(R.string.p3_waiting_source)
     file.state == FileState.SEEDING -> stringResource(R.string.p3_state_seeding)
     file.state == FileState.DOWNLOADING -> stringResource(R.string.p3_state_downloading)

@@ -374,12 +374,16 @@ class M1Runtime(context: Context) {
     /**
      * P3 弹层「磁力链接」：交给内核的公开会话导入（public-swarm §3）。
      *
-     * 内核默认**阻塞 60 s** 等元数据（§3.6），调用方必须已经在工作线程上
-     * （HuchuanState.importMagnet 走 withContext(IO)）。内核永不抛异常，五种失败各一句中文，
-     * 这里原样交给界面显示在输入框下一行，不弹窗、不要求重试（§3.1）。
+     * **同步只等 [IMPORT_WAIT_MS]**，不是「等不到就结束」：超时之后内核那条 torrent 仍留在公开会话里
+     * 继续找源，元数据到手时后台落缓存 + 回填尺寸（内核事件 public_metadata_arrived 触发一次界面刷新）。
+     * 真种子实测元数据可能在 15 min 后才到 —— 把同步窗口拉到那么长没有意义，界面只会卡在「导入中」；
+     * 短窗口 +「等待来源」那一行才是正确的表达（docs/core.md §3.12）。
+     *
+     * 调用方必须已经在工作线程上（HuchuanState.importMagnet 走 withContext(IO)）。
+     * 内核永不抛异常，五种失败各一句中文，这里原样交给界面显示在输入框下一行，不弹窗、不要求重试（§3.1）。
      */
     fun importPublicMagnet(groupId: String, magnet: String): MagnetImport {
-        val result = kernel.addPublicMagnet(groupId, magnet)
+        val result = kernel.addPublicMagnet(groupId, magnet, null, IMPORT_WAIT_MS)
         Log.i(
             TAG,
             "event=ui_magnet_import group_id=" + groupId +
@@ -910,6 +914,9 @@ class M1Runtime(context: Context) {
         const val MSG_PORT = 47100
         const val BT_PORT = 51413
         private const val LOCK_TAG = "huchuan-mdns"
+
+        /** 导入磁力时同步等元数据的上限：超时照样入库，后台继续找（见 importPublicMagnet）。 */
+        private const val IMPORT_WAIT_MS = 15_000L
 
         /** 加入群组的追赶窗口上限（比内核的加入超时略长即可）。 */
         private const val JOIN_CATCHUP_MAX_MS = 180_000L

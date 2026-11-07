@@ -483,7 +483,12 @@ class M1Kernel @JvmOverloads constructor(
         return if (entry.scope == FileScope.PUBLIC) SessionRoute.PUBLIC else SessionRoute.PRIVATE
     }
 
-    /** 公开条目「激活」：先在 `<data>/public/meta` 找 .torrent 缓存，没有就把磁力挂进公开会话。 */
+    /**
+     * 公开条目「激活」：先在 `<data>/public/meta` 找 .torrent 缓存，没有就把磁力挂进公开会话。
+     *
+     * 已经在会话里但还没有元数据的那条（导入任务）走 [PublicBtSession.adopt]：接管，变成
+     * [GroupRuntime.KernelState.ACQUIRING]（「正在寻找来源」），元数据一到就开始下。
+     */
     internal fun startPublicDownload(group: GroupRuntime, entry: FileEntry): Boolean {
         val pub = ensurePublicSession() ?: return false
         val cached = pub.cachedTorrent(entry.fileId)

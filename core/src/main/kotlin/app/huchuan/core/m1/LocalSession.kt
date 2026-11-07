@@ -37,12 +37,41 @@ interface LocalSession {
     fun hasMetadata(fileId: String): Boolean
 
     /**
+     * 这条 torrent 是不是「用户要它参与传输」（激活过它）。
+     *
+     * 公开会话里，磁力导入建的那条任务是**只为取元数据**的（`importOnly = true`）：它在会话里
+     * 跑着等 info 字典，用户还没点激活。点激活（[GroupRuntime.startDownload] → `PublicBtSession.adopt`）
+     * 会把这个标记清掉，同一时刻起它元数据一到就开始下。
+     *
+     * 两者在会话里都是「有任务、没元数据、没在传」，但它们是两件事：前者是「等待来源」（放着不管），
+     * 后者是「正在寻找来源」（用户要了，内核在找）。界面靠这一位把「休眠 0%」与「找源中」分开
+     * （docs/core.md §3.12）。私有会话没有导入态（内联种子进来就有元数据），有任务就是 true。
+     */
+    fun wantsData(fileId: String): Boolean
+
+    /**
      * 已完成的**有效字节**（libtorrent 的 `total_wanted_done`，wanted 那部分里已落盘校验过的）。
      *
      * 比整数百分比细一档：21.4 GB 的种子 1% = 214 MB，用它才看得出「8 MB 真的动了」。
      * torrent 不在会话里、或元数据还没到手时返回 0（不是「不知道」，是「确实一个字节都没有」）。
      */
     fun downloadedBytes(fileId: String): Long
+
+    /**
+     * **已经写到磁盘上的字节**：已校验字节 + 已落盘但还没通过校验的块。
+     *
+     * 与 [downloadedBytes] 并列，两者不是同一个口径（不要互相替代）：
+     * - [downloadedBytes] 只数校验通过的片（`total_wanted_done`）—— 判「完成没完成」用它；
+     *   拉大文件时它会长时间停在同一个数上（真种子实测 120 s 一字节不涨，同期磁盘 +3 MB）；
+     * - 这个读口把「已经写进盘、只是还没凑成完整一片」的部分也算进去 —— 判「下了多少 / 在不在动」
+     *   用它。它恒 ≥ [downloadedBytes]，下完那一刻收敛到总量。
+     *
+     * 为什么不是 libtorrent 的 `total_done`：`total_done` 是「我们手上有的字节」，与
+     * `total_wanted_done` 只差「用户不要的片」；本产品的 torrent 全部文件都要，两者恒等，
+     * 换成它读数一个字节都不会变（libtorrent 2.1 参考手册 torrent_status.total_done /
+     * total_wanted_done 原文）。torrent 不在会话里 / 元数据未到手时返回 0。
+     */
+    fun diskBytes(fileId: String): Long
 
     /** 这个 torrent 的总字节（libtorrent 的 `total_wanted`）；不在会话里 / 元数据未到时 0。 */
     fun totalBytes(fileId: String): Long

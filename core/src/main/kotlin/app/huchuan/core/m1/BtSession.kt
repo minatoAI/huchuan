@@ -574,6 +574,15 @@ class BtSession(
         return if (wanted > 0L) wanted else st.total()
     }
 
+    /** 私有会话没有「只为取元数据」的导入态：挂进来的 torrent 都是用户要的。 */
+    override fun wantsData(fileId: String): Boolean = has(fileId)
+
+    override fun diskBytes(fileId: String): Long {
+        val handle = synchronized(lock) { tasks[fileId]?.handle } ?: return 0L
+        val st = status(fileId, false) ?: return 0L
+        return diskBytesOf(handle, st)
+    }
+
     override fun peers(fileId: String): Int {
         val st = status(fileId, false) ?: return 0
         return st.numPeers()
@@ -959,6 +968,36 @@ class BtSession(
                 )
             }
             return out
+        }
+
+        /**
+         * 「已经写到磁盘上的字节」= 已校验 + 已落盘但未校验的块。私有 / 公开两个会话共用这一份口径
+         * （[LocalSession.diskBytes]）。
+         *
+         * 后一半来自 libtorrent 的下载队列（`partial_piece_info`）：`finished` 是「已经写完盘的块数」，
+         * 乘上 `block_size` 就是还没凑成完整片、也就还没通过校验的那部分数据 —— 正是
+         * `total_wanted_done` 在长文件上长时间不动而磁盘在涨的那几 MB。
+         * 只数 `finished`，不数 `writing`（还在写、未必落盘），也不数 `total_payload_download`
+         * （那是本轮收到的字节，含校验失败与重发的重复）；读队列失败就退回「已校验」，
+         * 宁可少算也不编数。结果夹在 [已校验, 总量] 之间。
+         */
+        internal fun diskBytesOf(handle: TorrentHandle, st: TorrentStatus): Long {
+            val verified = st.totalWantedDone().let { if (it > 0L) it else st.totalDone() }
+            val block = try { st.blockSize().toLong() } catch (e: Throwable) { 0L }
+            if (block <= 0L) return verified
+            var partial = 0L
+            try {
+                for (p in handle.downloadQueue) {
+                    val finished = try { p.finished() } catch (e: Throwable) { 0 }
+                    if (finished > 0) partial += finished.toLong() * block
+                }
+            } catch (e: Throwable) {
+                return verified
+            }
+            var sum = verified + partial
+            val total = st.totalWanted().let { if (it > 0L) it else st.total() }
+            if (total > 0L && sum > total) sum = total
+            return if (sum < verified) verified else sum
         }
 
         /** 协议 §4 的 pieceSize 规则 + 「>8192 片则翻倍」。 */

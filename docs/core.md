@@ -1047,7 +1047,9 @@ java -Dlibtorrent4j.jni.path="<core/build/m1-native/libtorrent4j.dll>" -Dfile.en
 |---|---|---|
 | 导入 `addMagnet(..., importOnly = true)` | 加种 → 等 `metadata_received` → **当场 `handle.pause()`** → 等 `save_resume_data` 吐出 info 字典 → 落 `.torrent` 缓存 → 把 torrent 从会话里摘掉 | 没有元数据 `WAITING_METADATA`，摘掉之后 `ABSENT` |
 | 等元数据期间 | torrent 在会话里跑着，但 libtorrent 没有 piece 表，一个数据字节都发不出请求 | `WAITING_METADATA` |
-| 激活 `group.startDownload` → 按缓存加种 | 会话里还有这条（元数据没到手）就 `adopt` 接管；缓存种子在就按它加种（并把磁力的 `tr` 补挂回去）；都没有就按磁力加种且 `importOnly = false` | `DOWNLOADING` |
+| 等元数据**超时之后** | 同上一条：torrent **留在会话里继续找源**，元数据到了照样落缓存 + 回填尺寸（`public_metadata_arrived`）。超时只结束调用方的同步等待，不结束寻找 | `WAITING_METADATA` |
+| 激活 `group.startDownload`（元数据没到手） | 会话里还有这条就 `adopt` 接管（清掉 `importOnly`）：不再退场，元数据一到就开始下 | `ACQUIRING`（「正在寻找来源」） |
+| 激活（元数据已到手） | 缓存种子在就按它加种（并把磁力的 `tr` 补挂回去）；都没有就按磁力加种且 `importOnly = false` | `DOWNLOADING` / `SEEDING` |
 | 休眠 `group.stopFile` | 摘掉 torrent（磁盘文件不动） | `ABSENT` |
 
 **为什么是「摘掉」而不是 `pause()`**：先按字面实现成「元数据到手就 `handle.pause()`」，实测两个问题 ——
@@ -1071,27 +1073,51 @@ java -Dlibtorrent4j.jni.path="<core/build/m1-native/libtorrent4j.dll>" -Dfile.en
 **状态与真实一致：唯一事实源 `GroupRuntime.kernelState`**
 
 ```kotlin
-enum class KernelState { ABSENT, PARKED, WAITING_METADATA, DOWNLOADING, SEEDING }
+enum class KernelState { ABSENT, PARKED, WAITING_METADATA, ACQUIRING, DOWNLOADING, SEEDING }
 group.kernelState(fileId)   // 宿主 state 字段的唯一判据
 group.localRole(fileId)     // = kernelState 的投影：只有真在传才 DOWNLOADING
 ```
 
 判定顺序：不在会话里 → `ABSENT`；进做种集合或 `isFinished` → `SEEDING`；`isPaused` → `PARKED`；
-`!hasMetadata` → `WAITING_METADATA`；其余 `DOWNLOADING`。
+`!hasMetadata` 时再看会话里那条任务是不是用户要的（`LocalSession.wantsData` = `!importOnly`）：
+是 → `ACQUIRING`，不是 → `WAITING_METADATA`；其余 `DOWNLOADING`。
+
+- **为什么要多一个 `ACQUIRING`**（docs/reports/public-swarm-recheck.md 问题 1）：元数据没到手时点激活，
+  内核确实接管了那条任务（`torrent_adopted`），但状态还是 `WAITING_METADATA`、界面写「休眠 0%」，
+  2 分钟 41 次采样没有任何可见反馈 —— 用户看不出「点了激活到底有没有生效」。两个状态在 libtorrent
+  里是同一个事实（有任务、没元数据、没在传），差别只有一位：**这条任务是「只为取元数据」的导入任务，
+  还是用户要的**。这一位在会话里（`Task.importOnly`），不在本地任务表里。
+- `ACQUIRING` 同样**不算在下载**：没有 info 字典发不出 piece 请求，`localRole` 仍是 `NONE`、
+  字节仍是 0。界面拿它说话（「正在寻找来源」），不拿它改进度。
 
 - **为什么不再拿本地任务表（`localTasks`）当判据**：磁力导入把 torrent 加进了公开会话、任务表里却没有这一条，
   这正是本次缺陷的形状。任务表只回答「谁该被拨号 / 谁该被巡查」，**不回答「内核在不在传」**。
 - 改法对照：修复前 `localRole` 只查 `localTasks`，导入的条目永远 `NONE` → 界面「休眠」；现在 `localRole` 查
   `kernelState`，`PARKED` 与「真在下载」分得开，**界面读到的状态不可能比内核更激进**。
-- 宿主不用改判定：daemon 的 `state` / `role` / `paused` 与 app 的 `M1GroupStore` 都从这两个口出（app/ 本轮未改）。
+- 宿主不用改判定：daemon 的 `state` / `role` / `paused` / `kernelState` 与 app 的 `M1GroupStore` 都从这两个口出；
+  app 本轮把 `kernelState` 多投了一位 `GroupFile.searchingSource`（`ACQUIRING` 时界面说「正在寻找来源」、
+  P4 的开关保持打开），其余状态照旧。
 
-**字节级进度（`progressPercent` 太粗的另一半）**
+**字节级进度（`progressPercent` 太粗的另一半），两个字节读口**
 
 | 读口 | 数据来源 | 口径 |
 |---|---|---|
-| `group.downloadedBytes(fileId)` | libtorrent `total_wanted_done`（取不到退回 `total_done`） | 已完成且校验过的字节；不在会话里 / 无元数据 = 0 |
+| `group.downloadedBytes(fileId)` | libtorrent `total_wanted_done`（取不到退回 `total_done`） | **已校验**字节：完成且通过哈希的片。判「完成没完成」用它；不在会话里 / 无元数据 = 0 |
+| `group.diskBytes(fileId)` | `total_wanted_done` + 下载队列里 `partial_piece_info.finished` 的块 × `block_size` | **已写到磁盘**的字节：已校验 + 已落盘但还没凑成完整片（因此还没校验）的部分。判「下了多少 / 在不在动」用它 |
 | `group.totalBytes(fileId)` | `total_wanted`（取不到退回 `total`，再退回条目 `size`） | 这个 torrent 要下的总字节 |
-| `group.percent(fileId)` | 有总量时**向下取整 `done*100/total`**，否则退回 `progress()` | 与字节同源，不会出现「百分比涨了字节没动」 |
+| `group.percent(fileId)` | 有总量时**向下取整 `done*100/total`**，否则退回 `progress()` | 与**已校验**字节同源，不会出现「百分比涨了字节没动」 |
+
+两个读口的关系恒成立：`downloadedBytes ≤ diskBytes ≤ totalBytes`，下完那一刻三者收敛到总量。
+**为什么不拿 `total_done` 当第二个读口**（复验要求核实「`total_done` 还是磁盘分配量」）：
+libtorrent 2.1 的 `total_done` 是「我们手上有的字节」，与 `total_wanted_done` 只差「用户不要的片」，
+本产品的 torrent 全部文件都要，两者恒等 —— 换上去读数一个字节都不会变，`total_done` **不能**修这个低估。
+`diskBytes` 的第二项用的是 `partial_piece_info.finished`（块已写完盘），不是 `writing`（还在写）、
+也不是 `total_payload_download`（本轮收到的字节，含校验失败与重发）；读队列失败就退回「已校验」，
+宁可少算不编数。
+
+**界面用哪个：百分比与「完成」用 `downloadedBytes`，不新增字节行。** 理由：百分比一旦把未校验的块算进去，
+就会在没下完时显示 100%；而「在不在动」在 P4 已经有 ↓ 速率那一行。`diskBytes` 是给宿主与诊断用的细读数
+（daemon 的 `diskBytes` 字段、复验脚本），app 目前没有任何界面元素展示它。
 
 `progressPercent` 保留（页面在用），但它不再是唯一判据：21.4 GB 的种子 1% = 214 MB，只有字节数看得出「8 MB 真的动了」。
 
@@ -1109,9 +1135,21 @@ group.localRole(fileId)     // = kernelState 的投影：只有真在传才 DOWN
   这是一开始按「秒」写、读出来是 64000 这种没人能用的数之后，用一次性探针钉住的口径。
 - 挂起中的 torrent 会断开 peer：诊断里 `peers` 为空是**正确**的，不是缺陷。
 
-**验收**（`harness/PublicSwarmSelfTest.java` 第 7 组，检查名 `public.park_*` / `public.activate_*` / `public.diag_*`）
+**验收**（`harness/PublicSwarmSelfTest.java` 第 7 / 8 组，检查名 `public.park_*` / `public.activate_*` / `public.diag_*` / `public.acquire_*`）
 
-装置：本机一个公开会话做种 16 MiB + 一个本机 BEP 3 tracker 牵线 + 一个真内核跑 导入 → 激活 → 休眠 → 再激活。
+装置（第 7 组）：本机一个公开会话做种 16 MiB + 一个本机 BEP 3 tracker 牵线 + 一个真内核跑 导入 → 激活 → 休眠 → 再激活。
+
+装置（第 8 组 `public.acquire_*`）：先导入一个**还没有做种者**的磁力（必超时回 `no_source`），激活之后
+做种者才上线（做种侧 1 MB/s 限速，让两个字节读口有可观测的窗口）。
+
+| 断言 | 判据 | 打红方式 |
+|---|---|---|
+| `public.acquire_import_no_metadata` | 导入超时但条目仍在（`scope=public`、`size=0`） | 超时就把条目丢了 |
+| `public.acquire_waiting_state` / `waiting_in_session` / `waiting_role_none` | 没激活时 `kernelState=WAITING_METADATA`、torrent 仍在会话里、角色 `NONE` | `wantsData` 恒 true |
+| `public.acquire_started` / `acquire_kernel_state` / `acquire_role_none` / `acquire_bytes_zero` | 激活后 `ACQUIRING`、角色仍 `NONE`、两个字节读口都是 0 | `kernelState` 不看 `importOnly` |
+| `public.acquire_metadata_arrived` / `acquire_total_bytes` | 做种者上线后**不调任何接口**，状态自己走到 `DOWNLOADING`/`SEEDING`，总量 = 种子大小 | 激活路径没清 `importOnly`（元数据到手就退场） |
+| `public.acquire_bytes_order` / `acquire_disk_ahead` | 每次采样 `downloadedBytes ≤ diskBytes ≤ totalBytes`；下载中确实出现过 `diskBytes > downloadedBytes` | `diskBytes` 直接回 `downloadedBytes` |
+| `public.acquire_download_finished` / `acquire_disk_converges` | 下完两个读口都等于总量 | — |
 
 | 断言 | 判据 | 打红方式 |
 |---|---|---|
@@ -1129,8 +1167,14 @@ group.localRole(fileId)     // = kernelState 的投影：只有真在传才 DOWN
 - 挂起的导入任务仍留在会话里（这是「暂停该 torrent 直到 activate」的本义）。§7.1 的「全部休眠即 stop」
   因此按「会话里还有任务」判：只有休眠（`stopFile`）或移除才会把会话停掉，退出活性由那条路径保证。
 - 元数据没到手时 torrent 不挂起（否则永远拿不到 info 字典）——这一段的字节数是恒 0，不是「偷偷在下」。
-- 本轮不动 `app/`、`windows/resources/web/`、`pages/`、`worker/`：宿主读的是同一批字段，多出来的
-  `downloadedBytes` / `totalBytes` / `paused` / `public.*` 对老页面是无害的多余字段。
+- **导入的同步等待不是「找源的总时长」**：`addPublicMagnet(timeoutMs)` 等的是一个同步结果，超时之后
+  torrent 仍在会话里继续找源（真种子实测元数据 15 min 后才到，后台照样补上、条目照样回填尺寸）。
+  所以超时值只决定调用方多久拿到回包，不决定它还能不能被找到：daemon 默认 0（不等），
+  app 的磁力导入等 15 s（`M1Runtime.IMPORT_WAIT_MS`），之后界面靠「等待来源」那一行表达。
+- 本轮不动 `windows/resources/web/`、`pages/`、`worker/`：宿主读的是同一批字段，多出来的
+  `downloadedBytes` / `diskBytes` / `kernelState` / `totalBytes` / `paused` / `public.*` 对老页面是无害的多余字段。
+- app（本轮改了）把 `kernelState` 投到界面：`ACQUIRING` → 「正在寻找来源」且激活开关保持打开，
+  `WAITING_METADATA` → 「等待来源」，其余三态照旧（`M1GroupStore.toGroupFile` / `ui/Common.kt`）。
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。

@@ -883,6 +883,14 @@ DL_BYTES=$(ival "$PUB_ENTRY" downloadedBytes)
 TOTAL_BYTES=$(ival "$PUB_ENTRY" totalBytes)
 chk "magnet.entry_bytes (downloaded=$DL_BYTES total=$TOTAL_BYTES)" \
   "$([ "$DL_BYTES" = "0" ] && echo 1 || echo 0)"
+# 内核态：这条没有来源的公开条目是「等待来源」（waiting_metadata），不是心不在焉的休眠；
+# 两个字节读口同时存在（已校验 / 已写到磁盘），没有元数据时都是 0。docs/core.md §3.12。
+KN_STATE=$(sval "$PUB_ENTRY" kernelState)
+chk "magnet.entry_kernel_state (kernelState=$KN_STATE)" \
+  "$([ "$KN_STATE" = "waiting_metadata" ] && echo 1 || echo 0)"
+DISK_BYTES=$(ival "$PUB_ENTRY" diskBytes)
+chk "magnet.entry_disk_bytes (disk=$DISK_BYTES)" \
+  "$([ "$DISK_BYTES" = "0" ] && echo 1 || echo 0)"
 
 # 公开会话诊断读口：/api/state.public 要有真值（DHT / tracker / peer 三块都得在）。
 # 这三个键只出现在 public 块里（文件对象用 seeders，没有 peers），所以直接在整份 state 里找。
@@ -903,6 +911,18 @@ chk "magnet.public_diag_dht (nodes=$(printf '%s' "$STATE_PUB" | grep -o '"dhtNod
   "$(pub_has '"dhtRunning":true' && pub_has '"dhtNodes":[0-9]' && echo 1 || echo 0)"
 chk "magnet.public_diag_lists" \
   "$(pub_has '"trackers":\[' && pub_has '"peers":\[' && pub_has '"portMapping":' && echo 1 || echo 0)"
+
+# 激活一条「元数据还没到手」的公开条目（复验问题 1）：内核态必须立刻从 waiting_metadata
+# 变成 acquiring（界面说「正在寻找来源」），而 state / 角色不变 —— 没有元数据就没有字节在动。
+# 这条是 daemon 侧的端到端证据：点激活之后用户看得见「在找源」，不是一条静止的「休眠 0%」。
+ACT_BODY=$(post "http://127.0.0.1:$PORT_A/api/groups/$GID/files/$PUB_FID/active" '{"active":true}')
+ACT_KN=$(sval "$ACT_BODY" kernelState)
+ACT_STATE=$(sval "$ACT_BODY" state)
+ACT_ROLE=$(sval "$ACT_BODY" role)
+chk "magnet.activate_acquiring (kernelState=$ACT_KN state=$ACT_STATE role=$ACT_ROLE)" \
+  "$([ "$ACT_KN" = "acquiring" ] && [ "$ACT_STATE" = "sleeping" ] && [ "$ACT_ROLE" = "none" ] && echo 1 || echo 0)"
+chk "magnet.activate_logged" \
+  "$(grep -q "event=api_file_active .*file_id=$PUB_HASH" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
 
 # 同一合法磁力再导入一次：同群按 infohash 去重，第二次是 409 duplicate。
 DUP_STATUS=$(post_file "$MAGNET_URL" "{\"magnet\":\"$PUB_MAGNET\"}" "$ART/import-2.json")
