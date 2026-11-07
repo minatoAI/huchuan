@@ -9,19 +9,28 @@ import app.huchuan.core.link.ShareFile
 import app.huchuan.core.link.ShareRegistry
 import app.huchuan.core.m1.DeviceIdentity
 import app.huchuan.kernel.M1Runtime
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
-/** P8 的状态口径：一行字 + 一个百分比。 */
-enum class LinkPhase { CONNECTING, WAITING, INCOMING, SENDING, SENT, REVOKED, FAILED }
+/**
+ * P8 的状态口径：一行字 + 一个百分比。
+ *
+ * [ENDED] 与 [REVOKED] 必须分开：REVOKED 是用户（或服务端）撤销，链接确实失效了；
+ * ENDED 是「没人服务了」—— 进程被系统杀掉、前台服务被系统停掉。把后者说成前者是撒谎，
+ * 说成 WAITING 是假装还在分享，两种都不允许。
+ */
+enum class LinkPhase { CONNECTING, WAITING, INCOMING, SENDING, SENT, REVOKED, ENDED, FAILED }
 
 /**
  * 一条分享的实时状态。[failure] 是可 grep 的失败码（revoked / connect-failed / peer-left /
@@ -67,16 +76,47 @@ class LinkShareController(private val runtime: M1Runtime) {
     /** shareId → 实时状态；界面只读。 */
     val live: StateFlow<Map<String, LinkLive>> = _live.asStateFlow()
 
-    private val _shares = MutableStateFlow(store.active())
+    private val _shares = MutableStateFlow(store.listed())
 
-    /** P9 的列表源：本机有效记录（撤销 / 过期即移出）。 */
+    /** P9 的列表源：本机有效记录（撤销 / 过期即移出）；已结束的留着，显示成不可用。 */
     val shares: StateFlow<List<StoredShare>> = _shares.asStateFlow()
+
+    /**
+     * 冷启动清扫：上一次进程留下的有效记录一律标成已结束。
+     *
+     * 前台服务能护住进程，但护不住「被用户从最近任务划掉 / 被系统杀 / 断电重启」——
+     * 那几种情况下进程连一行日志都写不了。所以「还在不在分享」只在下一次启动时判定：
+     * 进程都换了，之前那批分享早就没人服务，不能继续假装在分享（任务验收 4）。
+     */
+    init {
+        val ended = store.endActive(REASON_PROCESS_RESTARTED)
+        if (ended > 0) {
+            _shares.value = store.listed()
+            Log.i(
+                M1Runtime.TAG,
+                "event=link_end_orphans count=" + ended + " reason=" + REASON_PROCESS_RESTARTED,
+            )
+        }
+    }
+
+    /**
+     * 保活：池子里有分享 = 前台服务在跑 = 链接现在真的能取件。
+     * 加入 / 移除只发生在 [startSession] 与 [closeSession]，没有第三个入口。
+     */
+    private val keepAlive = LinkKeepAlive(
+        app = app,
+        recordOf = { id -> store.get(id) },
+        onLost = { ids, reason -> onKeepAliveLost(ids, reason) },
+    )
 
     private val sessions = ConcurrentHashMap<String, LinkSession>()
     private val sessionLock = Any()
     private val io = Executors.newSingleThreadExecutor { job ->
         Thread(job, "huchuan-link-io").apply { isDaemon = true }
     }
+
+    /** 与界面无关的挂起动作（通知栏「结束分享」）：进程级作用域，不需要取消。 */
+    private val bg = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val prefs = app.getSharedPreferences("huchuan-link", Context.MODE_PRIVATE)
 
@@ -263,6 +303,48 @@ class LinkShareController(private val runtime: M1Runtime) {
         io.execute { closeSession(shareId) }
     }
 
+    // ---------------------------------------------------------------- 保活（前台服务）
+
+    /**
+     * 通知栏「结束分享」：与 P8 页面内的「结束分享」是同一个动作 —— 撤销链接、关会话，
+     * 池子空了服务随之停掉、通知消失。撤销要发网络请求，所以在 IO 上跑。
+     *
+     * 服务端撤销失败（离线、5xx）也必须停：用户已经点了结束，再开着服务就是在
+     * 用户不知情的前提下继续分享。这种情况按本机已撤销处理，失败码进日志。
+     */
+    internal fun endFromNotification(shareId: String) {
+        bg.launch {
+            val result = revoke(shareId)
+            if (result.ok) return@launch
+            Log.i(
+                M1Runtime.TAG,
+                "event=link_end_offline share=" + shareId.take(8) + " reason=" + result.failure,
+            )
+            store.markRevoked(shareId)
+            closeSession(shareId)
+            updateLive(shareId, LinkLive(LinkPhase.REVOKED, failure = "revoked"))
+            refreshShares()
+        }
+    }
+
+    /** 服务 onDestroy / onTimeout → 系统把前台服务停了，这几条分享立刻变成不可用。 */
+    internal fun onServiceDestroyed() {
+        keepAlive.onServiceDestroyed()
+    }
+
+    /** 服务被系统停掉时，把还挂在池子里的分享全部收尾（P8/P9 立刻显示不可用）。 */
+    private fun onKeepAliveLost(ids: List<String>, reason: String) {
+        io.execute {
+            for (id in ids) {
+                store.markEnded(id, reason)
+                closeSession(id)
+                updateLive(id, LinkLive(LinkPhase.ENDED, failure = reason))
+            }
+            refreshShares()
+            Log.i(M1Runtime.TAG, "event=link_ended reason=" + reason + " shares=" + ids.size)
+        }
+    }
+
     /** 内核按有效期耗尽等待预算（wait-expired）：链接到期，移出 P9 并关会话。 */
     internal fun onExpired(shareId: String) {
         refreshShares()
@@ -272,21 +354,28 @@ class LinkShareController(private val runtime: M1Runtime) {
     private fun startSession(record: StoredShare, device: DeviceIdentity, file: File, digest: String) {
         if (!record.active()) return
         synchronized(sessionLock) {
-            if (sessions.containsKey(record.shareId)) return
+            if (sessions.containsKey(record.shareId)) return@synchronized
             val session = LinkSession(this, app, record, device, file, digest)
             sessions[record.shareId] = session
             updateLive(record.shareId, LinkLive(LinkPhase.CONNECTING))
             session.start()
         }
+        // 会话起来了 = 这条链接现在真的能被取件：前台服务与常驻通知跟着会话走。
+        keepAlive.add(record)
     }
 
     private fun closeSession(shareId: String) {
-        val session = sessions.remove(shareId) ?: return
-        session.close()
+        val session = sessions.remove(shareId)
+        try {
+            session?.close()
+        } catch (t: Throwable) {
+            Log.w(M1Runtime.TAG, "event=link_session_close_failed share=" + shareId.take(8) + " error=" + t)
+        }
+        keepAlive.remove(shareId)
     }
 
     private fun refreshShares() {
-        _shares.value = store.active()
+        _shares.value = store.listed()
     }
 
     private fun identityOrNull(): DeviceIdentity? = synchronized(identityLock) {
@@ -303,6 +392,9 @@ class LinkShareController(private val runtime: M1Runtime) {
     }
 
     companion object {
+        /** 冷启动清扫给已结束分享写的原因码（见 [LinkStore.endActive]）。 */
+        const val REASON_PROCESS_RESTARTED = "process-restarted"
+
         private const val KEY_WARNED = "network_address_warned"
 
         private fun sha256(file: File): String {

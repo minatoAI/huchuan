@@ -5,6 +5,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import app.huchuan.link.LinkNotifyRoute
 import app.huchuan.notify.NotifyRoute
 import app.huchuan.share.ShareInTake
 import app.huchuan.ui.theme.HuchuanTheme
@@ -16,6 +17,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         // 从系统通知点进来：目标群/文件交给 HuchuanApp 的 LaunchedEffect 消费（notify/NotifyRoute.kt）。
         NotifyRoute.handle(intent)
+        // 点保活通知进来：目标 P8 交给 HuchuanApp 的 LaunchedEffect 消费（link/LinkNotifyRoute.kt）。
+        LinkNotifyRoute.handle(intent)
         // 系统分享进来（share/ShareInTake）：**当场**把 content:// 拷成私有副本。
         // 只在首次创建时认：屏幕旋转重建会把同一个 SEND intent 再送一遍，重复拷 = 重复入库。
         if (savedInstanceState == null) ShareInTake.handle(this, intent)
@@ -49,6 +52,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         NotifyRoute.handle(intent)
+        LinkNotifyRoute.handle(intent)
         // 同一个入口：App 已经在跑时系统把 SEND 递给栈顶实例（真机实测，见 docs/action-send.md）。
         ShareInTake.handle(this, intent)
     }

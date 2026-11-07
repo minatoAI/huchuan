@@ -23,6 +23,12 @@
          （未读由内核按读游标现算，见 kernel/M1Runtime + notify/NotifyPermission.kt）。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- 链接分享保活：分享期间用前台服务把进程钉住（链接要 App 活着才 available）。
+         Android 14（API 34）起前台服务必须声明类型，dataSync 是这一条的正解；
+         两个权限缺一个都会在 startForeground 时抛 SecurityException。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
     <application
         android:name=".HuchuanApplication"
         android:allowBackup="false"
@@ -69,6 +75,15 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+
+        <!-- 链接分享的前台服务（link/LinkKeepAliveService）：分享进行时常驻，进程被钉住，
+             链接才不会因为熄屏 / 切后台 / 回桌面变成 offline。
+             stopWithTask=false：从最近任务划掉也算"进程结束"，由下一次冷启动清扫成已结束。 -->
+        <service
+            android:name=".link.LinkKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
     </application>
 
 </manifest>

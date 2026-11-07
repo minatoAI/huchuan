@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -47,6 +48,7 @@ import app.huchuan.HuchuanState
 import app.huchuan.R
 import app.huchuan.link.LinkCreate
 import app.huchuan.link.LinkLive
+import app.huchuan.link.LinkNotify
 import app.huchuan.link.LinkPhase
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
@@ -82,6 +84,7 @@ fun ShareLinkScreen(
     var createFailure by remember(shareId, pendingGroupId, pendingFileId) { mutableStateOf("") }
     var retryKey by remember { mutableIntStateOf(0) }
     var record by remember(shareId) { mutableStateOf(controller?.share(shareId)) }
+    var endFailure by remember(shareId) { mutableStateOf("") }
 
     LaunchedEffect(pendingGroupId, pendingFileId, retryKey) {
         if (currentId.isNotEmpty()) return@LaunchedEffect
@@ -112,7 +115,28 @@ fun ShareLinkScreen(
         if (stored != null && stored.active()) controller?.ensureSession(currentId)
     }
 
+    // 常驻通知是「分享还在跑」的唯一可见信号：进 P8 时看不见通知就请一次权限。
+    // 走的是既有的 POST_NOTIFICATIONS 流程（HuchuanApp 里那个 launcher），这里不弹窗；
+    // 用户拒绝后系统不再问，P8 上那句「离开此页可能中断分享」就是兜底。
+    LaunchedEffect(currentId) {
+        if (currentId.isEmpty()) return@LaunchedEffect
+        if (LinkNotify.canShow(context)) return@LaunchedEffect
+        state.requestNotifyPermission("link-keepalive")
+    }
+
     val live = controller?.live?.collectAsState()?.value?.get(currentId)
+    // 通知现在看不看得见决定了 P8 上要不要写那句「离开此页可能中断分享」。
+    val notifyVisible = LinkNotify.canShow(context)
+
+    // 返回 ≠ 结束：分享继续跑，通知栏可以结束（任务验收 2 的那句一次性提示）。
+    BackHandler(enabled = state.canGoBack) {
+        val stored = record
+        val running = stored != null && !stored.revoked && !stored.ended &&
+            stored.expiresAt > System.currentTimeMillis() &&
+            live?.phase != LinkPhase.REVOKED && live?.phase != LinkPhase.ENDED
+        if (running) Toast.makeText(context, R.string.p8_leave_toast, Toast.LENGTH_SHORT).show()
+        state.pop()
+    }
 
     PageScaffold(
         title = stringResource(R.string.p8_title),
@@ -158,6 +182,13 @@ fun ShareLinkScreen(
                     color = MaterialTheme.colorScheme.error,
                 )
 
+                // 已结束（进程被系统杀掉 / 前台服务被系统停掉）：没人服务了，不再给二维码。
+                stored.ended || live?.phase == LinkPhase.ENDED -> Text(
+                    text = stringResource(R.string.p8_ended),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.error,
+                )
+
                 else -> {
                     ShareQrCode(
                         text = stored.link,
@@ -188,6 +219,38 @@ fun ShareLinkScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     LinkStatusLine(live = live)
+                    // 通知看不见 = 用户既看不到「分享还在跑」也停不了它。不弹窗，只写一句。
+                    if (!notifyVisible) {
+                        Text(
+                            text = stringResource(R.string.p8_keepalive_hint),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                    // 页面内唯一会停掉前台服务并撤销链接的入口（与通知栏「结束分享」同一个动作）。
+                    TextButton(
+                        onClick = {
+                            endFailure = ""
+                            scope.launch {
+                                val result = controller?.revoke(currentId)
+                                record = controller?.share(currentId)
+                                if (result != null && !result.ok) {
+                                    endFailure = result.failure.ifEmpty { "revoke" }
+                                }
+                            }
+                        },
+                    ) {
+                        Text(stringResource(R.string.p8_end))
+                    }
+                    if (endFailure.isNotEmpty()) {
+                        Text(
+                            text = linkFailureLabel(endFailure),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                 }
             }
         }
@@ -210,6 +273,7 @@ private fun LinkStatusLine(live: LinkLive?) {
 
         LinkPhase.SENT -> stringResource(R.string.p8_sent)
         LinkPhase.REVOKED -> stringResource(R.string.p8_revoked)
+        LinkPhase.ENDED -> stringResource(R.string.p8_ended)
         LinkPhase.FAILED -> linkFailureLabel(live?.failure.orEmpty())
     }
     Column(
@@ -273,21 +337,14 @@ fun ShareQrCode(text: String, modifier: Modifier = Modifier) {
     }
 }
 
-/** 剩余有效期：P8 与 P9 同一口径（天数 / 小时 / 分钟）。 */
+/**
+ * 剩余有效期：P8 / P9 / 常驻通知同一口径（天数 / 小时 / 分钟，向上取整 ——
+ * 刚创建（7 天差一分钟）显示「7 天后失效」，不是「6 天」）。文案只留一份：
+ * 具体实现在 [LinkNotify.expiryText]，前台服务那边也要用。
+ */
 @Composable
-fun expiryLabel(expiresAt: Long): String {
-    val left = expiresAt - System.currentTimeMillis()
-    return when {
-        left <= 0L -> stringResource(R.string.p8_expired)
-        // 向上取整：刚创建（7 天差一分钟）显示「7 天后失效」，不是「6 天」。
-        left >= DAY_MS -> stringResource(R.string.p8_expires_days, ((left + DAY_MS - 1) / DAY_MS).toInt())
-        left >= HOUR_MS -> stringResource(R.string.p8_expires_hours, ((left + HOUR_MS - 1) / HOUR_MS).toInt())
-        else -> stringResource(
-            R.string.p8_expires_minutes,
-            ((left + MINUTE_MS - 1) / MINUTE_MS).toInt().coerceAtLeast(1),
-        )
-    }
-}
+fun expiryLabel(expiresAt: Long): String =
+    LinkNotify.expiryText(LocalContext.current, expiresAt)
 
 /** 失败码 → 一句话（创建失败与信令失败共用；不弹窗）。 */
 @Composable
@@ -311,6 +368,3 @@ fun linkFailureLabel(code: String): String = when {
     else -> stringResource(R.string.p8_connect_failed)
 }
 
-private const val MINUTE_MS = 60_000L
-private const val HOUR_MS = 60L * MINUTE_MS
-private const val DAY_MS = 24L * HOUR_MS

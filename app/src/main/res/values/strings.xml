@@ -159,6 +159,17 @@
     <!-- P7 分享管理入口（link-share §8） -->
     <string name="p7_share_manage">分享管理</string>
 
+    <!-- 链接分享保活（前台服务 + 常驻通知，docs/link-keepalive.md）：
+         通知标题写文件名、正文写剩余有效期；离开 P8 分享继续，只有「结束分享」才停。 -->
+    <string name="link_channel_name">链接分享</string>
+    <string name="link_channel_desc">分享进行时常驻，可随时结束</string>
+    <string name="link_notify_title">正在分享 %1$s</string>
+    <string name="link_notify_stop">结束分享</string>
+    <!-- 通知看不见（POST_NOTIFICATIONS 被拒 / 应用通知被关）时的退路：只写一句，不弹窗 -->
+    <string name="p8_keepalive_hint">离开此页可能中断分享</string>
+    <!-- 离页一次性提示：返回不等于结束 -->
+    <string name="p8_leave_toast">分享继续，通知栏可随时结束</string>
+
     <!-- P8 链接分享（link-share §3 P8）：二维码 / 链接 / 复制 / 有效期 / 状态行 -->
     <string name="p8_title">分享链接</string>
     <string name="p8_creating">创建中</string>
@@ -192,6 +203,9 @@
     <string name="p8_verify_failed">校验不一致</string>
     <string name="p8_send_failed">发送失败</string>
     <string name="p8_connect_failed">连接失败</string>
+    <!-- 结束分享（页面内 / 通知栏同一个动作）：撤销链接 + 停前台服务 -->
+    <string name="p8_end">结束分享</string>
+    <string name="p8_ended">分享已结束</string>
 
     <!-- P9 分享管理（link-share §3 P9 / §8）：文件名 / 剩余有效期 / 访客状态 / 撤销 -->
     <string name="p9_title">分享管理</string>
@@ -203,4 +217,6 @@
     <string name="p9_visits">被访问 %1$d 次</string>
     <string name="p9_visitor_joined">访客已加入</string>
     <string name="p9_visitor_sending">正在取件 %1$d%%</string>
+    <!-- 已结束（进程被杀 / 服务被系统停）：链接不再有人服务，显示成不可用 -->
+    <string name="p9_ended">分享已结束</string>
 </resources>

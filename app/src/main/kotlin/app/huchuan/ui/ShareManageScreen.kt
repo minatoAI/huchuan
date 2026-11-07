@@ -153,7 +153,7 @@ private fun ShareRow(
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                text = expiryLabel(share.expiresAt) + " · " + visitorLabel(share, live),
+                text = expiryLabel(share.expiresAt) + " · " + statusLabel(share, live),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -165,9 +165,14 @@ private fun ShareRow(
     }
 }
 
+/**
+ * 行内状态：已结束的分享必须**看起来**不可用（进程被系统杀掉、前台服务被系统停掉），
+ * 不能还挂着「被访问 n 次」像是随时能取件。
+ */
 @Composable
-private fun visitorLabel(share: StoredShare, live: LinkLive?): String = when (live?.phase) {
-    LinkPhase.SENDING -> stringResource(R.string.p9_visitor_sending, live.percent.coerceIn(0, 100))
-    LinkPhase.INCOMING -> stringResource(R.string.p9_visitor_joined)
+private fun statusLabel(share: StoredShare, live: LinkLive?): String = when {
+    share.ended || live?.phase == LinkPhase.ENDED -> stringResource(R.string.p9_ended)
+    live?.phase == LinkPhase.SENDING -> stringResource(R.string.p9_visitor_sending, live.percent.coerceIn(0, 100))
+    live?.phase == LinkPhase.INCOMING -> stringResource(R.string.p9_visitor_joined)
     else -> stringResource(R.string.p9_visits, share.visitCount)
 }

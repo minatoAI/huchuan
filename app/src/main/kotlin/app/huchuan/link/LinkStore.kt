@@ -29,10 +29,14 @@ data class StoredShare(
     val sha256: String = "",
     val visitCount: Int = 0,
     val revoked: Boolean = false,
+    /** 已结束但**没有**被用户撤销：进程被系统杀掉、或前台服务被系统停掉。 */
+    val ended: Boolean = false,
+    val endedReason: String = "",
 ) {
     val link: String get() = baseUrl + "/#s=" + token
 
-    fun active(now: Long = System.currentTimeMillis()): Boolean = !revoked && expiresAt > now
+    fun active(now: Long = System.currentTimeMillis()): Boolean =
+        !revoked && !ended && expiresAt > now
 }
 
 /**
@@ -53,6 +57,15 @@ class LinkStore(private val file: File) {
     fun active(now: Long = System.currentTimeMillis()): List<StoredShare> =
         synchronized(lock) { records.filter { it.active(now) }.sortedByDescending { it.createdAt } }
 
+    /**
+     * P9 的列表源：还没撤销、也还没过期。**含已结束的**（进程被杀 / 服务被系统停），
+     * 它们要显示成不可用 —— 从列表里悄悄消失等于假装这条分享从没存在过。
+     */
+    fun listed(now: Long = System.currentTimeMillis()): List<StoredShare> =
+        synchronized(lock) {
+            records.filter { !it.revoked && it.expiresAt > now }.sortedByDescending { it.createdAt }
+        }
+
     fun get(shareId: String): StoredShare? = synchronized(lock) { records.firstOrNull { it.shareId == shareId } }
 
     fun upsert(record: StoredShare) {
@@ -64,6 +77,29 @@ class LinkStore(private val file: File) {
     }
 
     fun markRevoked(shareId: String): StoredShare? = update(shareId) { it.copy(revoked = true) }
+
+    fun markEnded(shareId: String, reason: String): StoredShare? =
+        update(shareId) { if (it.ended) it else it.copy(ended = true, endedReason = reason) }
+
+    /**
+     * 冷启动清扫：上一次进程留下的有效记录全部标成已结束，返回条数。
+     *
+     * 进程被杀的那一刻它写不了任何东西，所以「是不是还活着」只能在**下一次启动**时判：
+     * 进程都重启了，之前那批分享早就没人服务了，不能继续假装在分享。
+     */
+    fun endActive(reason: String): Int {
+        synchronized(lock) {
+            var n = 0
+            for (i in records.indices) {
+                val record = records[i]
+                if (!record.active()) continue
+                records[i] = record.copy(ended = true, endedReason = reason)
+                n++
+            }
+            if (n > 0) saveLocked()
+            return n
+        }
+    }
 
     fun bumpVisit(shareId: String): StoredShare? = update(shareId) { it.copy(visitCount = it.visitCount + 1) }
 
@@ -106,6 +142,8 @@ class LinkStore(private val file: File) {
                         sha256 = item.optString("sha256"),
                         visitCount = item.optInt("visitCount"),
                         revoked = item.optBoolean("revoked"),
+                        ended = item.optBoolean("ended"),
+                        endedReason = item.optString("endedReason"),
                     ),
                 )
             }
@@ -136,7 +174,9 @@ class LinkStore(private val file: File) {
                         .put("localPath", record.localPath)
                         .put("sha256", record.sha256)
                         .put("visitCount", record.visitCount)
-                        .put("revoked", record.revoked),
+                        .put("revoked", record.revoked)
+                        .put("ended", record.ended)
+                        .put("endedReason", record.endedReason),
                 )
             }
             val tmp = File(file.parentFile, file.name + ".tmp")

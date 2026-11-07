@@ -39,6 +39,7 @@ import app.huchuan.core.NetworkStatus
 import app.huchuan.kernel.M1Runtime
 import app.huchuan.kernel.MagnetImport
 import app.huchuan.kernel.PublicPublish
+import app.huchuan.link.LinkNotifyRoute
 import app.huchuan.link.LinkShareController
 import app.huchuan.notify.NotifyPermission
 import app.huchuan.notify.NotifyRoute
@@ -555,6 +556,24 @@ fun HuchuanApp(
             "event=notify_open group_id=" + target.groupId +
                 " file_id=" + (target.fileId ?: "-") +
                 " waited_ms=" + waitedMs,
+        )
+    }
+
+    // 点常驻通知回 P8（link/LinkNotifyRoute）：与群通知同一条路子 —— 冷启动时内核还在读
+    // state.json，先等它起来（最多 15 s），再把 P8 压到栈顶。
+    val linkTarget = LinkNotifyRoute.pending
+    LaunchedEffect(linkTarget, runtime) {
+        val shareId = linkTarget ?: return@LaunchedEffect
+        var waitedMs = 0
+        while (runtime != null && !runtime.started && waitedMs < 15_000) {
+            delay(200)
+            waitedMs += 200
+        }
+        LinkNotifyRoute.consume()
+        state.push(Destination.LinkShare(shareId))
+        Log.i(
+            M1Runtime.TAG,
+            "event=link_notify_route share=" + shareId.take(8) + " waited_ms=" + waitedMs,
         )
     }
 
