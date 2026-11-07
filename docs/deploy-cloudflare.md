@@ -196,10 +196,17 @@ cd pages
 CLOUDFLARE_ACCOUNT_ID=f72eb4995b4129225c4761434d61b733 \
   npx --yes wrangler@3 pages project create huchuan --production-branch main
 
-# 2) 部署
+# 2) 部署（目录参数必须是 public，函数目录取当前工作目录下的 ./functions）
 CLOUDFLARE_ACCOUNT_ID=f72eb4995b4129225c4761434d61b733 \
-  npx --yes wrangler@3 pages deploy --branch main
+  npx --yes wrangler@3 pages deploy public --project-name=huchuan --branch main
 ```
+
+**实测过的坑（2026-11-07）**：在仓库根目录跑 `wrangler pages deploy pages` 会「部署成功」，
+但 Functions 没被打包——`/health`、`/announce`、`/signal` 全部 404，静态页照旧能开，
+很容易误判成部署没问题。wrangler 只在**当前工作目录**下找 `./functions`，
+所以必须先 `cd pages`，且目录参数写 `public`。判断部署是否真的带上了函数：
+`curl -o /dev/null -w '%{http_code}' https://huchuan-a9f.pages.dev/health` 应为 200，
+`/signal` 应为 426。
 
 三个坑：
 
