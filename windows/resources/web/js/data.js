@@ -27,6 +27,28 @@ const FileState = {
   SLEEPING: 'sleeping',
 };
 
+/**
+ * 内核态：与 daemon 文件对象的 kernelState 字段同名同义（docs/daemon-api.md §3.3）。
+ *
+ * 与 [FileState] 并列、不是同一件事：state 是「画面上显示什么」（三值），这个是内核真值（六值）。
+ * 多出来的三位里，waiting_metadata（导入后放着等来源）与 acquiring（用户点了激活、内核正在找源）
+ * 在 state 里都是 sleeping，界面要能说两句不同的话就只能看这个字段。
+ */
+const KernelState = {
+  ABSENT: 'absent',
+  PARKED: 'parked',
+  WAITING_METADATA: 'waiting_metadata',
+  ACQUIRING: 'acquiring',
+  DOWNLOADING: 'downloading',
+  SEEDING: 'seeding',
+};
+
+/** 线上写法白名单：不认识的（老 daemon 缺字段、以后内核加值）一律当「没有这个字段」。 */
+const KERNEL_STATE_WIRE = [
+  KernelState.ABSENT, KernelState.PARKED, KernelState.WAITING_METADATA,
+  KernelState.ACQUIRING, KernelState.DOWNLOADING, KernelState.SEEDING,
+];
+
 /** 公开 / 私有：与 daemon 文件对象的 scope 字段同名同义（缺字段的旧对端按 private）。 */
 const FileScope = {
   PRIVATE: 'private',
@@ -210,7 +232,13 @@ function toFile(json) {
     state: json.state === FileState.SEEDING || json.state === FileState.DOWNLOADING
       ? json.state
       : FileState.SLEEPING,
+    // 内核态（六值）原样带过来，不认识 / 缺字段就是空串：页面按 state + 尺寸未知的老口径兜底，
+    // 不猜一个更像真的值。acquiring 那一态在 state 里是 sleeping，只有这个字段说得出来。
+    kernelState: KERNEL_STATE_WIRE.indexOf(json.kernelState) >= 0 ? json.kernelState : '',
     progressPercent: json.progressPercent || 0,
+    // 已写到磁盘的字节（与 downloadedBytes 不是一个口径，见 docs/daemon-api.md §3.3）。
+    // P4 的「已落盘」只读它；老 daemon 不给就是 0，那一行不出现。
+    diskBytes: json.diskBytes || 0,
     seeders: json.seeders || 0,
     teammates: json.teammates || 0,
     uploadLimitKbps: json.uploadLimitKbps || 0,
@@ -272,6 +300,9 @@ function toGroup(json) {
   return {
     id: json.id,
     name: json.name || '',
+    // 个人空间（docs/design/personal-space.md）：P2 置顶 + 换图标 + 不显示成员数都只认这一位，
+    // 不按名字或成员数去猜。缺字段的旧 daemon 按普通群处理。
+    isPersonal: json.isPersonal === true,
     inviteCode: json.inviteCode || '',
     notificationLevel: json.notificationLevel || NotificationLevel.SYSTEM_BUBBLE,
     unreadCount: json.unreadCount || 0,

@@ -54,6 +54,9 @@ const COPY = {
   p3_sleeping: '休眠',
   p3_downloading: '下载中',
   p3_waiting_source: '等待来源',
+  // 用户点了激活、元数据还没到手：内核正在找源。这一态在 daemon 的 state 里仍是 sleeping，
+  // 说「休眠」等于否认用户刚点的那一下（docs/daemon-api.md §3.3，文案同 Android 的 p3_finding_source）。
+  p3_finding_source: '正在寻找来源',
   p3_scope_public: '公开',
   p3_team: function (n) { return '组队 ' + n + ' 人'; },
   p3_seeders: function (n) { return '做种 ' + n; },
@@ -81,6 +84,9 @@ const COPY = {
   // 所以这里给的是 daemon 记的值 + 此刻是不是真的套在会话里（uploadLimitInForce）。
   p4_limit_in_force: function (kbps) { return '已生效 ' + kbps + ' ' + COPY.unit_kbps; },
   p4_limit_saved: function (kbps) { return '已设置 ' + kbps + ' ' + COPY.unit_kbps; },
+  // 「已落盘」：内核写到磁盘的字节（diskBytes），与完成度不是同一个口径 ——
+  // 长文件上百分比与 downloadedBytes 会长时间卡住，这一行才看得出「在不在动」（同一个 §3.3）。
+  p4_disked: function (size) { return '已落盘 ' + size; },
 
   // P5 新群组
   p5_title: '新群组',
@@ -89,6 +95,8 @@ const COPY = {
   p5_create_group: '新建群组',
   p5_invite_hint: '邀请码后 8 位',
   p5_invite_wrong: '邀请码不对',
+  // 对端明确拒绝（E_JOIN_PERSONAL，docs/daemon-api.md §3.4）：个人空间不可加入。
+  p5_join_personal: '对方是个人空间，不能被加入',
   p5_group_name_default: function (name) { return name + '的群组'; },
   p5_create: '创建',
 
@@ -194,6 +202,9 @@ const State = {
   magnetNoteError: false, // 非法 / 重复这类「被拒」才染红；无源 / 超时只是还没成
   magnetCopied: false,
   magnetCopiedTimer: null,
+  // 取证夹具（'parked'）：只有 ?route=p3-parked / ?fixture=parked 这种取证入口才会设，
+  // 正常启动永远是空串（见 fixtureGroup）。
+  fixture: '',
   // P4「…」溢出菜单（本轮只有「分享链接」一项；单文件限速在页内，不占菜单）。
   p4Menu: false,
   // P8：shareToken 为空时可能是「创建中」或创建失败；shareFileId 记着从哪个文件建的。
@@ -217,7 +228,15 @@ const State = {
  */
 const RouteAlias = {
   'p3-magnet': { page: 'p3', add: 'magnet' },
-  'p4-public': { page: 'p4', public: true },
+  'p4-public': { page: 'p4', public: true, group: 'public' },
+  // 取证夹具：parked 那一态没有 API 造得出来（导入到位就 absent、点激活是 acquiring），
+  // 只能由页面自带的夹具造一条同口径条目（见 fixtureGroup）。页面名仍是 p3。
+  'p3-parked': { page: 'p3', fixture: 'parked', group: 'public' },
+  // 个人空间（docs/design/personal-space.md）：它通常是 /api/state 的第一个群，但「有文件的第一个群」
+  // 才是深链默认落点（见 defaultGroup）—— 这几条别名把落点钉死，取证图不会被空列表顶掉。
+  'p3-personal': { page: 'p3', group: 'personal' },
+  'p3-acquiring': { page: 'p3', group: 'public' },
+  'p4-acquiring': { page: 'p4', group: 'public' },
   // 取证用：落 P8/P9 前先确保 daemon 里有一条有效分享（没有就用本群第一个私有文件建一条）。
   // 正常导航不带这两个别名 —— 真实入口是 P4「…」与 P7「分享管理」。
   'p8-share': { page: 'p8', ensureShare: true },
@@ -252,6 +271,35 @@ function digitsOnly(text, max) {
   return String(text).replace(/\D/g, '').slice(0, max);
 }
 
+/**
+ * 深链 / 取证落哪个群：**有文件的第一个群**。
+ *
+ * 个人空间（我的分享）通常排在 /api/state 的第一个，但它经常是空的 —— 深链直接落在它上面，
+ * 截出来的就是「还没有文件」。一个群里都没有文件时才退回第一个群。
+ */
+function defaultGroup(groups) {
+  let empty = null;
+  for (let i = 0; i < groups.length; i += 1) {
+    if (groups[i].files.length > 0) return groups[i];
+    if (!empty) empty = groups[i];
+  }
+  return empty;
+}
+
+/** 取证别名要的落点：personal = 个人空间，public = 有公开条目的那个群，其余按 defaultGroup。 */
+function pickGroup(groups, want) {
+  if (want === 'personal') {
+    for (let i = 0; i < groups.length; i += 1) {
+      if (groups[i].isPersonal) return groups[i];
+    }
+  } else if (want === 'public') {
+    for (let i = 0; i < groups.length; i += 1) {
+      if (groups[i].files.some(isPublicFile)) return groups[i];
+    }
+  }
+  return defaultGroup(groups);
+}
+
 /** 公开条目：P3 的「公开」chip、P4 的磁力摘要与「移除」都只认这一个判断。 */
 function isPublicFile(file) {
   return file.scope === FileScope.PUBLIC;
@@ -275,11 +323,90 @@ function magnetDigest(magnet) {
   return infohash.length > 16 ? 'btih:' + infohash.slice(0, 16) + '…' : text;
 }
 
+/**
+ * 状态文案：口径是 daemon 的 kernelState（六值），不是 state（三值）。
+ *
+ * state 把「导入后放着等来源」与「用户点了激活、内核正在找源」都归成 sleeping，
+ * 但前者是被动的、后者是用户刚拨了开关、必须有反馈的 —— 只有 kernelState 分得开
+ * （docs/daemon-api.md §3.3）。内核加值 / 老 daemon 缺字段时退回 state + 尺寸未知的老口径。
+ */
 function fileStateLabel(file) {
+  switch (file.kernelState) {
+    case KernelState.ACQUIRING: return COPY.p3_finding_source;
+    case KernelState.WAITING_METADATA: return COPY.p3_waiting_source;
+    case KernelState.SEEDING: return COPY.p3_seeding;
+    case KernelState.DOWNLOADING: return COPY.p3_downloading;
+    case KernelState.PARKED: return COPY.p3_sleeping;
+    case KernelState.ABSENT:
+      // 不在会话里就是休眠；公开条目「元数据还没到手」那一段仍说「等待来源」。
+      return fileAwaitingSource(file) ? COPY.p3_waiting_source : COPY.p3_sleeping;
+    default:
+      break;
+  }
   if (fileAwaitingSource(file)) return COPY.p3_waiting_source;
   if (file.state === FileState.SEEDING) return COPY.p3_seeding;
   if (file.state === FileState.DOWNLOADING) return COPY.p3_downloading;
   return COPY.p3_sleeping;
+}
+
+/**
+ * 这一条是不是「在参与」（P3 的 chip 高亮、P4 的激活开关共用这一个判定）。
+ *
+ * 与 Android 的 GroupFile.isActive() 同口径：在传，或者用户已经点了激活、内核还在找源。
+ * acquiring 时内核读数仍是「没在传」（state=sleeping、字节 0），但开关不能自己弹回休眠 ——
+ * 那正是「点了激活没反应」的另一半（docs/daemon-api.md §3.3）。
+ */
+function fileActive(file) {
+  if (file.kernelState) {
+    return file.kernelState === KernelState.SEEDING ||
+      file.kernelState === KernelState.DOWNLOADING ||
+      file.kernelState === KernelState.ACQUIRING;
+  }
+  return file.state !== FileState.SLEEPING;
+}
+
+/** 在给定的群快照里找一条文件（与 Store.file 同口径，但只看传进来的这一份）。 */
+function fileOf(group, fileId) {
+  if (!group || !fileId) return null;
+  for (let i = 0; i < group.files.length; i += 1) {
+    if (group.files[i].id === fileId) return group.files[i];
+  }
+  return null;
+}
+
+/**
+ * 取证夹具：?fixture=parked（取证路由别名 p3-parked 带的就是它）时，把本群的文件换成一个
+ * kernelState=parked 的条目。
+ *
+ * 为什么需要造：parked 是「torrent 挂在会话里、被 libtorrent 挂着」那一段，daemon 的正常流程走不到
+ * —— 磁力导入元数据一到就摘任务（absent），点激活是 acquiring / downloading，私有文件挂进来就直接做种。
+ * core 的 GroupRuntime.kernelState 读得到这个值（daemon 也照实投成 paused=true），但 API 没有哪一步
+ * 能让它停在这。所以这一态只能造一条与 daemon 同口径的条目给截图用，正常启动永远不生效。
+ */
+function fixtureGroup(group) {
+  if (!group || State.fixture !== 'parked') return group;
+  const file = {
+    id: 'fixture-parked',
+    name: '纪录片 4K.mp4',
+    sizeBytes: 32768,
+    sourceMember: group.members.length ? group.members[0].name : 'WIN11-0715',
+    state: FileState.SLEEPING,
+    kernelState: KernelState.PARKED,
+    progressPercent: 0,
+    diskBytes: 0,
+    seeders: 0,
+    teammates: 0,
+    uploadLimitKbps: 0,
+    uploadLimitInForce: false,
+    downloadRateBps: 0,
+    uploadRateBps: 0,
+    savedPath: '',
+    scope: FileScope.PRIVATE,
+    magnet: '',
+    sizeKnown: true,
+    comments: [],
+  };
+  return Object.assign({}, group, { files: [file] });
 }
 
 /**
@@ -608,22 +735,47 @@ function topbar(title, options) {
     '</div>';
 }
 
+/** 个人空间的图标：与普通群区分，用「往上递」的形状（我的分享 = 递出去的东西）。 */
+function personalIcon() {
+  return '<svg class="row-icon" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">' +
+    '<path d="M10 3l4.2 4.2-1.4 1.4L11 6.9V13H9V6.9L7.2 8.6 5.8 7.2 10 3z" fill="currentColor"/>' +
+    '<path d="M4 14h2v2h8v-2h2v4H4v-4z" fill="currentColor"/>' +
+    '</svg>';
+}
+
+/**
+ * P2 的排列：个人空间（我的分享）固定置顶，其余保持 daemon 给的原序。
+ * 认它只用 isPersonal，不看名字、不看成员数（docs/daemon-api.md §3.2）。
+ */
+function orderedGroups() {
+  const groups = Store.groups();
+  const personal = [];
+  const rest = [];
+  for (let i = 0; i < groups.length; i += 1) {
+    if (groups[i].isPersonal) personal.push(groups[i]);
+    else rest.push(groups[i]);
+  }
+  return personal.concat(rest);
+}
+
 function groupRow(group) {
   const team = groupTeamSize(group);
+  // 个人空间没有队友也没有群成员可数：只留本机做种的条数（docs/design/personal-space.md）。
   const meta = [COPY.p2_seeding(groupSeedingCount(group))];
   if (team > 0) meta.push(COPY.p2_team(team));
   const unread = group.unreadCount > 0
     ? '<span class="chip is-on row-tag">' + COPY.p2_unread(group.unreadCount) + '</span>'
     : '<span class="row-tag"></span>';
-  return '<button class="row" data-act="open-group" data-id="' + group.id + '">' +
-    '<span class="row-title">' + esc(group.name) + '</span>' +
+  return '<button class="row' + (group.isPersonal ? ' is-personal' : '') +
+    '" data-act="open-group" data-id="' + group.id + '">' +
+    '<span class="row-title">' + (group.isPersonal ? personalIcon() : '') + esc(group.name) + '</span>' +
     '<span class="row-meta">' + meta.join(' · ') + '</span>' +
     unread +
     '</button>';
 }
 
 function viewHome() {
-  const groups = Store.groups().filter(function (group) {
+  const groups = orderedGroups().filter(function (group) {
     const query = State.search.trim().toLowerCase();
     return !query || group.name.toLowerCase().indexOf(query) >= 0;
   });
@@ -654,7 +806,7 @@ function renderGroupRows() {
   const list = document.getElementById('group-list');
   if (!list) return;
   const query = State.search.trim().toLowerCase();
-  const groups = Store.groups().filter(function (group) {
+  const groups = orderedGroups().filter(function (group) {
     return !query || group.name.toLowerCase().indexOf(query) >= 0;
   });
   list.innerHTML = groups.length
@@ -670,7 +822,7 @@ function fileRow(file) {
   if (isPublicFile(file)) {
     chips.push('<span class="chip">' + COPY.p3_scope_public + '</span>');
   }
-  chips.push('<span class="chip' + (file.state === FileState.SLEEPING ? '' : ' is-on') + '">' +
+  chips.push('<span class="chip' + (fileActive(file) ? ' is-on' : '') + '">' +
     fileStateLabel(file) + '</span>');
   if (fileInTeam(file)) {
     chips.push('<span class="chip is-on">' + COPY.p3_team(fileTeamSize(file)) + '</span>');
@@ -725,7 +877,7 @@ function addFileModal() {
 }
 
 function viewGroup() {
-  const group = Store.group(State.groupId);
+  const group = fixtureGroup(Store.group(State.groupId));
   if (!group) return viewHome();
 
   const body = group.files.length
@@ -778,9 +930,9 @@ function fileMenu(file) {
 }
 
 function viewFile() {
-  const group = Store.group(State.groupId);
+  const group = fixtureGroup(Store.group(State.groupId));
   if (!group) return viewHome();
-  const file = (State.fileId && Store.file(group.id, State.fileId)) || group.files[0];
+  const file = fileOf(group, State.fileId) || group.files[0];
   if (!file) return viewGroup();
 
   const comments = file.comments || [];
@@ -796,6 +948,12 @@ function viewFile() {
     ? COPY.p4_seeders(file.seeders)
     : COPY.p4_waiting;
 
+  // 「已落盘」：内核写到磁盘的字节（diskBytes）。只在 P4、只在这个文件真在参与（下载 / 做种 /
+  // 找源）且盘上真有字节时出现 —— 休眠时说「已落盘」是噪音，acquiring 时它是 0（还没元数据）。
+  // 完成度看百分比，看「下了多少 / 在不在动」看这一行（docs/daemon-api.md §3.3）。
+  const diskLine = fileActive(file) && file.diskBytes > 0
+    ? '<p class="line" id="disk-line">' + COPY.p4_disked(formatSize(file.diskBytes)) + '</p>'
+    : '';
   // 「公开」固定在状态 chip 左侧；元数据没到手时不写尺寸（不是 0 B）。
   const publicChip = isPublicFile(file)
     ? '<span class="chip">' + COPY.p3_scope_public + '</span>'
@@ -822,7 +980,7 @@ function viewFile() {
     '<div class="content"><div class="page page-wide">' +
       '<div class="file-meta">' +
         publicChip +
-        '<span class="chip' + (file.state === FileState.SLEEPING ? '' : ' is-on') + '">' +
+        '<span class="chip' + (fileActive(file) ? ' is-on' : '') + '">' +
           fileStateLabel(file) + '</span>' +
         size +
         '<span>' + COPY.p4_source(file.sourceMember) + '</span>' +
@@ -838,13 +996,15 @@ function viewFile() {
               '<span>↑' + formatRate(file.uploadRateBps) + '</span>' +
             '</div>' +
           '</div>' +
+          diskLine +
           teaming +
           '<p class="line">' + seeders + '</p>' +
           '<hr class="divider">' +
           '<div class="setting-row">' +
             '<span class="setting-label">' + COPY.p4_activate + '</span>' +
+            // 开关的「开」= 在参与（含 acquiring）：点了激活、内核还在找源时它不能弹回休眠。
             '<button class="switch" role="switch" data-act="toggle-active" ' +
-              'aria-checked="' + (file.state !== FileState.SLEEPING) + '" ' +
+              'aria-checked="' + fileActive(file) + '" ' +
               'aria-label="' + COPY.p4_activate + ' / ' + COPY.p4_sleep + '"></button>' +
             '<span class="setting-label">' + COPY.p4_sleep + '</span>' +
           '</div>' +
@@ -928,8 +1088,15 @@ function joinGroup() {
     State.inviteCode = '';
     Nav.reset('p2');
     Nav.go('p3', joined.id);
-  }).catch(function () {
-    if (note) note.hidden = false;
+  }).catch(function (error) {
+    // 两种失败两种说法（docs/daemon-api.md §3.4）：对端明确说「我是个人空间」时不能含糊成
+    // 「邀请码不对」—— 那个码根本不存在，用户再输多少次都没用。
+    if (note) {
+      note.textContent = error && error.code === 'E_JOIN_PERSONAL'
+        ? COPY.p5_join_personal
+        : COPY.p5_invite_wrong;
+      note.hidden = false;
+    }
     if (button) {
       button.disabled = false;
       button.textContent = COPY.p5_join;
@@ -1123,16 +1290,21 @@ function viewMembers() {
     ? '<div class="list">' + group.members.map(memberRow).join('') + '</div>'
     : '<p class="empty">' + COPY.p6_empty + '</p>';
 
-  return '<div class="screen">' +
-    topbar(COPY.p6_title, { back: true }) +
-    '<div class="content"><div class="page">' +
-      list +
-      '<div class="invite">' +
+  // 个人空间不生成邀请码（daemon 给的就是空串），所以整块不出现 —— 不是显示一个空的邀请码。
+  const invite = group.isPersonal
+    ? ''
+    : '<div class="invite">' +
         '<span class="field-label">' + COPY.p6_invite + '</span>' +
         '<button class="invite-code" data-act="copy-invite">' + group.inviteCode + '</button>' +
         '<span class="spacer"></span>' +
         (State.copied ? '<span class="copied">' + COPY.p6_copied + '</span>' : '') +
-      '</div>' +
+      '</div>';
+
+  return '<div class="screen">' +
+    topbar(COPY.p6_title, { back: true }) +
+    '<div class="content"><div class="page">' +
+      list +
+      invite +
     '</div></div>' +
     '</div>';
 }
@@ -1436,7 +1608,8 @@ function ensureShareForDemo() {
   return Store.loadShares(true).then(function () {
     const existing = Store.activeShares()[0];
     if (existing) return existing.token;
-    const group = Store.groups()[0];
+    // 个人空间常常是空的：挑第一个有文件的群，别把夹具钉在一个空列表上。
+    const group = defaultGroup(Store.groups());
     if (!group) throw new Error('no group');
     const privates = group.files.filter(function (file) { return !isPublicFile(file); });
     const file = privates[0] || group.files[0];
@@ -1644,7 +1817,9 @@ document.addEventListener('click', function (event) {
       const group = Store.group(State.groupId);
       const file = group && Store.file(group.id, State.fileId);
       if (!file) break;
-      Store.setFileActive(group.id, file.id, file.state === FileState.SLEEPING);
+      // 方向看同一个 fileActive()：与开关显示的状态是同一个判据，不会出现「看着是开、点下去是关」。
+      // acquiring 期间点它等于再激活一次（内核那边本来就挂着这条找源任务，不会重复加种）。
+      Store.setFileActive(group.id, file.id, !fileActive(file));
       render();
       break;
     }
@@ -1896,9 +2071,14 @@ function sendComment() {
 
   const initial = Params.get('route') || 'p0';
   const alias = RouteAlias[initial] || { page: initial };
+  // 取证夹具只在取证别名 / 显式参数下生效；正常启动两个都没有，State.fixture 保持空串。
+  State.fixture = alias.fixture || Params.get('fixture') || '';
   // 先把 daemon 的快照拿下来再进开屏：P0 的自检判据就是「daemon 在不在」。
   Store.boot().then(function () {
-    const first = Store.groups()[0];
+    // 落点：别名钉死的群（personal / public）优先，否则「有文件的第一个群」。
+    // 个人空间（我的分享）排在 /api/state 第一个，深链直接落上去多半是一张空列表。
+    const target = pickGroup(Store.groups(), alias.group);
+    const first = target;
     State.groupId = first ? first.id : '';
     Store.onChange(onDataChanged);
     // 链接分享的入口（P4「…」/ P7「分享管理」）先探一次可用性：不可用时两处都不出现。

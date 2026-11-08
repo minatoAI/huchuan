@@ -170,6 +170,9 @@ WebView2 里的页面如果从一个伪造源（`https://huchuan.invalid`）去 
   所以这时候它是空的 —— 空不等于缺陷。
 - 会话没起来时整块是 `running=false` 加零值/空表，不返回 404，也不抛错。
 
+`groups` 里**第一个**是个人空间（`isPersonal=true`，见 3.2），它每个 daemon 启动时都会出现，
+所以按「第一个群」取数的断言会取到它；要取某个群的数请按 `id` 找（scripts/m1-windows.sh 的 `jget`）。
+
 **为什么带评论**：Web UI 每次刷新只发一个请求。传输中页面每秒重绘，若再按文件拉评论，
 请求数会跟着文件数涨。`/api/state` 是 UI 的唯一读口，评论就一起给；其余接口（`/api/groups`
 列表、`/api/groups/{gid}/files`）不带评论，避免列表接口被放大。
@@ -260,7 +263,7 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
 
 ```json
 {
-  "id": "7N2PKKSCFVK0NZT7", "name": "老板的群",
+  "id": "7N2PKKSCFVK0NZT7", "name": "老板的群", "isPersonal": false,
   "inviteCode": "RC4ME4MDAQ2078EP", "inviteTail8": "AQ2078EP",
   "invitePretty": "RC4M-E4MD-AQ20-78EP", "fingerprint": "3D482SC7",
   "memberCount": 2, "fileCount": 1, "seedingCount": 1,
@@ -270,6 +273,16 @@ POST { "enabled": false }        // enabled / baseUrl 都可选，给几项改�
   "files": [ /* 见 3.3 */ ]
 }
 ```
+
+**个人空间**（`isPersonal: true`，docs/design/personal-space.md、docs/core.md §3.13）：每个 daemon 启动时
+自动建一个「我的分享」，**固定置顶**（它就是 `/api/state` 里的第一个群）。它的字段与普通群完全同构，
+只有三处不同：
+
+- `id` 是 **32 字符**的派生 gid（普通群 16 字符），由本机身份派生，重启 / 重装都不变；
+- `inviteCode` / `inviteTail8` / `invitePretty` 一律是**空串**（不生成、不显示邀请码）；
+- `memberCount` 恒为 1（只有本机），它不可被加入、也不会出现在别人的候选里。
+
+P2 用 `isPersonal` 决定置顶与图标，不要用「名字 == 我的分享」或「成员数 == 1」去认它。
 
 成员对象：
 
@@ -531,7 +544,15 @@ POST { "body": "这段我下到 60% 了", "parent": "" }     // parent 为空 = 
   可以为空 —— 局域网内 mDNS 会先找到。
 - `timeoutMs`：1–60 秒，默认 25 秒。
 
-失败返回 409 `E_JOIN_FAILED`。
+失败返回 409，`code` 分两种：
+
+| code | 什么时候 | 界面该怎么写 |
+| --- | --- | --- |
+| `E_JOIN_FAILED` | 没找到 / 连不上 / 码不对（超时也算这一档） | 「没找到这个群：检查后 8 位、对方是否在跑、地址是否可达」 |
+| `E_JOIN_PERSONAL` | 对方只有个人空间（内核回的 `E_JOIN_PERSONAL`，见 docs/core.md §3.13） | 「对方是个人空间，不能被加入」 |
+
+两个码都是对端**明确拒绝**还是本机**没连上**的分界：`E_JOIN_PERSONAL` 来自对端的 err 帧
+（`kernel.lastJoinError()`），不是超时兜底出来的。
 
 ---
 

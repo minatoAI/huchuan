@@ -1175,6 +1175,79 @@ libtorrent 2.1 的 `total_done` 是「我们手上有的字节」，与 `total_w
   `downloadedBytes` / `diskBytes` / `kernelState` / `totalBytes` / `paused` / `public.*` 对老页面是无害的多余字段。
 - app（本轮改了）把 `kernelState` 投到界面：`ACQUIRING` → 「正在寻找来源」且激活开关保持打开，
   `WAITING_METADATA` → 「等待来源」，其余三态照旧（`M1GroupStore.toGroupFile` / `ui/Common.kt`）。
+### 3.13 个人空间：不可加入的本地群（本轮）
+
+规格见 docs/design/personal-space.md（L0 已拍板）。实现**不另写一套**文件 / 做种 / 评论 / 限速：
+个人空间就是一个普通的 GroupRuntime，隔离只加在「发现」与「准入」两处。
+
+**创建与派生**（core/src/main/kotlin/app/huchuan/core/m1/PersonalSpace.kt）
+
+首次 start() 时本地库里没有个人空间就自动建一个；旧 state.json 没有它时同样补建，已有群一律不动
+（ensurePersonalSpace 的认领顺序：已标 isPersonal 的群 → gid 等于派生值的群 → 都没有才新建，
+所以同一份数据上永远建不出第二个）。名字固定「我的分享」。
+
+gid / 邀请码 / keySeed / gHandle 全部由设备身份派生，所以**固定不变**（重启、重装应用，只要 identity.txt 还在就一样）：
+
+    gid     = B32(HKDF-SHA256(ikm = pub64, salt = "", info = "huchuan/personal/v1",       20 字节))
+    邀请码   = InviteCode(secret = HKDF(..., "huchuan/personal/v1/invite",  5 字节))
+    keySeed = HKDF(..., "huchuan/personal/v1/key",    32 字节)
+    gHandle = B32(HKDF(..., "huchuan/personal/v1/handle",  5 字节))
+
+20 字节 = 160 bit = **32 个 Crockford Base32 字符**，与普通群的 10 字节 / 16 字符长度不同，永远撞不上随机群 id。
+IKM 用**公钥**：这几样只要求「唯一且稳定」，不承担保密职责 —— 个人空间不接受任何对端，密钥不用于对外准入；
+换成私钥只会把 identity 的存储形态（PKCS8 落文件 / Android Keystore 包裹）绑进来，没有收益。
+
+派生出来的那枚 16 字符码**不显示、也不作为准入凭据**：它只是 GroupMeta 的结构需要（kGrp / fp / proof）。
+
+**隔离四条**（每条都有 harness 断言，见本节末尾）
+
+| 通道 | 实现 | 断言 |
+| --- | --- | --- |
+| mDNS | start() / refreshBtReachability() 注册前按 isPersonal 跳过；LanDiscovery.register 再兜一层 | mdns.broadcast_list_excludes_personal / mdns.browser_never_sees_personal |
+| 自带 tracker | TrackerService.watch() 里跳过并打 personal_space_tracker_skip（**唯一的判点**，调用方不用记得多写 if） | tracker.exactly_one_register / tracker.announce_only_normal |
+| join.req | PeerLink.onJoinReq 在其它校验**之前**判 isPersonal → E_JOIN_PERSONAL + personal_space_join_rejected | join.guest_got_explicit_code |
+| hello 声称该 gid | PeerLink.onHello 收到声称该 gid 的握手 → E_JOIN_PERSONAL + 断链 | join.host_logged_rejection |
+
+没有 per-group 的 PeerServer：消息层只有一个监听口，个人空间不注册任何群级监听；
+针对它的 join 一律在 onJoinReq 被拒，失败码 E_JOIN_PERSONAL（PeerLink.ERR_PERSONAL）—— 不是静默忽略。
+joinOpen 建出来就是 false，是纵深防御（真拒绝在 PeerLink，那一层码更明确）。
+
+**hello 报哪个 gid**（M1Kernel.helloGroupOrNull）
+
+协议 §1.2 的 hello 只带一个 gid，规则：本机**恰好一个可加入的群**时报它；有多个可加入的群时报空。
+个人空间**不算可加入的群**（否则每台设备都因为多了这个群而再也报不出 gid，P5 的手动地址加入会全线超时）。
+唯一例外：一个普通群都没有时退回报个人空间 —— 这时对端拿到的是明确的 E_JOIN_PERSONAL，
+而不是一次沉默的 12 s 超时（刚装好、还没建群是这个场景的常见形态）。
+
+**持久化**
+
+state.json 每群多一个 "isPersonal": true|false（落 GroupRuntime.isPersonal）。读回来时先看字段，
+再看「gid == 派生值」—— 旧库、以及补建后第一次保存之前都能认出来，认出来就写回标记
+（personal_space_ready 日志的 flag_restored=true 就是这一格）。
+
+**不可删除**：removeGroup 对个人空间返回 false 并打 group_remove_rejected reason=personal_space。
+删文件是删文件（hideLocally），不是删空间。
+
+**读口**
+
+    kernel.personalSpace()          // GroupRuntime?（内核没起来时 null）
+    kernel.groups()                 // 每个群带 isPersonal；个人空间排在最前（宿主按它置顶 P2）
+    kernel.mdnsBroadcastGroupIds()  // 当前在 mDNS 上广播的群（个人空间永远不在里面）
+    kernel.lastJoinError()          // 最近一次加入失败的原因；E_JOIN_PERSONAL = 对面明确拒绝
+
+lastJoinError 是给宿主做错误分流的：/api/join 把 E_JOIN_PERSONAL 原样回给界面，
+其余仍是笼统的 E_JOIN_FAILED（见 docs/daemon-api.md §3.4）。
+
+**验收**
+
+- PersonalSpaceSelfTest（挂在 SelfTest 里，输出 selftest.personal checks=… failures=…）。六组：
+  创建与派生（含用 identity.txt 的公钥独立重算 HKDF / Base32）、mDNS、tracker、不可加入、
+  复用文件路径（同一串动作后个人空间与普通群的读数签名必须逐个相等）、重启往返与旧库补建。
+- scripts/m1-windows.sh 第 3c 段从 daemon 侧再验一遍：/api/state 里的 isPersonal、名称固定、
+  gid 32 字符、邀请码三个字段为空、不向内置 tracker 注册、personal_space_ready 落日志。
+
+**未做**（按设计文档「不做」）：多个人空间、把群文件移进个人空间、把个人空间当普通群模板。
+
 ### 接 UI（下一轮）
 
 - 一个进程一个 `M1Kernel`，放在 Application / daemon 单例，`start()` 一次；`close()` 走生命周期。

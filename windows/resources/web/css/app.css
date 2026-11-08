@@ -343,6 +343,21 @@ button {
 
 .row-tag { justify-self: end; }
 
+/* 个人空间（P2 置顶的「我的分享」）：图标 + 左边一道品牌色细竖线，与普通群分开，不加说明文字。 */
+.row.is-personal { box-shadow: inset 3px 0 0 var(--brand); }
+
+.row.is-personal .row-title {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  font-weight: 600;
+}
+
+.row-icon {
+  flex: none;
+  color: var(--brand);
+}
+
 /* ------------------------------------------------------------ 文件表（P3） */
 .toolbar {
   display: flex;

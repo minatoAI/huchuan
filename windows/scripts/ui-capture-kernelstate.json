@@ -1,0 +1,60 @@
+{
+  "note": "内核态（kernelState）与个人空间（isPersonal）的取证图。数据来自 windows/scripts/capture-kernelstate-ui.sh 的装置：daemon 自动建的个人空间「我的分享」（里面一个私有文件）+ 一个普通群「老板的群」（一个私有文件 + 一条没有来源的公开磁力条目，脚本已经对它 POST 过 active=true，所以内核态是 acquiring）。parked 那一态没有 API 造得出来（导入到位就 absent、点激活就是 acquiring），走取证别名 p3-parked 的页面夹具。落点由路由别名钉死（p3-personal / p3-acquiring / p4-acquiring），因为深链默认落「有文件的第一个群」，个人空间常常是空的。page 必须等于 document.body.dataset.page，expect 必须出现在截图那一刻的 DOM 探针里。daemonPort 让壳连到这台装置专用的端口（47200 可能被同机别的服务占着）。",
+  "jobs": [
+    {
+      "name": "p2-personal",
+      "route": "p2",
+      "theme": "light",
+      "page": "p2",
+      "expect": "我的分享",
+      "daemonPort": 47280,
+      "shotDelayMs": 2500,
+      "shotTimeoutMs": 20000,
+      "describe": "P2 群列表：个人空间「我的分享」固定置顶（图标 + 品牌色竖线），普通群「老板的群」在其后"
+    },
+    {
+      "name": "p3-personal",
+      "route": "p3-personal",
+      "theme": "light",
+      "page": "p3",
+      "expect": "我的分享",
+      "daemonPort": 47280,
+      "shotDelayMs": 2500,
+      "shotTimeoutMs": 20000,
+      "describe": "P3 个人空间：标题「我的分享」，文件行 + 添加文件，成员入口仍是本机一个人"
+    },
+    {
+      "name": "p3-acquiring",
+      "route": "p3-acquiring",
+      "theme": "light",
+      "page": "p3",
+      "expect": "正在寻找来源",
+      "daemonPort": 47280,
+      "shotDelayMs": 2500,
+      "shotTimeoutMs": 20000,
+      "describe": "P3 文件行：激活了但元数据没到手，状态 chip 说「正在寻找来源」（不是「休眠」），尺寸仍不显示"
+    },
+    {
+      "name": "p4-acquiring",
+      "route": "p4-acquiring",
+      "theme": "light",
+      "page": "p4",
+      "expect": "正在寻找来源",
+      "daemonPort": 47280,
+      "shotDelayMs": 2500,
+      "shotTimeoutMs": 20000,
+      "describe": "P4 文件详情：chip「正在寻找来源」+ 激活开关保持「已激活」（acquiring 期间不弹回休眠）"
+    },
+    {
+      "name": "p3-parked",
+      "route": "p3-parked",
+      "theme": "light",
+      "page": "p3",
+      "expect": "休眠",
+      "daemonPort": 47280,
+      "shotDelayMs": 2500,
+      "shotTimeoutMs": 20000,
+      "describe": "P3 文件行：kernelState=parked（torrent 挂在会话里、被 libtorrent 挂着）仍说「休眠」——与 Android 同口径"
+    }
+  ]
+}
