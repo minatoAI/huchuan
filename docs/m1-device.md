@@ -127,14 +127,16 @@ P6 的离线文案因此由 `离线，显示缓存` 收成 `离线`（`p6_offlin
 
 | 入口 | 落点 | 0 的含义 | 重启后 |
 | --- | --- | --- | --- |
-| P4 单文件限速 | `GroupRuntime.setUploadLimitKbps(fileId, kbps)` → `TorrentHandle.setUploadLimit(kbps×1024)` | 清掉该 torrent 的限制 | `AppPrefs.file_limit.<fileId>` 落盘，冷启动与重新激活时重放 |
-| P7 全局限速（上/下） | `M1Kernel.setSessionUploadLimit / setSessionDownloadLimit` → libtorrent 会话级 `upload_rate_limit` / `download_rate_limit` | 不限（`不限`开关 = 两项都下发 0） | `AppPrefs` 落盘，冷启动 `M1Runtime.reapplyStoredLimits()` 重放 |
+| P4 单文件限速 | `GroupRuntime.setUploadLimitKbps(fileId, kbps)` → `TorrentHandle.setUploadLimit(kbps×1024)` | 关掉「限制速度」开关（或输入框清空）= 清掉该 torrent 的限制 | `AppPrefs.file_limit.<fileId>` 落盘，冷启动与重新激活时重放 |
+| P7 全局限速（上/下） | `M1Kernel.setSessionUploadLimit / setSessionDownloadLimit` → libtorrent 会话级 `upload_rate_limit` / `download_rate_limit` | 关掉「限制速度」开关 = 两项都下发 0 | `AppPrefs` 落盘，冷启动 `M1Runtime.reapplyStoredLimits()` 重放 |
 
 - 全局限速是**会话级**：走 `applySettings`，运行期立即生效，对已经在传的 torrent 同样有效；
   和单文件限速同时存在时，每个 torrent 取更小的那个。
-- 真机判据（脚本第 12 步，三份 32 MiB 素材各管一件事）：P4 设 1024 → 桌面端稳态 965 KB/s、
-  均速 958，清空输入框后 `kbps=0`；P7 设上行 512 → 另一份稳态 494 KB/s、均速 481；
-  清掉限制后第三份 10853 KB/s（多轮在 8.4–11.7 MB/s 区间）。
+- 两处的入口都是「限制速度」开关：打开后才出现 KB/s 输入框，关掉开关 = 两项都下发 0。
+  脚本用输入框是否出现判开关状态，只在关着时点它，避免把开关又关掉。
+- 真机判据（脚本第 12 步，三份 32 MiB 素材各管一件事）：P4 打开「限制速度」输入 1024 →
+  桌面端稳态 965 KB/s、均速 958，关掉开关后 `kbps=0`；P7 打开「限制速度」设上行 512 →
+  另一份稳态 494 KB/s、均速 481；关掉限制后第三份 10853 KB/s（多轮在 8.4–11.7 MB/s 区间）。
   两条限速都带内核读回（`session_up_kbps=512 ok=true` / `kbps=1024 applied=true`），
   防「设置成功但没生效」。
 - **判据用稳态，不用均速**：稳态 = 桌面端 `auto_progress` 里 libtorrent 报的瞬时速率中位数
@@ -280,13 +282,13 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 | `team.p3_no_chip_at_0` | 0 队友时 P3 文件行不出现「组队」字样（ui-dump --texts 取全屏文本） |
 | `team.p4_no_line_at_0` | 0 队友时 P4 不出现「正在组队」 |
 | `team.no_teammate_events` | 整个流程里没有任何 `teammates_changed` 的 count>0（0 是常态，界面不靠定时器）。判据必须先锚 `event=teammates_changed` 再取 `count`：日志行中间还夹着 group_id / file_id，写 `grep -o 'teammates_changed count='` 会恒真（2026-11-06 修） |
-| `limit.file_set_1024` | P4 单文件限速输入 1024 → `file_upload_limit ... kbps=1024 applied=true`（applied = 该 torrent 已在会话里） |
+| `limit.file_set_1024` | P4 打开「限制速度」开关，输入 1024 → `file_upload_limit ... kbps=1024 applied=true`（applied = 该 torrent 已在会话里） |
 | `limit.file_1024_enforced` | 桌面端下载该 32 MiB 的**稳态**速率 ≤ 1229 KB/s（标称 1024 留 20% 余量；下限 100 只证明在传） |
-| `limit.file_cleared` | 清空输入框 → `file_upload_limit ... kbps=0 applied=true`（0 = 不限，真的把 handle 上的限制清掉） |
-| `limit.global_set_512` | P7 上行改成 512：`global_limit_set up_kbps=512`（单位 KB/s） |
+| `limit.file_cleared` | 关掉「限制速度」开关 → `file_upload_limit ... kbps=0 applied=true`（0 = 不限，真的把 handle 上的限制清掉） |
+| `limit.global_set_512` | P7 打开「限制速度」，上行改成 512：`global_limit_set up_kbps=512`（单位 KB/s） |
 | `limit.global_applied` | 读回校验：`global_limit_applied ... session_up_kbps=512 ... ok=true`（读的是会话里生效的值，不是本地偏好） |
 | `limit.global_512_enforced` | 桌面端下载另一份 32 MiB 的**稳态**速率 ≤ 600 KB/s（标称 512 留 20% 余量，下限 200 防呆） |
-| `limit.global_cleared` / `limit.global_applied_cleared` | 「不限」把两项都下发 0，并读回 `session_up_kbps=0 ok=true` |
+| `limit.global_cleared` / `limit.global_applied_cleared` | 关掉「限制速度」把两项都下发 0，并读回 `session_up_kbps=0 ok=true` |
 | `limit.cleared_speed_restored` | 清掉限制后第三份同尺寸文件实测 > 2048 KB/s（2 MB/s） |
 | `limit.global_restored_after_restart` | 冷启动后按偏好重新下发 512：`global_limit_applied ... session_up_kbps=512 ... ok=true` 的条数比重启前多一条（限速不落内核盘，只靠 app 重放） |
 | `limit.restored_logged` | 冷启动日志里有 `limits_restored files=N`（全局限速 + 每个文件的限速都在这里重放） |

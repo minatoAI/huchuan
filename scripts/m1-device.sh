@@ -32,7 +32,7 @@
 #       P3 文件行不出现「组队」chip、P4 不出现「正在组队」行（0 就是不显示，不是显示 0）；
 #       logcat 里也不会出现 teammates_changed count≥1。
 #       限速（step 12，单位一律 KB/s）：
-#       P4 单文件限速设 1024 → 桌面端下载 32 MiB 实测 ≤ 1229 KB/s（20% 余量），清空输入框后 kbps=0；
+#       P4 打开「限制速度」设 1024 → 桌面端下载 32 MiB 实测 ≤ 1229 KB/s（20% 余量），关掉开关后 kbps=0；
 #       P7 全局限速设上行 512 → 另一份 32 MiB 实测 ≤ 600 KB/s；清掉限制（不限）→ 第三份实测 > 2 MB/s。
 #       两条都带内核读回校验（session_up_kbps=512 / ok=true），防止「设置成功但没生效」。
 #       debuggable：私有目录哈希要 run-as，release 包上记 SKIP（原因 package not debuggable），
@@ -369,18 +369,20 @@ open_settings() {
   see_text "全局限速" 20000
 }
 
-# 把 P7 上行限速设成 $1 KB/s（0 = 打开「不限」）。
+# 把 P7 上行限速设成 $1 KB/s（0 = 关掉「限制速度」= 两项都按 0 下发）。
 #
-# 抽屉里的「不限」是一个开关，点一下翻转一次；脚本是唯一的状态机驱动者：
-# 首次打开时它是开的（AppPrefs 默认 unlimited=true），所以先点一下输入框才可编辑。
-# 成功与否由 logcat 的 event=global_limit_set 判定，不靠界面猜测。
+# 「限制速度」是整行可点的开关：开 = 显示上行/下行输入框，关 = 不限。
+# 开关本身没有可读文本，用「上行」输入框是否出现判状态；脚本是唯一状态机驱动者，
+# 每次只按当前状态点一下。成功与否由 logcat 的 event=global_limit_set 判定，不靠界面猜测。
 p7_upload_limit() {
   local kbps="$1" shot="${2:-}" before
   before="$(count_log "event=global_limit_set")"
   open_settings || return 1
-  tap "不限" >/dev/null 2>&1 || return 1
-  sleep 1
   if [ "$kbps" != "0" ]; then
+    if ! see_text "上行" 3000; then
+      tap "限制速度" exact >/dev/null 2>&1 || return 1
+      see_text "上行" 8000 || return 1
+    fi
     tap "上行" >/dev/null 2>&1 || return 1
     sleep 1
     # 先清空旧值：输入框会保留上一次的数字，直接 input text 会追加成 512512。
@@ -389,6 +391,17 @@ p7_upload_limit() {
     sleep 1
     sh_ input text "$kbps" >/dev/null 2>&1
     sleep 1
+  else
+    if see_text "上行" 3000; then
+      tap "限制速度" exact >/dev/null 2>&1 || return 1
+    else
+      # 已经是不限：先开再关，逼出本轮可断言的 global_limit_set / applied 日志，
+      # 不能拿上一轮的「up_kbps=0」冒充本轮证据。
+      tap "限制速度" exact >/dev/null 2>&1 || return 1
+      see_text "上行" 8000 || return 1
+      tap "限制速度" exact >/dev/null 2>&1 || return 1
+    fi
+    sleep 2
   fi
   # 截图必须在抽屉还开着的时候拍：关掉之后就只剩 P2 了（第一版就踩了这个坑）。
   if [ -n "$shot" ]; then screenshot "$shot"; fi
@@ -672,6 +685,9 @@ info "logcat / crash buffer cleared"
 for push_file in "$PAYLOAD" "$THROTTLE_PAYLOAD" "$FREE_PAYLOAD" "$RESTORE_PAYLOAD"; do
   push_name="$(basename "$push_file")"
   "$ADB" -s "$SERIAL" push "$(w "$push_file")" "/sdcard/Download/$push_name" 2>&1 | tail -1
+  # adb push 会保留本地素材的 mtime（缓存可能是好几天前的），而 MIUI 的「下载」列表按修改时间
+  # 倒序：旧 mtime 会被排到屏幕外，SAF 按名字永远看不到（2026-11-08 踩过）。touch 一下再扫。
+  sh_ touch "/sdcard/Download/$push_name" >/dev/null 2>&1
   # 媒体库索引要立刻看到，SAF 的「下载」目录里才有这几行。
   sh_ "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/$push_name" >/dev/null 2>&1
 done
@@ -1370,19 +1386,25 @@ for share_name in "$THROTTLE_NAME" "$FREE_NAME"; do
 done
 screenshot "p12-files-seeding"
 
-# ② P4 单文件限速 1024 KB/s：进该文件的 P4 → 点占位符「不限」聚焦输入框 → 输入 1024。
+# ② P4 单文件限速 1024 KB/s：进该文件的 P4 → 打开「限制速度」开关 → 点 KB/s 聚焦输入框 → 输入 1024。
 # 走的是「一文件一 torrent + TorrentHandle.setUploadLimit」，与 P7 的 session 级限速是两层。
 if ! see_text "$THROTTLE_NAME" 20000; then
   screenshot "p12-p3-no-throttle-file"
   die "P3 上没有 $THROTTLE_NAME"
 fi
 tap "$THROTTLE_NAME" exact
-if ! see_text "单文件限速" 25000; then
+if ! see_text "限制速度" 25000; then
   screenshot "p12-p4-missing"
   uidump "p12-p4-missing"
   die "点文件行没进 P4"
 fi
-tap "不限" >/dev/null 2>&1 || die "点不进单文件限速输入框"
+# P4 的限速入口是「限制速度」开关：打开后才出现 KB/s 输入框。开关已经开着时不要再点，
+# 否则会把它关掉（applyFileLimit(false) 会下发 0）；用 KB/s 输入框是否出现判开关状态。
+if ! see_text "KB/s" 2000; then
+  tap "限制速度" exact >/dev/null 2>&1 || die "点不开「限制速度」开关"
+  see_text "KB/s" 8000 || die "打开「限制速度」后没有 KB/s 输入框"
+fi
+tap "KB/s" >/dev/null 2>&1 || die "点不进单文件限速输入框"
 sleep 1
 sh_ input text "1024" >/dev/null 2>&1
 sleep 2
@@ -1407,13 +1429,11 @@ chk "limit.file_1024_enforced" \
   "$([ "${FILE_STEADY:-0}" -ge 100 ] 2>/dev/null && [ "${FILE_STEADY:-0}" -le 1229 ] 2>/dev/null && echo 1 || echo 0)" \
   "桌面稳态 ${FILE_STEADY:-?} KB/s、均速 ${FILE_KBPS:-?} KB/s（标称 1024，判据 ≤1229；不限速时 >8000）"
 
-# ④ 清掉单文件限速：输入框清空 = 0 = 不限（真的把 handle 上的限制清掉，不是「跳过不设」）。
+# ④ 清掉单文件限速：关掉「限制速度」开关 = 0 = 不限（真的把 handle 上的限制清掉，不是「跳过不设」）。
 enter_group || die "回不到 P3（清单文件限速）"
 tap "$THROTTLE_NAME" exact
-see_text "单文件限速" 25000 || die "进不了 P4（清单文件限速）"
-tap "1024" exact >/dev/null 2>&1 || die "点不进单文件限速输入框（已有值）"
-sh_ input keyevent KEYCODE_MOVE_END >/dev/null 2>&1
-sh_ input keyevent 67 67 67 67 >/dev/null 2>&1
+see_text "限制速度" 25000 || die "进不了 P4（清单文件限速）"
+tap "限制速度" exact >/dev/null 2>&1 || die "关不掉「限制速度」开关"
 sleep 2
 sh_ input keyevent 111 >/dev/null 2>&1 || true
 screenshot "p12-p4-file-limit-cleared"
