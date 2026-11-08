@@ -126,11 +126,14 @@ fun FileScreen(
     }
 
     PageScaffold(
-        // P4 顶部显示完整名：可换行、最多两行；两行用 titleMedium 才放得进 64dp 的 TopAppBar。
-        // 点/横线后补零宽空格，长文件名才有地方断行。
-        title = softWrapName(file.name),
-        titleMaxLines = 2,
-        titleStyle = MaterialTheme.typography.titleMedium,
+        // P4 顶部显示完整名：按实测宽度折两行，不插入零宽字符（见 FileNameTitle）。
+        title = file.name,
+        titleContent = {
+            FileNameTitle(
+                name = file.name,
+                style = MaterialTheme.typography.titleMedium,
+            )
+        },
         // 「移除」只对公开条目出现（public-swarm §5.2）：私有条目行为不变。
         actions = {
             if (file.scope == FileScope.PUBLIC) {
@@ -413,7 +416,10 @@ private data class CommentRow(val comment: Comment, val depth: Int)
 
 private fun commentRows(comments: List<Comment>): List<CommentRow> {
     if (comments.isEmpty()) return emptyList()
+    // comments 来自内核投影，顺序是「新 → 旧」（M1GroupStore.toGroupFile 末尾 reversed）。
+    // 串内按时间正序 = 下标从大到小；串间按最近活动 = 串内最小下标。
     val byId = comments.associateBy { it.id }
+    val indexById = comments.withIndex().associate { it.value.id to it.index }
     val rootIds = HashMap<String, String>(comments.size)
     fun rootIdOf(comment: Comment): String {
         rootIds[comment.id]?.let { return it }
@@ -428,16 +434,24 @@ private fun commentRows(comments: List<Comment>): List<CommentRow> {
     }
     comments.forEach { rootIds[it.id] = rootIdOf(it) }
 
-    val rows = ArrayList<CommentRow>(comments.size)
-    comments.forEach { root ->
-        if (rootIds[root.id] != root.id) return@forEach
-        rows.add(CommentRow(root, depth = 1))
-        comments.forEach { child ->
-            if (child.id != root.id && rootIds[child.id] == root.id) {
-                rows.add(CommentRow(child, depth = 2))
-            }
-        }
+    val threads = LinkedHashMap<String, MutableList<Comment>>()
+    comments.forEach { comment ->
+        threads.getOrPut(rootIds.getValue(comment.id)) { ArrayList() }.add(comment)
     }
+
+    val rows = ArrayList<CommentRow>(comments.size)
+    threads.entries
+        // 最近活动的串在上：串内最小下标 = 最近一条评论。
+        .sortedBy { (_, members) -> members.minOf { indexById.getValue(it.id) } }
+        .forEach { (rootId, members) ->
+            val root = members.firstOrNull { it.id == rootId } ?: return@forEach
+            rows.add(CommentRow(root, depth = 1))
+            members.asSequence()
+                .filter { it.id != rootId }
+                // 新→旧列表反转成旧→新，父评论已经单独放在最上面。
+                .sortedByDescending { indexById.getValue(it.id) }
+                .forEach { rows.add(CommentRow(it, depth = 2)) }
+        }
     return rows
 }
 

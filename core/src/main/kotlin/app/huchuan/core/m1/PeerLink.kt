@@ -189,7 +189,7 @@ internal class PeerLink(
 
     private fun sendHello(signed: Boolean) {
         val identity = kernel.identity
-        val g = kernel.singleGroupOrNull()
+        val g = kernel.helloGroupOrNull()
         val gid = if (g != null) g.groupId else ""
         val proof = if (g != null) g.meta.proofHex(chanId) else ""
         val peerN = peerNonce

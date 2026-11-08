@@ -978,11 +978,9 @@ class M1Kernel @JvmOverloads constructor(
         tracker = service
         service.start()
         // 从 state.json 恢复出来的群：立刻注册并 announce，冷启动重连的候选表里就有跨网那一份。
-        // 个人空间跳过（它不可加入，注册上去只会让服务端多一条永远不会有 peer 的 swarm）。
-        for (group in allGroups()) {
-            if (group.isPersonal) continue
-            service.watch(group)
-        }
+        // 个人空间由 [TrackerService.watch] 自己跳过并留一条 personal_space_tracker_skip ——
+        // 「谁不该注册」只在那一个地方判，调用方不需要记得多写一个 if。
+        for (group in allGroups()) service.watch(group)
     }
 
     // ------------------------------------------------------------------ 会话级（P7 全局限速）
@@ -1122,8 +1120,23 @@ class M1Kernel @JvmOverloads constructor(
 
     internal fun groupById(gid: String): GroupRuntime? = group(gid)
 
-    internal fun singleGroupOrNull(): GroupRuntime? = synchronized(stateLock) {
-        if (groupsById.size == 1) groupsById.values.first() else null
+    /**
+     * hello 里报哪个群（协议 §1.2 的 hello 只带一个 gid）。
+     *
+     * 规则：本机**恰好一个可加入的群**时报它；有多个可加入的群时报空（对端只能靠 join.req 指定）。
+     * 个人空间不算「可加入的群」—— 它不可加入，报出去只会让加入方多一次注定失败的尝试。
+     *
+     * 唯一例外：本机一个普通群都没有时，退回报个人空间。这时对端拿到的是一次
+     * `E_JOIN_PERSONAL`（明确的「这台机器只有个人空间」），而不是一次沉默的 12 s 超时 ——
+     * 这是命中率很高的场景（刚装好、还没建群），沉默超时是错的反馈。
+     */
+    internal fun helloGroupOrNull(): GroupRuntime? = synchronized(stateLock) {
+        val joinable = groupsById.values.filter { !it.isPersonal }
+        when {
+            joinable.size == 1 -> joinable.first()
+            joinable.isNotEmpty() -> null
+            else -> groupsById.values.firstOrNull { it.isPersonal }
+        }
     }
 
     // ------------------------------------------------------------------ 未读数（缺口 G4）

@@ -176,6 +176,23 @@ ival() { printf '%s' "$1" | grep -o "\"$2\":[0-9][0-9]*" | head -1 | sed 's/^[^:
 bval() { printf '%s' "$1" | grep -o "\"$2\":\(true\|false\)" | head -1 | sed 's/^[^:]*://'; }
 # JSON 里被转义的反斜杠还原（savedPath 在 Windows 上一定是 C:\\a\\b 这种形式）
 unbackslash() { printf '%s' "$1" | sed 's/\\\\/\\/g'; }
+# 从 JSON 回包里取一个值：jget <json> '<js 表达式，d = 回包的 data 块>'
+#   。/api/state 里现在有多个群（每个 daemon 都带一个个人空间），"取第一个匹配" 会取错群，
+#   所以按字段取值的断言一律走这个按表达式取的助手（node 已经是本脚本的硬依赖）。
+jget() {
+  printf '%s' "$1" | node -e '
+let s = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (d) => { s += d; });
+process.stdin.on("end", () => {
+  let doc;
+  try { doc = JSON.parse(s); } catch (e) { process.stdout.write(""); return; }
+  const scope = doc && doc.data !== undefined ? doc.data : doc;
+  let v = "";
+  try { v = new Function("d", "return (" + (process.argv[1] || "") + ");")(scope); } catch (e) { v = ""; }
+  process.stdout.write(v === undefined || v === null ? "" : String(v));
+});' "$2"
+}
 
 wait_health() { # wait_health <端口> <秒>；成功时把 /api/health 的响应打到 stdout
   local port=$1 limit=$2 i=0 body=""
@@ -318,6 +335,31 @@ chk "group.created (gid=$GID)" "$([ -n "$GID" ] && echo 1 || echo 0)"
 chk "group.invite_code_16 (code=$INVITE)" "$([ "$INVITE_LEN" = "16" ] && echo 1 || echo 0)"
 chk "group.invite_tail8 (tail8=$TAIL8)" \
   "$([ "$TAIL8" = "$(printf '%s' "$INVITE" | tail -c 8)" ] && echo 1 || echo 0)"
+
+# ------------------------------------------------------------------ 3c. 个人空间（不可加入的本地群）
+# 每个 daemon 启动时都会建一个「我的分享」（docs/design/personal-space.md）：它出现在
+# /api/state 的 groups 里、带 isPersonal=true，但不生成邀请码、不广播 mDNS、不向 tracker 注册。
+say ""
+say "--- A 的个人空间（/api/state 里 isPersonal 的那个群）"
+STATE_PS=$(get "http://127.0.0.1:$PORT_A/api/state")
+PS_GID=$(jget "$STATE_PS" 'd.groups.filter((g) => g.isPersonal).map((g) => g.id).join(",")')
+PS_NAME=$(jget "$STATE_PS" 'd.groups.filter((g) => g.isPersonal).map((g) => g.name).join(",")')
+PS_INVITE=$(jget "$STATE_PS" 'd.groups.filter((g) => g.isPersonal).map((g) => g.inviteCode + "|" + g.inviteTail8 + "|" + g.invitePretty).join(",")')
+GROUP_COUNT=$(jget "$STATE_PS" 'd.groups.length')
+PS_LEN=$(printf '%s' "$PS_GID" | wc -c | tr -d ' ')
+chk "personal.in_state (gid=$PS_GID)" "$([ -n "$PS_GID" ] && echo 1 || echo 0)"
+chk "personal.name_fixed ($PS_NAME)" "$([ "$PS_NAME" = "我的分享" ] && echo 1 || echo 0)"
+chk "personal.gid_32_chars (len=$PS_LEN)" "$([ "$PS_LEN" = "32" ] && echo 1 || echo 0)"
+chk "personal.gid_distinct_from_group" "$([ -n "$PS_GID" ] && [ "$PS_GID" != "$GID" ] && echo 1 || echo 0)"
+chk "personal.invite_fields_blank ($PS_INVITE)" "$([ "$PS_INVITE" = "||" ] && echo 1 || echo 0)"
+chk "personal.state_has_two_groups ($GROUP_COUNT)" "$([ "$GROUP_COUNT" = "2" ] && echo 1 || echo 0)"
+chk "personal.ready_logged" \
+  "$(grep -q 'event=personal_space_ready .*created=true' "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+# 不向 tracker 注册：A 打开了内置 tracker，普通群有 tracker_started，个人空间一条都不能有。
+chk "personal.not_registered_on_tracker" \
+  "$([ -n "$PS_GID" ] && grep -q "event=tracker_started gid=$PS_GID " "$LOG_A" 2>/dev/null && echo 0 || echo 1)"
+chk "personal.tracker_skip_logged" \
+  "$(grep -q 'event=personal_space_tracker_skip' "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
 
 # ------------------------------------------------------------------ 3b. 跨网发现（开）
 # 默认开 + 内置地址：daemon 把地址交给内核，群一建好 tracker 线程就开始注册。
@@ -527,7 +569,9 @@ chk "web.state_has_group ($GROUP_NAME)" "$(printf '%s' "$STATE_A" | grep -q "$GR
 chk "web.state_has_file (payload-32m.bin)" "$(printf '%s' "$STATE_A" | grep -q 'payload-32m.bin' && echo 1 || echo 0)"
 chk "web.state_has_comment" "$(printf '%s' "$STATE_A" | grep -q "$COMMENT_BODY" && echo 1 || echo 0)"
 chk "web.state_file_complete" "$(printf '%s' "$STATE_A" | grep -q '"complete":true' && echo 1 || echo 0)"
-STATE_MEMBERS=$(ival "$STATE_A" memberCount)
+# 按 gid 取那一群的 memberCount：/api/state 的 groups 里还有个人空间（成员数 1），
+# 按「第一个 memberCount」取会取到它 —— 那是断言取错了位置，不是页面读错了。
+STATE_MEMBERS=$(jget "$STATE_A" 'd.groups.filter((g) => g.id === "'"$GID"'").map((g) => g.memberCount).join(",")')
 chk "web.state_member_count_2 ($STATE_MEMBERS)" "$([ "$STATE_MEMBERS" = "2" ] && echo 1 || echo 0)"
 # /api/state 是页面的唯一读口：队友数与全局限速的内核读回都得在这一份里（页面不另发请求）
 chk "web.state_has_teammates_field" "$(printf '%s' "$STATE_A" | grep -q '\"teammates\":' && echo 1 || echo 0)"

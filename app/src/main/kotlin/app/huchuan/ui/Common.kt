@@ -1,8 +1,10 @@
 package app.huchuan.ui
 
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -20,6 +22,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.text
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -55,20 +61,24 @@ fun PageScaffold(
     actions: @Composable RowScope.() -> Unit = {},
     snackbarHost: @Composable () -> Unit = {},
     bottomBar: @Composable () -> Unit = {},
-    titleMaxLines: Int = 1,
-    titleStyle: TextStyle? = null,
+    // P4 长文件名要两行且语义必须是原文：标题槽可换成自绘内容，默认仍是单行 Text。
+    titleContent: (@Composable () -> Unit)? = null,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Text(
-                        text = title,
-                        style = titleStyle ?: MaterialTheme.typography.titleLarge,
-                        maxLines = titleMaxLines,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    if (titleContent != null) {
+                        titleContent()
+                    } else {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.titleLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 },
                 navigationIcon = { navigation?.invoke() },
                 actions = actions,
@@ -129,18 +139,70 @@ fun formatSize(bytes: Long): String {
 fun formatRate(bytesPerSecond: Long): String = formatSize(bytesPerSecond) + "/s"
 
 /**
- * 给长文件名补断行机会：点 / 横线 / 下划线后插零宽空格，否则整段拉丁文件名会被当成
- * 一个不可断的词，两行标题的第一行只剩开头一两个汉字。
+ * P4 顶栏文件名：按实测宽度折两行，不往字符串里塞零宽字符。
+ *
+ * 视觉上是两个 Text，但语义只留外层一个节点，text 就是真实文件名；
+ * 这样 uiautomator / TalkBack 读到的标题不会被断行辅助字符污染。
  */
-fun softWrapName(name: String): String {
-    // 扩展名前的最后一个点不插零宽空格：宁可断在别的点上，也不要把 .mkv 拆到下一行。
-    val lastDot = name.lastIndexOf('.')
-    return buildString(name.length + 16) {
-        name.forEachIndexed { index, c ->
-            append(c)
-            if ((c == '.' && index != lastDot) || c == '-' || c == '_') append('\u200B')
+@Composable
+fun FileNameTitle(name: String, style: TextStyle, modifier: Modifier = Modifier) {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxWidth()
+            .semantics { text = AnnotatedString(name) },
+    ) {
+        val lines = remember(name, constraints.maxWidth, style, density, measurer) {
+            splitFileName(name, style, constraints.maxWidth, measurer)
+        }
+        Column(modifier = Modifier.clearAndSetSemantics {}) {
+            Text(
+                text = lines.first(),
+                style = style,
+                maxLines = 1,
+                softWrap = false,
+            )
+            if (lines.size > 1) {
+                Text(
+                    text = lines[1],
+                    style = style,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
+}
+
+private fun splitFileName(
+    name: String,
+    style: TextStyle,
+    maxWidth: Int,
+    measurer: TextMeasurer,
+): List<String> {
+    if (maxWidth <= 0 || maxWidth == Constraints.Infinity) return listOf(name)
+    fun fits(candidate: String): Boolean =
+        measurer.measure(candidate, style = style, maxLines = 1, softWrap = false).size.width <= maxWidth
+    if (fits(name)) return listOf(name)
+
+    val dot = name.lastIndexOf('.')
+    val hasExtension = dot > 0 && dot < name.length - 1
+    val lastSplit = (if (hasExtension) dot else name.length - 1).coerceAtLeast(1)
+
+    // 优先在扩展名前最后一个分隔符处折行，第二行尽量是完整的“x265.mkv”。
+    for (i in lastSplit downTo 1) {
+        if (name[i - 1] == '.' || name[i - 1] == '-' || name[i - 1] == '_' || name[i - 1] == ' ') {
+            if (fits(name.substring(0, i)) && fits(name.substring(i))) {
+                return listOf(name.substring(0, i), name.substring(i))
+            }
+        }
+    }
+    // 没有可用分隔符：首行取能放下的最长前缀，次行交给 TextOverflow 兜底。
+    var split = lastSplit
+    while (split > 1 && !fits(name.substring(0, split))) split--
+    return listOf(name.substring(0, split), name.substring(split))
 }
 
 /**

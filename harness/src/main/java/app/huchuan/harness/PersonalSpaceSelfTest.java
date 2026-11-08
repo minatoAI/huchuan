@@ -304,11 +304,17 @@ final class PersonalSpaceSelfTest {
                                              GroupRuntime personal, GroupRuntime normal) throws Exception {
         File personalFile = new File(kernel.getDataDir(), "personal-payload.bin");
         File normalFile = new File(kernel.getDataDir(), "normal-payload.bin");
+        File personalToggle = new File(kernel.getDataDir(), "personal-toggle.bin");
+        File normalToggle = new File(kernel.getDataDir(), "normal-toggle.bin");
         M1Harness.createRandomFile(personalFile, 256 * 1024);
         M1Harness.createRandomFile(normalFile, 256 * 1024);
+        M1Harness.createRandomFile(personalToggle, 128 * 1024);
+        M1Harness.createRandomFile(normalToggle, 128 * 1024);
 
         FileEntry a = personal.addFile(personalFile);
         FileEntry b = normal.addFile(normalFile);
+        FileEntry a2 = personal.addFile(personalToggle);
+        FileEntry b2 = normal.addFile(normalToggle);
         check.accept("reuse.file_added_personal", a != null && a.getSize() == personalFile.length());
         check.accept("reuse.file_added_normal", b != null && b.getSize() == normalFile.length());
 
@@ -316,7 +322,7 @@ final class PersonalSpaceSelfTest {
         String afterAddB = signature(normal, b.getFileId());
         check.accept("reuse.add_state_matches (" + afterAddA + ")",
                 afterAddA.equals(afterAddB) && afterAddA.contains("role=SEEDING")
-                        && afterAddA.contains("seeds=1"));
+                        && afterAddA.contains("seeds=2"));
 
         // 评论：同一条 oplog 路径，个人空间的评论同样进 visibleOps。
         OpRecord opA = personal.comment(a.getFileId(), "个人空间里的一条评论", null);
@@ -332,23 +338,23 @@ final class PersonalSpaceSelfTest {
         check.accept("reuse.upload_limit_matches_normal",
                 signature(personal, a.getFileId()).equals(signature(normal, b.getFileId())));
 
-        // 休眠 -> 再激活：做种集合的进出与普通群完全同一套判定。
-        personal.stopFile(a.getFileId());
-        normal.stopFile(b.getFileId());
-        String hibernatedA = signature(personal, a.getFileId());
-        String hibernatedB = signature(normal, b.getFileId());
+        // 休眠 -> 再激活：做种集合的进出与普通群完全同一套判定（用第二条文件，第一条继续做种）。
+        personal.stopFile(a2.getFileId());
+        normal.stopFile(b2.getFileId());
+        String hibernatedA = signature(personal, a2.getFileId());
+        String hibernatedB = signature(normal, b2.getFileId());
         check.accept("reuse.hibernate_matches (" + hibernatedA + ")",
                 hibernatedA.equals(hibernatedB) && hibernatedA.contains("role=NONE")
-                        && hibernatedA.contains("seeds=0"));
+                        && hibernatedA.contains("seeds=1"));
 
-        boolean reactivatedA = personal.startDownload(a.getFileId());
-        boolean reactivatedB = normal.startDownload(b.getFileId());
-        String reactivatedSigA = signature(personal, a.getFileId());
-        String reactivatedSigB = signature(normal, b.getFileId());
+        boolean reactivatedA = personal.startDownload(a2.getFileId());
+        boolean reactivatedB = normal.startDownload(b2.getFileId());
+        String reactivatedSigA = signature(personal, a2.getFileId());
+        String reactivatedSigB = signature(normal, b2.getFileId());
         check.accept("reuse.reactivate_matches_normal (personal=" + reactivatedA + " normal=" + reactivatedB + ")",
                 reactivatedA == reactivatedB && reactivatedSigA.equals(reactivatedSigB));
-        // 回到做种：与「加文件」那一刻的读数一致（个人空间的文件还是要能分享出去）。
-        check.accept("reuse.personal_back_to_seeding", personal.localRole(a.getFileId())
+        // 第一条文件始终在做种：个人空间的文件还是要能分享出去（重启续种在 restart 那一组验）。
+        check.accept("reuse.personal_still_seeding", personal.localRole(a.getFileId())
                 == GroupRuntime.LocalRole.SEEDING);
         return a;
     }
