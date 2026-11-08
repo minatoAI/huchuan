@@ -162,7 +162,8 @@ fun HomeScreen(
 
 /**
  * P2 的一行。个人空间与普通群的差别只有两处（docs/design/personal-space.md）：
- * 左边多一枚品牌色图标，并且**不写「做种 n」**——个人空间只有本机自己，成员数 / 做种数没有意义。
+ * 左边多一枚品牌色图标；次级信息写「n 个文件」而不是「做种 n」——个人空间只有本机自己，
+ * 成员数 / 做种数没有意义，但这一行必须和普通群等高，否则列表节奏会断。
  */
 @Composable
 private fun GroupRow(group: Group, personal: Boolean, onClick: () -> Unit) {
@@ -171,11 +172,15 @@ private fun GroupRow(group: Group, personal: Boolean, onClick: () -> Unit) {
     } else {
         null
     }
-    val supporting: (@Composable () -> Unit)? = if (personal) {
-        null
-    } else {
-        {
-            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
+    val supporting: @Composable () -> Unit = {
+        Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
+            if (personal) {
+                Text(
+                    text = stringResource(R.string.p2_files, group.files.size),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
                 Text(
                     text = stringResource(R.string.p2_seeding, group.seedingCount),
                     style = MaterialTheme.typography.bodyMedium,

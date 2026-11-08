@@ -11,7 +11,7 @@
 | 位置 | 改动 |
 | --- | --- |
 | `app/src/main/kotlin/app/huchuan/HuchuanApp.kt` | `HuchuanState` 增 `personalGroupId` / `isPersonal` / `lastJoinWasPersonal`：读 `kernel.personalSpace()` 与 `lastJoinError()`，界面不按群名猜 |
-| `app/src/main/kotlin/app/huchuan/ui/HomeScreen.kt` | 个人空间稳定置顶；行首品牌色图标；该行不显示「做种 n」（成员数 / 做种数对它无意义） |
+| `app/src/main/kotlin/app/huchuan/ui/HomeScreen.kt` | 个人空间稳定置顶；行首品牌色图标；次级信息写「n 个文件」（不是做种数），与普通群等高 |
 | `app/src/main/kotlin/app/huchuan/ui/GroupScreen.kt` | 个人空间不出现「成员」入口；空态改「还没有文件，加一个再分享链接」 |
 | `app/src/main/kotlin/app/huchuan/ui/NewGroupScreen.kt` | P5 失败分流：`E_JOIN_PERSONAL` →「对方是个人空间，不能加入」，其余 →「加入失败，检查邀请码或网络」 |
 | `app/src/main/res/values/strings.xml`、`drawable/ic_personal_space.xml` | 新增 4 条文案 + 一枚 24dp 线性图标（未引入 material-icons） |
@@ -20,7 +20,7 @@
 一键重跑：`bash artifacts/personal-ui/verify-personal-ui.sh`（日志 `artifacts/personal-ui/verify-personal-ui.log`，
 截图在 `artifacts/personal-ui/screenshots/5b94673a/`）。
 
-- P2 首行「我的分享」、有专属图标、行内无「做种」：`20261108-135014-430-p2-personal-first.png`（深色 `20261108-135531-862-p2-personal-dark.png`）
+- P2 首行「我的分享」、有专属图标、次级信息「1 个文件」、行内无「做种」：`20261108-135915-247-p2-personal-first.png`（深色 `20261108-140202-437-p2-personal-files-dark.png`）
 - P3 空态（首次进入、还没加文件）：`20261108-133121-186-p3-personal-empty.png`；有文件后仍无「成员」：`20261108-135022-880.xml`
 - P4「…」两项都在：`20261108-135046-426-p4-menu-personal.png`；「公开到群外」真跑过一次：`20261108-133757-768-p3-personal-public-chip.png`
 - P8 二维码 + 链接：`20261108-135056-293-p8-share-link.png`

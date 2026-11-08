@@ -39,6 +39,8 @@
     <string name="p2_empty">还没有群组</string>
     <!-- 个人空间（docs/design/personal-space.md）：置顶行图标的无障碍名，界面上不显示文字 -->
     <string name="p2_personal">个人空间</string>
+    <!-- 个人空间的次级信息：文件数（不是做种数），与普通群那一行等高 -->
+    <string name="p2_files">%1$d 个文件</string>
     <string name="p2_seeding">做种 %1$d</string>
     <string name="p2_team">组队 %1$d 人</string>
     <string name="p2_unread">%1$d 条新消息</string>
