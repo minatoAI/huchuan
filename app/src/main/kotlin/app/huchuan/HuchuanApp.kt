@@ -636,7 +636,10 @@ fun HuchuanApp(
     }
 
     // 系统分享进来（link-share §2.3）：落点只选群，不选「链接还是群」，也没有确认页。
-    //   0 个群 → P5 建群（还没用户名就先 P1）；1 个群 → 直接进 P3；多个群 → P2 点一个。
+    // 判「有几个群」时**个人空间不算真实群**，但它可以接住分享：
+    //   0 个普通群（只有个人空间 / 连群都没有）→ 直接分享进个人空间，进它的 P3；
+    //   1 个普通群 → 直接进该群 P3；多个普通群 → P2 点一个。
+    // 个人空间就是为「临时发一个文件给别人」准备的，让用户先建群再分享是反逻辑。
     // P0 自检照常跑，自检放行与这里是并行的两件事：谁先到都不会把对方顶掉（P0 一旦离开
     // 组合，它自己的 onEnter 就不会再触发）。
     val shareTarget = ShareInRoute.pending
@@ -655,30 +658,46 @@ fun HuchuanApp(
             waitedMs += 200
         }
         val groups = state.groupList
+        val personalId = state.personalGroupId
+        // 真实群 = 除个人空间外的群。个人空间面向「临时发一个文件」，不作为「先建群」的理由，
+        // 但它是合法的分享落点（没有真实群时直接落进去，用户不必先建群）。
+        val realGroups = groups.filter { group -> group.id != personalId }
         shareRouted = target
         when {
-            groups.isEmpty() -> {
-                if (state.deviceState.userNameUnset) {
-                    state.push(Destination.UserName)
-                } else {
-                    // P5 建群；创建成功 → onJoined → P3，导入由下面那段接手。
-                    state.enterNewGroupFirstLaunch()
-                }
+            realGroups.size == 1 -> {
+                shareGroup = realGroups.first().id
+                state.openGroup(realGroups.first().id)
             }
 
-            groups.size == 1 -> {
-                shareGroup = groups.first().id
-                state.openGroup(groups.first().id)
+            realGroups.size > 1 -> {
+                state.enterHome()
+                Toast.makeText(context, R.string.share_in_pick_group, Toast.LENGTH_SHORT).show()
+            }
+
+            personalId != null -> {
+                // 只有个人空间（或一个群都没有，但内核已经把个人空间建出来了）：分享落进它。
+                // 0 个普通群不再是「先建群」的理由 —— 那正是链接分享要消掉的步骤。
+                shareGroup = personalId
+                state.openGroup(personalId)
             }
 
             else -> {
-                state.enterHome()
-                Toast.makeText(context, R.string.share_in_pick_group, Toast.LENGTH_SHORT).show()
+                // 内核还没就绪到连个人空间都没有（理论不会发生，启动路径已经等过 start()）：
+                // 保留旧的首启兜底，至少不让这次分享变成死路。
+                if (state.deviceState.userNameUnset) {
+                    state.push(Destination.UserName)
+                } else {
+                    state.enterNewGroupFirstLaunch()
+                }
             }
         }
         Log.i(
             M1Runtime.TAG,
-            "event=share_in_route groups=" + groups.size + " waited_ms=" + waitedMs,
+            "event=share_in_route groups=" + groups.size +
+                " real_groups=" + realGroups.size +
+                " personal=" + (personalId != null) +
+                " target=" + (shareGroup ?: "-") +
+                " waited_ms=" + waitedMs,
         )
     }
 
