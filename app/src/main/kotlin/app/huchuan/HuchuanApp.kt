@@ -177,6 +177,24 @@ class HuchuanState(
 
     fun isPersonal(groupId: String): Boolean = groupId == personalGroupId
 
+    /**
+     * 「已有群组」的唯一判据：**除个人空间外**还有群。
+     *
+     * 个人空间常驻 [groupList]（docs/design/personal-space.md），用 `groupList.isNotEmpty()` 判
+     * 会把每个新用户都当成老用户：首启直接落 P2，P5 只剩 P2「+」一条路。
+     * 认个人空间只认内核的 isPersonal 标记（内核 helloGroupOrNull 也按它过滤「可加入的群」），
+     * 不拿群名或 gid 字符串猜。
+     */
+    val hasRealGroups: Boolean
+        get() {
+            @Suppress("UNUSED_EXPRESSION")
+            revision
+            val kernel = runtime?.kernel
+            // 没有内核（静态壳）：groupList 里不可能有个人空间，按列表非空判。
+            if (kernel == null) return groupList.isNotEmpty()
+            return kernel.groups().any { group -> !group.isPersonal }
+        }
+
     /** 最近一次加入失败的原因（内核失败码 / 一句话）；成功或还没试过时是空串。 */
     val lastJoinError: String
         get() = runtime?.kernel?.lastJoinError().orEmpty()
@@ -208,11 +226,25 @@ class HuchuanState(
         syncActiveView()
     }
 
-    /** 首次启动且无群组：P1 保存后直接进 P5，此页无返回（spec §3 P5 出口）。 */
+    /** 首次启动且无群组：P1 保存后、冷启动放行后直接进 P5，此页无返回（spec §3 P5 出口）。 */
     fun enterNewGroupFirstLaunch() {
         stack.clear()
         stack.add(Destination.NewGroup(firstLaunch = true))
         syncActiveView()
+    }
+
+    /**
+     * 冷启动放行前等内核把 state.json 读完：群列表（连同里面的个人空间标记）在
+     * [M1Runtime.started] 之前不是定论，早判一帧会把老用户扔回 P5。没有内核（静态壳）时立刻返回。
+     * 上限 5 s —— 内核起不来也照常放行，落点判断按「没有群」处理。
+     */
+    suspend fun awaitGroupsLoaded(timeoutMs: Long = 5_000) {
+        val rt = runtime ?: return
+        var waited = 0L
+        while (!rt.started && rt.startError.isEmpty() && waited < timeoutMs) {
+            delay(100)
+            waited += 100
+        }
     }
 
     /** 加入或创建成功 → P3，且 P3 的系统返回必须落到 P2。 */
@@ -674,6 +706,26 @@ fun HuchuanApp(
         }
     }
 
+    /**
+     * P0 自检放行后的落点（spec §3 P0 出口）：
+     * 没设用户名 → P1；有普通群 → P2；只有个人空间（等于还没加群）→ P5。
+     */
+    fun enterAfterSplash() {
+        scope.launch {
+            state.awaitGroupsLoaded()
+            when {
+                state.deviceState.userNameUnset -> state.push(Destination.UserName)
+                state.hasRealGroups -> state.enterHome()
+                else -> state.enterNewGroupFirstLaunch()
+            }
+            Log.i(
+                M1Runtime.TAG,
+                "event=p0_route has_real_groups=" + state.hasRealGroups +
+                    " user_name_set=" + !state.deviceState.userNameUnset,
+            )
+        }
+    }
+
     fun goBack() {
         val leaving = state.current
         state.pop()
@@ -709,19 +761,13 @@ fun HuchuanApp(
             is Destination.Network -> NetworkScreen(
                 state = state,
                 holdAt = debugHold,
-                onEnter = {
-                    if (state.deviceState.userNameUnset) {
-                        state.push(Destination.UserName)
-                    } else {
-                        state.enterHome()
-                    }
-                },
+                onEnter = { enterAfterSplash() },
             )
 
             Destination.UserName -> UserNameScreen(
                 state = state,
-                onSaved = { hasGroups ->
-                    if (hasGroups) state.enterHome() else state.enterNewGroupFirstLaunch()
+                onSaved = { hasRealGroups ->
+                    if (hasRealGroups) state.enterHome() else state.enterNewGroupFirstLaunch()
                 },
             )
 

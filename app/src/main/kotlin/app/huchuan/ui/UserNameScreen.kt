@@ -21,11 +21,16 @@ import app.huchuan.HuchuanState
 import app.huchuan.R
 import kotlinx.coroutines.delay
 
-/** P1 用户名。入口：P0「进入」（首次启动）；出口：「保存」→ 无群组进 P5、有群组进 P2。 */
+/**
+ * P1 用户名。入口：P0「进入」（首次启动）；出口：「保存」→ 没有普通群进 P5、有普通群进 P2。
+ *
+ * 判据是 [HuchuanState.hasRealGroups]：个人空间也在群列表里，按「列表非空」判会让每个新用户
+ * 都被当成老用户（首启落 P2 的发版缺陷）。
+ */
 @Composable
 fun UserNameScreen(
     state: HuchuanState,
-    onSaved: (hasGroups: Boolean) -> Unit,
+    onSaved: (hasRealGroups: Boolean) -> Unit,
 ) {
     val device = state.deviceState
     var name by rememberSaveable { mutableStateOf(device.deviceName) }
@@ -38,7 +43,7 @@ fun UserNameScreen(
         state.device.saveUserName(name)
         state.touch()
         saving = false
-        onSaved(state.groupList.isNotEmpty())
+        onSaved(state.hasRealGroups)
     }
 
     PageScaffold(title = stringResource(R.string.p1_title)) { padding ->
