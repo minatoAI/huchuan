@@ -412,7 +412,8 @@ P2 用 `isPersonal` 决定置顶与图标，不要用「名字 == 我的分享�
 
 ```json
 { "active": true }      // true = 激活（做种 / 下载），false = 休眠（从会话里摘掉）
-→ { "file": 文件对象 }
+→ { "file": 文件对象, "active": false, "stopped": true,
+    "kernelStateBefore": "acquiring", "kernelState": "absent" }
 ```
 
 激活时 daemon 自己判断方向：**本机共享的文件重新做种**（用 settings 里记的原路径，
@@ -422,7 +423,27 @@ P2 用 `isPersonal` 决定置顶与图标，不要用「名字 == 我的分享�
 
 元数据还没到手时点激活不会失败：内核接管那条找源任务，回包里的 `kernelState` 立刻是 `acquiring`
 （`state` 仍是 `sleeping`、`role` 仍是 `none` —— 没有元数据就没有字节在动），元数据一到自己转
-`downloading`。日志：`api_file_active gid=… file_id=… active=… role_before=… kernel_state=…`。
+`downloading`。
+
+**休眠不看角色，看内核真值**（docs/core.md §3.12）：`acquiring`（正在寻找来源）与 `waiting_metadata`
+（等待来源）时内核里挂着一条找源任务，但 `role` 是 `none` —— 没有元数据，一个数据字节都没在动。
+以前这里只在 `role != none` 时调 `stopFile`，于是这两种状态上点「休眠」**什么都不发生**：用户看到
+「正在寻找来源」，点停止也停不掉，只能等它超时或自己找到源（docs/windows-ui.md §9 第 10 条）。
+现在按 `kernelState` 判：除 `absent` 之外一律调 `group.stopFile`，找源中的任务走内核的**取消等待**
+语义（同步摘掉那条任务、叫醒同步等待、记一条取消日志），公开会话没有别的任务时一起停掉、端口释放。
+
+回包把这一下发生了什么说清楚（`file` 仍是动作之后的对象投影，`kernelState` 已经是新的）：
+
+| 字段 | 含义 |
+|---|---|
+| `active` | 回显请求：true = 激活 / false = 休眠 |
+| `stopped` | `true` = 这一次真的从会话里摘掉了一条任务；`false` = 本来就没在跑（已休眠 / 已退场） |
+| `kernelStateBefore` | 动作之前的内核态（六值，见 §3.3） |
+| `kernelState` | 动作之后的内核态（休眠成功是 `absent`） |
+
+日志：`api_file_active gid=… file_id=… active=… role_before=… kernel_state_before=… kernel_state=… stopped=…`；
+内核侧另有 `public_acquire_cancelled … reason=user_cancel`（找源中的取消，与「找不到来源」那种失败分开，
+见 docs/core.md §3.12）。
 
 #### `POST /api/groups/{gid}/files/{fid}/upload-limit`
 
@@ -480,6 +501,11 @@ core 没有按 torrent 读回限速的口子（缺口 G9），所以不给「内
 | `no_source` | 找不到来源，先挂着等别人上线 | 200 | 建好，等来源 |
 | `timeout` | 等文件信息超时，会继续重试 | 200 | 建好，等来源 |
 | `bad_metadata` | 文件信息无效 | 200 | 建好（内核摘掉无效 torrent，条目按等待来源留着） |
+
+另有 `cancelled`（「已取消，不再寻找来源」）：只在**同步等待中的导入被用户取消**时出现 —— 用户点了
+「休眠」（`active=false`）或本机移除，内核把那条找源任务摘掉并叫醒等待槽。HTTP 200，条目照常建好
+（取消的是「找源」，不是「条目」）。它不是失败，所以不在 core 的 `PublicMagnetResult.failureReasons()`
+里（docs/core.md §3.12）。
 
 请求级失败（400 / 409 / 503）沿用全站错误包络 `{ok:false, code, error}`，并额外带 `message`
 （与 `error` 同义）与 `fileId`（重复时是撞上的那条 infohash）；群不存在是 404 `E_NO_GROUP`，

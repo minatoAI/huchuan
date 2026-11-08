@@ -954,6 +954,8 @@ class M1Kernel @JvmOverloads constructor(
                 "file_id" to fileId,
                 // 从哪个状态被取消：acquiring（正在寻找来源）/ waiting_metadata（等待来源）。
                 "from" to from.name.lowercase(),
+                // 取消的理由：user_cancel = 用户点了停止。日志里要能一眼分开「用户取消」与「失败」。
+                "reason" to PublicBtSession.REASON_USER_CANCEL,
                 "removed" to removed.toString(),
                 // 取消之后公开会话里还剩几条任务（0 = 没有别人在用，随后会被停掉、端口释放）。
                 "torrents" to publicBt.torrentCount().toString(),

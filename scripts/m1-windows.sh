@@ -27,7 +27,9 @@
 #                （成功 / 失败都算，断言的是「有尝试」）；另起一个启动前就关掉 tracker 的 C 节点，
 #                要求 kernel_started tracker=off、建群后一条 tracker 请求都没有
 #   8. magnet  ：公开种子 / 磁力导入：非法链接 400 invalid_link、同一链接第二次
-#                duplicate、state 里 scope=public + magnet、本机移除后从 state 消失但同群 B 还在
+#                duplicate、state 里 scope=public + magnet、激活后 acquiring、
+#                acquiring 时点休眠真的停（active=false → absent + 会话释放 + 取消日志）、
+#                再激活可重入、本机移除后从 state 消失但同群 B 还在
 #   9. link    ：链接分享（W1）：可用性、创建（link/qrText/7 天默认）、列表、状态、撤销（幂等、
 #                未知 token 404）、过期（ttlSec=60 自然过期），以及一条真端到端：daemon 发 8 MiB，
 #                Edge headless 打开 Pages 接收页，经真 Worker 的 /signal 建链收字节，浏览器自己
@@ -967,6 +969,48 @@ chk "magnet.activate_acquiring (kernelState=$ACT_KN state=$ACT_STATE role=$ACT_R
   "$([ "$ACT_KN" = "acquiring" ] && [ "$ACT_STATE" = "sleeping" ] && [ "$ACT_ROLE" = "none" ] && echo 1 || echo 0)"
 chk "magnet.activate_logged" \
   "$(grep -q "event=api_file_active .*file_id=$PUB_HASH" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+
+# 停止等待（docs/windows-ui.md §9 第 10 条的修复验收）：acquiring 时点「休眠」必须真的停。
+# 修复前 daemon 只在 role != none 时调 stopFile，而 acquiring 的 role 是 none —— 点停止什么都不发生，
+# 用户只能等它超时或自己找到源。现在按内核真值（kernelState）判，并把结果如实回给调用方。
+STOP_BODY=$(post "http://127.0.0.1:$PORT_A/api/groups/$GID/files/$PUB_FID/active" '{"active":false}')
+STOP_BEFORE=$(sval "$STOP_BODY" kernelStateBefore)
+STOP_STATE=$(sval "$STOP_BODY" kernelState)
+STOP_FLAG=$(bval "$STOP_BODY" stopped)
+chk "magnet.stop_from_acquiring (before=$STOP_BEFORE after=$STOP_STATE stopped=$STOP_FLAG)" \
+  "$([ "$STOP_BEFORE" = "acquiring" ] && [ "$STOP_STATE" = "absent" ] && [ "$STOP_FLAG" = "true" ] && echo 1 || echo 0)"
+# 日志要看得出「用户取消」而不是「失败」：内核一条取消事件，daemon 一条带前后状态的 API 事件。
+chk "magnet.stop_logged_as_cancel" \
+  "$(grep -q "event=public_acquire_cancelled .*file_id=$PUB_HASH .*reason=user_cancel" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+chk "magnet.stop_api_logged (kernel_state_before=acquiring stopped=true)" \
+  "$(grep -q "event=api_file_active .*file_id=$PUB_HASH .*kernel_state_before=acquiring .*stopped=true" "$LOG_A" 2>/dev/null && echo 1 || echo 0)"
+
+# 条目仍然在列表里（休眠，不是从本机消失 —— 「移除」才是另一条路），公开会话已经停掉、端口释放。
+STATE_STOPPED=""
+i=0
+while [ "$i" -lt 20 ]; do
+  STATE_STOPPED=$(get "http://127.0.0.1:$PORT_A/api/state")
+  case "$STATE_STOPPED" in *"\"id\":\"$PUB_HASH\""*) break ;; esac
+  sleep 0.5
+  i=$((i + 1))
+done
+STOPPED_ENTRY=$(printf '%s' "$STATE_STOPPED" | grep -o "\"id\":\"$PUB_HASH\"[^}]*" | head -1)
+chk "magnet.stop_entry_parked (kernelState=$(sval "$STOPPED_ENTRY" kernelState) state=$(sval "$STOPPED_ENTRY" state))" \
+  "$([ "$(sval "$STOPPED_ENTRY" kernelState)" = "absent" ] && [ "$(sval "$STOPPED_ENTRY" state)" = "sleeping" ] && echo 1 || echo 0)"
+chk "magnet.stop_session_released" \
+  "$(printf '%s' "$STATE_STOPPED" | grep -q '"public":{"running":false' && echo 1 || echo 0)"
+
+# 再激活：可重入。公开会话重新起来、这条又回到 acquiring（「停得下，也还能再开始」）。
+RE_BODY=$(post "http://127.0.0.1:$PORT_A/api/groups/$GID/files/$PUB_FID/active" '{"active":true}')
+RE_STATE=$(sval "$RE_BODY" kernelState)
+RE_PUBLIC=$(get "http://127.0.0.1:$PORT_A/api/state" | grep -o '"public":{"running":[a-z]*' | head -1)
+chk "magnet.reactivate_acquiring (kernelState=$RE_STATE)" \
+  "$([ "$RE_STATE" = "acquiring" ] && echo 1 || echo 0)"
+case "$RE_PUBLIC" in
+  *'"running":true'*) RE_RUNNING=1 ;;
+  *) RE_RUNNING=0 ;;
+esac
+chk "magnet.reactivate_session_running ($RE_PUBLIC)" "$RE_RUNNING"
 
 # 同一合法磁力再导入一次：同群按 infohash 去重，第二次是 409 duplicate。
 DUP_STATUS=$(post_file "$MAGNET_URL" "{\"magnet\":\"$PUB_MAGNET\"}" "$ART/import-2.json")

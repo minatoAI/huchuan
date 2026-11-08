@@ -37,7 +37,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BiConsumer;
 
 /**
- * 公开种子社区（public-swarm）的内核自检。六组断言，每组都有一个能把它打红的现实缺陷：
+ * 公开种子社区（public-swarm）的内核自检。九组断言，每组都有一个能把它打红的现实缺陷：
  *
  *   1. 会话参数（[sessions]）：公开会话 DHT 开、LSD 关、uTP 开、端口 >= 6881；私有会话 DHT 关。
  *      打红方式：把 PublicBtSession 的 settings 改成和私有会话一样，或者把端口起点改成 51413。
@@ -53,6 +53,12 @@ import java.util.function.BiConsumer;
  *   6. 公开到群外（[publish]）：私有文件另建 private=0 的新种子（infohash 与私有不同）、磁力 btih
  *      对齐新 infohash、公开条目出现而私有条目保留、重复调用幂等、unpublish 只移除公开条目。
  *      打红方式：把 TorrentBuild 的 private 参数传 true，或者让重复调用再建一个 torrent。
+ *   7. 导入不等于下载（[importParking]）：导入后 kernelState=ABSENT、公开会话里没有它、字节 0；
+ *      激活才下载，做种后休眠/再激活两个方向都成立。
+ *   8. 激活了但还没有元数据（[acquiringSource]）：waiting_metadata → acquiring → 自己转 downloading。
+ *   9. 取消等待（[cancelSearch]）：acquiring 时点停止要真的摘任务、停公开会话、把状态打回 absent，
+ *      日志写「取消」而不是「失败」；同步等待中的导入被取消时立刻回 cancelled；再激活可重入。
+ *      打红方式：stopFile 按 localRole 分流（acquiring 的 role 是 none，停止成了空操作）。
  */
 final class PublicSwarmSelfTest {
 
@@ -1103,6 +1109,207 @@ final class PublicSwarmSelfTest {
         }
     }
 
+    // ---------------------------------------------------------------- 9. 取消等待（停止找源）
+
+    /**
+     * 「正在寻找来源」时点停止必须真的停（docs/windows-ui.md §9 第 10 条 → docs/core.md §3.12）。
+     *
+     * 缺陷现场：用户导入磁力 → 点激活 → kernelState=acquiring，此时再点休眠，daemon 只在
+     * role != none 时调 stopFile，而 acquiring 的 role 是 none —— 于是什么都不发生，用户看到
+     * 「正在寻找来源」却停不掉，只能等它超时或者自己找到源。本轮把「取消等待」做成内核的明确语义：
+     * 摘任务 + 叫醒同步等待 + 记一条取消日志（不是失败）。
+     *
+     * 装置是真的：一个本机 tracker（**一条 peer 都不报**）+ 一个真内核 + 两条真磁力。
+     * 打红方式（每条断言一个能把它打红的现实缺陷）：
+     *   - stopFile 只看 localRole、不看 kernelState → cancel_stop_removed / cancel_absent 红；
+     *   - 摘任务不叫醒等待槽 → cancel_waiter_woken 红（导入方会等满 30 s 再回 no_source）；
+     *   - 取消不记独立事件 → cancel_logged 红；
+     *   - 摘任务之后不重判公开会话 → cancel_session_released 红；
+     *   - 公开会话停了之后加不回来（激活不可重入）→ cancel_reactivate_* 红。
+     */
+    private static void cancelSearch(BiConsumer<String, Boolean> check) {
+        File root = new File(System.getProperty("java.io.tmpdir"), "huchuan-selftest-cancel-" + System.nanoTime());
+        root.mkdirs();
+        MockTracker tracker = null;
+        M1Kernel kernel = null;
+        try {
+            // --- 装置：两条公开种子（只用来算 infohash）+ 一个谁都不报的本机 tracker
+            File seedDir = new File(root, "seed-data");
+            seedDir.mkdirs();
+            File payload = new File(seedDir, CANCEL_NAME);
+            writeRandom(payload, CANCEL_BYTES);
+            File payload2 = new File(seedDir, CANCEL_NAME2);
+            writeRandom(payload2, CANCEL_BYTES);
+            tracker = new MockTracker();
+            tracker.setIntervalSeconds(2, 1);
+            String announce = tracker.baseUrl() + "/announce";
+            String fileId = cancelTorrentId(payload, announce);
+            String fileId2 = cancelTorrentId(payload2, announce);
+
+            List<String> events = new CopyOnWriteArrayList<>();
+            Map<String, String> lastCancel = new ConcurrentHashMap<>();
+            Map<String, String> lastPubCancel = new ConcurrentHashMap<>();
+            KernelEvents sink = new KernelEvents() {
+                @Override
+                public void log(String event, Map<String, String> fields) {
+                    events.add(event);
+                    if ("public_acquire_cancelled".equals(event)) {
+                        lastCancel.putAll(fields);
+                    } else if ("pub_acquire_cancelled".equals(event)) {
+                        lastPubCancel.putAll(fields);
+                    }
+                }
+            };
+            kernel = new M1Kernel(new File(root, "kernel"), "cancel-selftest", 47494, 53494, sink);
+            kernel.start();
+            final GroupRuntime group = kernel.createGroup("取消寻找来源");
+
+            String magnet = "magnet:?xt=urn:btih:" + fileId + "&dn=" + CANCEL_NAME
+                    + "&tr=" + URLEncoder.encode(announce, "UTF-8");
+            // --- 1. 导入：没有源，同步等待必然超时，任务留在公开会话里继续找
+            PublicMagnetResult imported = kernel.addPublicMagnet(
+                    group.getGroupId(), magnet, CANCEL_NAME, CANCEL_IMPORT_WAIT_MS);
+            check.accept("public.cancel_import_no_source (reason=" + imported.getReason() + ")",
+                    !imported.getOk()
+                            && (PublicMagnetResult.NO_SOURCE.equals(imported.getReason())
+                            || PublicMagnetResult.TIMEOUT.equals(imported.getReason()))
+                            && imported.getEntry() != null);
+            check.accept("public.cancel_waiting_in_session (torrents=" + kernel.publicTorrentCount() + ")",
+                    group.kernelState(fileId) == GroupRuntime.KernelState.WAITING_METADATA
+                            && kernel.publicHasTorrent(fileId)
+                            && kernel.getPublicSessionRunning());
+
+            // --- 2. 激活：接管找源任务，状态是「正在寻找来源」，角色仍是 none
+            check.accept("public.cancel_acquiring_started", group.startDownload(fileId));
+            check.accept("public.cancel_acquiring_state (state=" + group.kernelState(fileId)
+                            + " role=" + group.localRole(fileId) + ")",
+                    group.kernelState(fileId) == GroupRuntime.KernelState.ACQUIRING
+                            && group.localRole(fileId) == GroupRuntime.LocalRole.NONE);
+
+            // --- 3. 点停止（daemon 的 active=false 在 core 里就是这一句）：必须真的停下
+            check.accept("public.cancel_stop_removed", group.stopFile(fileId));
+            check.accept("public.cancel_absent (state=" + group.kernelState(fileId) + ")",
+                    group.kernelState(fileId) == GroupRuntime.KernelState.ABSENT
+                            && group.localRole(fileId) == GroupRuntime.LocalRole.NONE);
+            check.accept("public.cancel_not_in_public_session (torrents=" + kernel.publicTorrentCount() + ")",
+                    !kernel.publicHasTorrent(fileId) && kernel.publicTorrentCount() == 0);
+            check.accept("public.cancel_session_released (running=" + kernel.getPublicSessionRunning()
+                            + " port=" + kernel.publicSessionPort() + ")",
+                    !kernel.getPublicSessionRunning() && kernel.publicSessionPort() == 0);
+            check.accept("public.cancel_logged (event=" + (events.contains("public_acquire_cancelled") ? "yes" : "no")
+                            + " reason=" + lastCancel.get("reason") + " from=" + lastCancel.get("from") + ")",
+                    events.contains("public_acquire_cancelled")
+                            && "user_cancel".equals(lastCancel.get("reason"))
+                            && "acquiring".equals(lastCancel.get("from"))
+                            && fileId.equals(lastCancel.get("file_id"))
+                            && "true".equals(lastCancel.get("removed"))
+                            && "0".equals(lastCancel.get("torrents"))
+                            // 会话侧也有一条同源事件：import_only=false 说明停的是「激活过的任务」，
+                            // 与「导入任务被停」（第 5 步那条，import_only=true）在日志里分得开。
+                            && "false".equals(lastPubCancel.get("import_only"))
+                            && "user_cancel".equals(lastPubCancel.get("reason"))
+                            && "true".equals(lastPubCancel.get("removed")));
+            check.accept("public.cancel_stop_idempotent", !group.stopFile(fileId));
+
+            // --- 4. 再激活：可重入 —— 会话重新起来、又回到 acquiring
+            check.accept("public.cancel_reactivate_started", group.startDownload(fileId));
+            check.accept("public.cancel_reactivate_acquiring (state=" + group.kernelState(fileId)
+                            + " running=" + kernel.getPublicSessionRunning()
+                            + " port=" + kernel.publicSessionPort() + ")",
+                    group.kernelState(fileId) == GroupRuntime.KernelState.ACQUIRING
+                            && kernel.publicHasTorrent(fileId)
+                            && kernel.getPublicSessionRunning()
+                            && kernel.publicSessionPort() >= PublicBtSession.DEFAULT_PORT);
+
+            // --- 5. 取消「还在同步等待中的导入」：调用方立刻拿到 cancelled，不是等满超时再回 no_source
+            String magnet2 = "magnet:?xt=urn:btih:" + fileId2 + "&dn=" + CANCEL_NAME2
+                    + "&tr=" + URLEncoder.encode(announce, "UTF-8");
+            final PublicMagnetResult[] blocked = new PublicMagnetResult[1];
+            final M1Kernel running = kernel;
+            Thread importer = new Thread(
+                    () -> blocked[0] = running.addPublicMagnet(
+                            group.getGroupId(), magnet2, CANCEL_NAME2, CANCEL_BLOCK_WAIT_MS),
+                    "huchuan-selftest-cancel-import");
+            importer.setDaemon(true);
+            long t0 = System.currentTimeMillis();
+            importer.start();
+            boolean parked = waitUntil(
+                    () -> group.kernelState(fileId2) == GroupRuntime.KernelState.WAITING_METADATA, 10000);
+            check.accept("public.cancel_waiting_before_stop (state=" + group.kernelState(fileId2) + ")", parked);
+            check.accept("public.cancel_waiter_stop_removed", group.stopFile(fileId2));
+            importer.join(CANCEL_WAKE_BUDGET_MS);
+            long elapsed = System.currentTimeMillis() - t0;
+            PublicMagnetResult woken = blocked[0];
+            check.accept("public.cancel_waiter_woken (reason=" + (woken == null ? "null" : woken.getReason())
+                            + " elapsed=" + elapsed + "ms)",
+                    !importer.isAlive() && woken != null
+                            && PublicMagnetResult.CANCELLED.equals(woken.getReason())
+                            && PublicMagnetResult.messageFor(PublicMagnetResult.CANCELLED).equals(woken.getMessage())
+                            // 叫醒必须是「当场」，而不是等满 30 s 的同步等待预算。
+                            && elapsed < CANCEL_WAKE_BUDGET_MS);
+            check.accept("public.cancel_waiter_second_absent (state=" + group.kernelState(fileId2) + ")",
+                    group.kernelState(fileId2) == GroupRuntime.KernelState.ABSENT
+                            && !kernel.publicHasTorrent(fileId2));
+            // 两条取消在会话日志里分得开：第一条是激活过的任务（import_only=false），这条是导入任务。
+            check.accept("public.cancel_waiter_logged_import_only (import_only="
+                            + lastPubCancel.get("import_only") + " reason=" + lastPubCancel.get("reason") + ")",
+                    fileId2.equals(lastPubCancel.get("infohash"))
+                            && "true".equals(lastPubCancel.get("import_only"))
+                            && "user_cancel".equals(lastPubCancel.get("reason")));
+            // 条目照旧在（取消的是「找源」，不是「条目」）：这正是「休眠」的语义，与「移除」分开。
+            check.accept("public.cancel_entry_kept (entry="
+                            + (woken == null || woken.getEntry() == null ? "null" : woken.getEntry().getFileId()) + ")",
+                    woken != null && woken.getEntry() != null
+                            && fileId2.equals(woken.getEntry().getFileId())
+                            && woken.getEntry().getScope() == FileScope.PUBLIC);
+
+            // --- 6. 收尾：第一条还在 acquiring（第 4 步），再停一次，两条都停、会话全停
+            check.accept("public.cancel_final_stop", group.stopFile(fileId));
+            check.accept("public.cancel_all_stopped (a=" + group.kernelState(fileId)
+                            + " b=" + group.kernelState(fileId2)
+                            + " torrents=" + kernel.publicTorrentCount() + ")",
+                    group.kernelState(fileId) == GroupRuntime.KernelState.ABSENT
+                            && group.kernelState(fileId2) == GroupRuntime.KernelState.ABSENT
+                            && kernel.publicTorrentCount() == 0
+                            && !kernel.getPublicSessionRunning());
+            System.out.println("selftest.info public.cancel file_id=" + fileId
+                    + " events=" + events.size()
+                    + " cancel_reason=" + lastCancel.get("reason")
+                    + " wake_ms=" + elapsed);
+        } catch (Throwable t) {
+            check.accept("public.cancel_exception (" + t + ")", false);
+            t.printStackTrace(System.out);
+        } finally {
+            if (kernel != null) {
+                try {
+                    kernel.close();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            if (tracker != null) {
+                try {
+                    tracker.close();
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+            deleteTree(root);
+        }
+    }
+
+    /** 建一个公开 v1 种子并返回它的 infohash（只用来给磁力一个真实存在的 infohash）。 */
+    private static String cancelTorrentId(File payload, String announce) throws Exception {
+        byte[] bytes = new TorrentBuilder()
+                .path(payload)
+                .setPrivate(false)
+                .flags(TorrentBuilder.V1_ONLY)
+                .pieceSize(65536)
+                .addTracker(announce)
+                .generate().entry().bencode();
+        return new TorrentInfo(bytes).infoHash().toString();
+    }
+
     private static PublicBtSession.Diagnostics.Tracker repliedTracker(
             PublicBtSession.Diagnostics diag, String url) {
         for (PublicBtSession.Diagnostics.Tracker t : diag.getTrackers()) {
@@ -1190,6 +1397,23 @@ final class PublicSwarmSelfTest {
     private static final long ACQUIRE_IMPORT_WAIT_MS = 1500L;
     /** 做种者上线后「拿元数据 → 自动开下 → 传完」的整段预算（1 MB/s × 2 MiB ≈ 2 s）。 */
     private static final long ACQUIRE_WAIT_MS = 60000L;
+
+    /**
+     * 「取消等待」那一组（第 9 组 public.cancel_*）：两条不同的公开种子、谁都不报 peer 的 tracker。
+     * 体积只要够算出 infohash 与一个不同的 fileId，不值得再传字节。
+     */
+    private static final int CANCEL_BYTES = 256 * 1024;
+    private static final String CANCEL_NAME = "cancel-payload-a.bin";
+    private static final String CANCEL_NAME2 = "cancel-payload-b.bin";
+    /** 导入的同步等待：这条磁力没有源，必然超时；条目与找源任务照旧留下。 */
+    private static final long CANCEL_IMPORT_WAIT_MS = 1200L;
+    /**
+     * 第 5 步那条「正卡在导入里」的同步等待预算：必须远大于叫醒预算，
+     * 否则「取消叫醒了它」与「它自己超时了」这两种情况分不开（断言就失去证伪力）。
+     */
+    private static final long CANCEL_BLOCK_WAIT_MS = 30000L;
+    /** 从「导入线程开始等」到「拿到 cancelled」的预算；超过它就说明没被叫醒（是超时那条路）。 */
+    private static final long CANCEL_WAKE_BUDGET_MS = 8000L;
 
     // ---------------------------------------------------------------- 工具
 

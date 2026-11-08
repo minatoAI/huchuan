@@ -1050,7 +1050,46 @@ java -Dlibtorrent4j.jni.path="<core/build/m1-native/libtorrent4j.dll>" -Dfile.en
 | 等元数据**超时之后** | 同上一条：torrent **留在会话里继续找源**，元数据到了照样落缓存 + 回填尺寸（`public_metadata_arrived`）。超时只结束调用方的同步等待，不结束寻找 | `WAITING_METADATA` |
 | 激活 `group.startDownload`（元数据没到手） | 会话里还有这条就 `adopt` 接管（清掉 `importOnly`）：不再退场，元数据一到就开始下 | `ACQUIRING`（「正在寻找来源」） |
 | 激活（元数据已到手） | 缓存种子在就按它加种（并把磁力的 `tr` 补挂回去）；都没有就按磁力加种且 `importOnly = false` | `DOWNLOADING` / `SEEDING` |
-| 休眠 `group.stopFile` | 摘掉 torrent（磁盘文件不动） | `ABSENT` |
+| 休眠 / 停止 `group.stopFile` | 按内核真值分流：找源中（`ACQUIRING` / `WAITING_METADATA`）走**取消等待**语义（同步摘任务 + 叫醒同步等待 + 取消日志），其余直接摘 torrent（磁盘文件不动） | `ABSENT` |
+
+**取消等待（「停止找源」）：acquiring / waiting_metadata 必须停得下**（本轮修复）
+
+缺陷现场（docs/windows-ui.md §9 第 10 条）：用户导入磁力 → 点激活 → `kernelState=acquiring`（「正在寻找来源」），
+此时再点「休眠」**什么都不发生** —— daemon 只在 `role != none` 时调 `stopFile`，而 acquiring 的 `role` 是 `none`。
+用户只能等它超时，或者等它自己找到源。
+
+判据写在内核里，宿主不再按角色猜：
+
+| 调用（`group.stopFile(fileId)`） | 内核做什么 | 之后的状态 |
+|---|---|---|
+| 状态是 `ACQUIRING` | `PublicBtSession.cancelAcquire`：把那条任务从公开会话里同步摘掉、放开等待槽 | `ABSENT` |
+| 状态是 `WAITING_METADATA`（导入任务，用户没激活） | 同上 —— 两条都是「有任务、没元数据」，对用户是同一件事 | `ABSENT` |
+| `DOWNLOADING` / `SEEDING` / `PARKED` | `sessionOf(fileId).removeTorrent`（原路径） | `ABSENT` |
+
+- **为什么判据放在 `stopFile` 里**：`localRole` 是 `kernelState` 的投影，`ACQUIRING` / `WAITING_METADATA` 都不算在传 →
+  `NONE`。任何「只看 role 决定要不要停」的调用方（daemon、app）在这两个状态上都会得出「没有东西可停」。
+  谁能停只留一处判：按内核真值。
+- **同步摘任务，不是异步退场**：`PublicBtSession.retire` 是内核自己做完事之后的退场（可能跑在告警线程上，
+  所以挪到 `huchuan-pub-retire` 线程）；取消是用户点的停止，调用方（daemon 的 `active=false`）要在同一个请求里
+  把「现在是什么状态」如实回给页面，所以当场摘掉。
+- **叫醒同步等待**：`addMagnet` 的等待槽（`MetadataWait`）带一个 `cancelled` 位，取消时两个闸门一起放开。
+  正卡在 `addPublicMagnet(..., timeoutMs)` 里的调用方**立刻**拿到 `PublicMagnetResult.CANCELLED`
+  （文案「已取消，不再寻找来源」），而不是等满超时再回一句「找不到来源」—— 用户点了停止，不该收到一条失败。
+  `cancelled` **不在** `failureReasons()` 的五个失败码里：它不是失败。
+- **条目留着，任务摘掉**：取消的是「找源」，不是「条目」。条目照旧在列表里，状态回到 `ABSENT`（休眠）；
+  要让它从本机列表消失是 `remove`（§3.9 的 `unpublishPublic`、公开条目的本机移除）。
+- **端口释放**：摘掉之后 `maybeStopPublicSession` 照旧判一次；公开会话里没有别的任务就停掉，
+  `pubBtPort` 回 0 并重报 `peer.announce`（§7.1）。
+- **可重入**：再点激活回到 `ACQUIRING`（有 .torrent 缓存就按缓存加种，没有就把磁力重新挂进公开会话）。
+
+日志（grep 一次就能分开「取消」与「失败」）：
+
+| 事件 | 字段 | 说明 |
+|---|---|---|
+| `public_acquire_cancelled`（内核） | `group_id` `file_id` `from`（`acquiring` / `waiting_metadata`）`reason=user_cancel` `removed` `torrents` | 用户点了停止；`torrents` 是摘掉之后会话里剩下的条数 |
+| `pub_acquire_cancelled`（公开会话） | `infohash` `name` `import_only` `reason=user_cancel` `removed` `torrents` `sess=pub` | 同一次取消在会话侧的现场（`import_only` 区分「导入任务」与「激活过的任务」） |
+| `magnet_cancelled`（公开会话） | `infohash` `phase`（`metadata` / `saving`） | 只在「同步等待中的导入被取消」时出现，说明叫醒发生在哪一段 |
+| `file_stopped`（内核） | `group_id` `file_id` | 所有休眠路径共有的通用事件，语义没变 |
 
 **为什么是「摘掉」而不是 `pause()`**：先按字面实现成「元数据到手就 `handle.pause()`」，实测两个问题 ——
 ① 暂停过的 torrent 恢复之后要等**下一次周期 announce** 才重新拉 peer：导入 → 挂起 3 s → 激活，要 **57 s** 才有
@@ -1150,6 +1189,23 @@ libtorrent 2.1 的 `total_done` 是「我们手上有的字节」，与 `total_w
 | `public.acquire_metadata_arrived` / `acquire_total_bytes` | 做种者上线后**不调任何接口**，状态自己走到 `DOWNLOADING`/`SEEDING`，总量 = 种子大小 | 激活路径没清 `importOnly`（元数据到手就退场） |
 | `public.acquire_bytes_order` / `acquire_disk_ahead` | 每次采样 `downloadedBytes ≤ diskBytes ≤ totalBytes`；下载中确实出现过 `diskBytes > downloadedBytes` | `diskBytes` 直接回 `downloadedBytes` |
 | `public.acquire_download_finished` / `acquire_disk_converges` | 下完两个读口都等于总量 | — |
+
+装置（第 9 组 `public.cancel_*`）：一个本机 tracker（**一条 peer 都不报**）+ 一个真内核 + 两条真磁力（不同 infohash）。
+先导入（必超时回 `no_source`，条目与找源任务留下）→ 激活（`ACQUIRING`）→ 停止；另一条在**同步等待中被取消**。
+
+| 断言 | 判据 | 打红方式 |
+|---|---|---|
+| `public.cancel_import_no_source` / `cancel_waiting_in_session` | 导入超时但条目仍在；`WAITING_METADATA`、`publicHasTorrent=true`、公开会话在跑 | 导入不挂会话 / 超时就把条目丢了 |
+| `public.cancel_acquiring_started` / `cancel_acquiring_state` | 激活后 `ACQUIRING`、角色仍 `NONE` | `wantsData` / `adopt` 不生效 |
+| `public.cancel_stop_removed` / `cancel_absent` / `cancel_not_in_public_session` / `cancel_session_released` | `stopFile` 返回 true、状态 `ABSENT`、会话里没有它（`publicHasTorrent=false`、`torrentCount=0`）、公开会话停掉、`publicSessionPort=0` | `stopFile` 按 `localRole` 分流（acquiring 的 role 是 none，停止成了空操作）/ 摘了任务不停会话 |
+| `public.cancel_logged` | 内核 `public_acquire_cancelled`：`reason=user_cancel`、`from=acquiring`、`removed=true`、`torrents=0`；会话侧 `pub_acquire_cancelled`：`import_only=false`、`reason=user_cancel`、`removed=true` | 取消不记独立事件 / 会话侧不记 `import_only` |
+| `public.cancel_stop_idempotent` | 已经停过再停返回 false | 停过之后还报「停了」 |
+| `public.cancel_reactivate_started` / `reactivate_acquiring` | 再激活回到 `ACQUIRING`、会话与端口回来（≥ 6881） | 会话停掉之后加不回来 |
+| `public.cancel_waiter_stop_removed` / `cancel_waiter_woken` | 另一条导入正卡在 30 s 的同步等待里，取消后**立刻**（< 8 s）拿到 `cancelled` + 文案「已取消，不再寻找来源」 | 取消不叫醒等待槽（调用方会等满超时再回 `no_source`） |
+| `public.cancel_waiter_second_absent` / `cancel_waiter_logged_import_only` | 任务摘掉（`ABSENT`、会话里没有它）；会话日志这一条是 `import_only=true`（导入任务，与上一条激活过的任务在日志里分得开） | 取消不区分两种任务 |
+| `public.cancel_entry_kept` | 条目留下（`scope=public`，尺寸仍未知） | 取消连条目一起删 |
+| `public.cancel_final_stop` / `cancel_all_stopped` | 两条都停、`torrentCount=0`、公开会话停 | 只停当前那一条 |
+
 
 | 断言 | 判据 | 打红方式 |
 |---|---|---|
