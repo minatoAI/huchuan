@@ -153,11 +153,18 @@ public final class ReconnectRace {
                 + " msg_port=" + kernel.localMessagePort()
                 + " link_fallback=" + app.huchuan.core.m1.LinkRaceGuard.fallbackEnabled);
         try {
-            if (kernel.groups().isEmpty()) {
+            // 个人空间每个内核都有、且排在最前：重连用例要的是有对端的那个普通群。
+            GroupRuntime group = null;
+            for (GroupRuntime candidate : kernel.groups()) {
+                if (!candidate.isPersonal()) {
+                    group = candidate;
+                    break;
+                }
+            }
+            if (group == null) {
                 fail(role, "no_group_after_restart");
                 return;
             }
-            GroupRuntime group = kernel.groups().get(0);
             String peerDev = "";
             for (app.huchuan.core.m1.MemberRecord m : group.members()) {
                 if (!m.getDev().equals(kernel.getDeviceId())) {

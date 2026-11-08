@@ -276,6 +276,12 @@ internal class PeerLink(
         }
         if (h.gid.isNotEmpty()) {
             val g = kernel.groupById(h.gid)
+            if (g != null && g.isPersonal) {
+                // 个人空间不接受任何对端（docs/design/personal-space.md）：连「我已经在这个群里」
+                // 的旧数据都不认，回明确的失败码再断链 —— 不是静默忽略。
+                rejectPersonalPeer(g.groupId, h.dev, "hello")
+                return
+            }
             if (g != null) {
                 // 我们是该群成员：可以验 proof（HMAC(kGrp, gid‖chanId)）
                 val expected = hexToBytes(g.meta.proofHex(chanId))
@@ -371,6 +377,16 @@ internal class PeerLink(
             sendErr("E_NOT_MEMBER", "unknown group", "")
             return
         }
+        // 个人空间不可加入：任何针对它的 join 一律拒绝，且**排在其它校验之前** ——
+        // 失败码必须是「这是个人空间」，不能是邀请码不对 / 加入已关闭这类会让人以为「换个码还能试」的码。
+        if (g.isPersonal) {
+            kernel.events.log(
+                "personal_space_join_rejected",
+                mapOf("gid" to msg.gid, "dev" to msg.dev, "host" to remoteHost, "via" to "join.req"),
+            )
+            sendErr(ERR_PERSONAL, "personal space cannot be joined", "")
+            return
+        }
         if (!g.meta.joinOpen) {
             sendErr("E_JOIN_CLOSED", "group is closed for joins", "")
             return
@@ -428,6 +444,21 @@ internal class PeerLink(
         // 让其他在线成员知道新成员：触发一次群内广播（协议 §2.3 第 7 步）
         g.broadcastPeerAnnounce(msg.dev)
         sendSyncReq(g)
+    }
+
+    /**
+     * 个人空间的对端一律拒绝：留一条可 grep 的日志，回 [ERR_PERSONAL]，然后断链。
+     *
+     * 走的是协议 §10 的 0x7F err 帧，所以对端（[dispatch] 的 ERR 分支）拿到的就是
+     * `code=E_JOIN_PERSONAL` —— 明确失败码，不是一次无故的 EOF。
+     */
+    private fun rejectPersonalPeer(gid: String, dev: String, via: String) {
+        kernel.events.log(
+            "personal_space_peer_rejected",
+            mapOf("gid" to gid, "dev" to dev, "host" to remoteHost, "via" to via),
+        )
+        sendErr(ERR_PERSONAL, "personal space takes no peers", "")
+        close("personal_space")
     }
 
     private fun sendJoinOk(g: GroupRuntime, msg: JoinReqMsg) {
@@ -829,6 +860,14 @@ internal class PeerLink(
         const val READ_TIMEOUT_MS = 130_000
         const val CLOCK_SKEW_MS = 300_000L
         const val MAX_FRAMES_PER_SECOND = 60
+
+        /**
+         * 落到个人空间上的 hello / join.req 的失败码（docs/core.md §3.13）。
+         *
+         * 对端在 0x7F err 帧里收到的就是这个字符串，[M1Kernel.joinByTail8] 失败时
+         * `join_failed reason=E_JOIN_PERSONAL` 也是它 —— 宿主 / 验收脚本按它判「被明确拒绝」。
+         */
+        const val ERR_PERSONAL = "E_JOIN_PERSONAL"
 
         /**
          * 连续写失败多少帧才断开对端连接（docs/core.md 同步了这个数）。

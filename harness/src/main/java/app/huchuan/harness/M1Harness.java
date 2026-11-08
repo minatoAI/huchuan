@@ -755,11 +755,18 @@ public final class M1Harness {
                 // （PeerLink.onBound 的成员分支），内核自己发 peer.announce + sync.req，补差就发生
                 // 在这条链路上。所以这里只把「拨号」丢到后台线程，成败不看 joinByTail8 的返回值 ——
                 // 它等的是 join.ok，而这条路径上根本不会有 join.ok，硬等会白等一整轮候选超时。
-                if (kernel.groups().isEmpty()) {
+                GroupRuntime restored = null;
+                for (GroupRuntime candidate : kernel.groups()) {
+                    if (!candidate.isPersonal()) {
+                        restored = candidate;
+                        break;
+                    }
+                }
+                if (restored == null) {
                     fail("B2", "no_group_after_restart");
                     return;
                 }
-                group = kernel.groups().get(0);
+                group = restored;
                 final M1Kernel dialKernel = kernel;
                 Thread dialer = new Thread(() -> {
                     GroupRuntime again = dialKernel.joinByTail8(tail8, manual, RECONNECT_DIAL_MS);
@@ -1244,12 +1251,20 @@ public final class M1Harness {
         throw new NoSuchFieldException(name);
     }
 
-    /** 重启后从 state.json 恢复出来的那个群；恢复不出来就当场 FAIL，不静默跳过。 */
+    /**
+     * 重启后从 state.json 恢复出来的那个**普通**群；恢复不出来就当场 FAIL，不静默跳过。
+     *
+     * 个人空间（docs/design/personal-space.md）每个内核都有、且排在最前，所以不能按「第一个群」
+     * 取 —— 那会拿到一个没有对端的本地群，后面的重连断言全部失去意义。
+     */
     static GroupRuntime firstGroup(M1Kernel kernel, String role) {
-        if (kernel.groups().isEmpty()) {
-            fail(role, "no_group_after_restart");
+        for (GroupRuntime group : kernel.groups()) {
+            if (!group.isPersonal()) {
+                return group;
+            }
         }
-        return kernel.groups().get(0);
+        fail(role, "no_group_after_restart");
+        throw new IllegalStateException("fail() did not exit");
     }
 
     static int optInt(Map<String, String> opts, String key, int def) {

@@ -683,6 +683,13 @@ internal class TrackerService(private val kernel: M1Kernel, rawBaseUrl: String) 
 
     fun watch(group: GroupRuntime) {
         if (!enabled) return
+        // 个人空间**不注册、不 announce**（docs/design/personal-space.md「同样跳过 tracker 注册」）：
+        // 它不可加入，注册上去只会让服务端多一条永远不会有 peer 的 swarm，
+        // 还会把「本机有一个不能被加入的群」这条事实泄给跨网的服务端。
+        if (group.isPersonal) {
+            kernel.events.log("personal_space_tracker_skip", mapOf("gid" to group.groupId))
+            return
+        }
         val gid = group.groupId
         if (trackers.containsKey(gid)) return
         val tracker = GroupTracker(kernel, group, http)

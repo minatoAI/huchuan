@@ -54,6 +54,10 @@
 （无。目标项全部落地，见下）
 
 ## 已完成
+- 公开种子真实公网种子实测 → 19.93 GiB 电影种子：元数据到手、396 KB/s、42 片 SHA-1 全对；peer 中有不在 tracker 名单的，证明 DHT/PEX 生效
+- 导入语义确定为「导入 ≠ 下载」（休眠 → 激活才下载），激活 4.2 s 首字节；休眠后会话真停
+- 可见性修复 → kernelState.ACQUIRING + 「正在寻找来源」+ diskBytes 读口
+- GitHub 仓库与发布流水线 → https://github.com/minatoAI/huchuan ，Windows CI 真 runner 2m50s 通过；0.1.0 草稿已建（APK 23,034,447 已签名 / Windows 34,803,588）
 - Doze 对照（同一把尺子）：无前台服务 断链 23 次 / 重连 20 / 耗尽 3 / 恢复 20 s；有前台服务（WebView 包）全部 0 次、无需恢复
 - 链接分享（W1 接收页 / 内核 link 层 / Android P8+P9 / Windows daemon 适配）→ 两端 8 MiB 端到端、浏览器独立 SHA 一致；挂机 10 分钟仍可接收（11 次采样）；线上发版待 wrangler 重新授权
 - 分享者等待预算与访客建链预算分离（core fbd24a2）；链接分享断言 78→119

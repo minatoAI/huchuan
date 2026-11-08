@@ -152,7 +152,15 @@ class LanDiscovery : AutoCloseable {
         return best
     }
 
-    fun register(group: GroupMeta, messagePort: Int, btPort: Int): Boolean {
+    /**
+     * 广播一个群（协议 §3.1）。个人空间一律不广播（docs/design/personal-space.md）：
+     * 它不是可加入的群，广播出去只会让同网段的其它设备看到一个点不进去的候选。
+     *
+     * 这里是**纵深防御**：正常调用点（M1Kernel 的 start / refreshBtReachability）已经先跳过它，
+     * 但个人空间不可广播这件事不该依赖调用方记得传对。
+     */
+    fun register(group: GroupMeta, messagePort: Int, btPort: Int, personal: Boolean = false): Boolean {
+        if (personal) return false
         val jm = jmDns ?: return false
         return try {
             val props = mapOf(
@@ -170,6 +178,9 @@ class LanDiscovery : AutoCloseable {
             false
         }
     }
+
+    /** 当前在广播的群 gid（诊断 / 验收读口；个人空间永远不在里面）。 */
+    fun registeredGroupIds(): Set<String> = synchronized(lock) { registrations.keys.toSet() }
 
     fun unregister(groupId: String) {
         val jm = jmDns ?: return

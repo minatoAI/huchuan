@@ -1,5 +1,6 @@
 package app.huchuan.ui
 
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.padding
@@ -14,10 +15,16 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import app.huchuan.R
 import app.huchuan.core.FileScope
@@ -48,6 +55,8 @@ fun PageScaffold(
     actions: @Composable RowScope.() -> Unit = {},
     snackbarHost: @Composable () -> Unit = {},
     bottomBar: @Composable () -> Unit = {},
+    titleMaxLines: Int = 1,
+    titleStyle: TextStyle? = null,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Scaffold(
@@ -56,8 +65,8 @@ fun PageScaffold(
                 title = {
                     Text(
                         text = title,
-                        style = MaterialTheme.typography.titleLarge,
-                        maxLines = 1,
+                        style = titleStyle ?: MaterialTheme.typography.titleLarge,
+                        maxLines = titleMaxLines,
                         overflow = TextOverflow.Ellipsis,
                     )
                 },
@@ -120,6 +129,102 @@ fun formatSize(bytes: Long): String {
 fun formatRate(bytesPerSecond: Long): String = formatSize(bytesPerSecond) + "/s"
 
 /**
+ * 给长文件名补断行机会：点 / 横线 / 下划线后插零宽空格，否则整段拉丁文件名会被当成
+ * 一个不可断的词，两行标题的第一行只剩开头一两个汉字。
+ */
+fun softWrapName(name: String): String {
+    // 扩展名前的最后一个点不插零宽空格：宁可断在别的点上，也不要把 .mkv 拆到下一行。
+    val lastDot = name.lastIndexOf('.')
+    return buildString(name.length + 16) {
+        name.forEachIndexed { index, c ->
+            append(c)
+            if ((c == '.' && index != lastDot) || c == '-' || c == '_') append('\u200B')
+        }
+    }
+}
+
+/**
+ * 单行中间省略，保留扩展名（P3 文件行）：先把尾部（至少扩展名）留住，再用剩余宽度补头部。
+ * Compose 的 TextOverflow 只有末尾省略，中间省略要靠实测宽度自己切。
+ */
+@Composable
+fun MiddleEllipsisText(
+    text: String,
+    style: TextStyle,
+    modifier: Modifier = Modifier,
+    color: Color = Color.Unspecified,
+) {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    BoxWithConstraints(modifier = modifier) {
+        val maxWidth = constraints.maxWidth
+        val display = remember(text, maxWidth, style, density, measurer) {
+            if (maxWidth <= 0 || maxWidth == Constraints.Infinity) {
+                text
+            } else {
+                middleEllipsis(text, style, maxWidth, measurer)
+            }
+        }
+        Text(
+            text = display,
+            style = style,
+            color = color,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+private fun middleEllipsis(
+    text: String,
+    style: TextStyle,
+    maxWidth: Int,
+    measurer: TextMeasurer,
+): String {
+    fun fits(candidate: String): Boolean =
+        measurer.measure(
+            text = candidate,
+            style = style,
+            maxLines = 1,
+            softWrap = false,
+        ).size.width <= maxWidth
+
+    if (fits(text)) return text
+    val dot = text.lastIndexOf('.')
+    val hasExtension = dot > 0 && dot < text.length - 1 && text.length - dot <= 12
+    val extension = if (hasExtension) text.substring(dot) else ""
+    val stem = if (hasExtension) text.substring(0, dot) else text
+    if (stem.isEmpty()) return text
+    if (!fits("…" + extension)) return text
+
+    // 宽度对字符数基本单调：二分“最多能留几个字符”，尾部多分一点，尾部才认得出是哪个文件。
+    var low = 0
+    var high = stem.length - 1
+    var best = 0
+    while (low <= high) {
+        val mid = (low + high) ushr 1
+        if (fits(middleCandidate(stem, mid, extension))) {
+            best = mid
+            low = mid + 1
+        } else {
+            high = mid - 1
+        }
+    }
+    return middleCandidate(stem, best, extension)
+}
+
+private fun middleCandidate(stem: String, keep: Int, extension: String): String {
+    if (keep <= 0) return "…" + extension
+    val safeKeep = keep.coerceAtMost(stem.length - 1)
+    // 头部多留一点（文件名前面通常是片名），尾部只保留扩展名附近那几字符。
+    val tail = (safeKeep / 4)
+        .coerceAtLeast(extension.length + 2)
+        .coerceAtMost(safeKeep)
+    val head = safeKeep - tail
+    return stem.take(head) + "…" + stem.takeLast(tail) + extension
+}
+
+/**
  * 公开条目的元数据还没到手：内核把 size 记 0，等 ut_metadata 回来再本地回填
  * （public-swarm §1.1 / §3.1）。只看它一个字段，不去猜状态机。
  */
@@ -146,6 +251,18 @@ fun fileStateLabel(file: GroupFile): String = when {
     file.state == FileState.SEEDING -> stringResource(R.string.p3_state_seeding)
     file.state == FileState.DOWNLOADING -> stringResource(R.string.p3_state_downloading)
     else -> stringResource(R.string.p3_state_sleeping)
+}
+
+/**
+ * P4 激活/休眠开关下面那一行「当前后果」：开关本身只表达状态，后果得用一句人话写出来。
+ * 四种文案与内核状态一一对应，不新增控件（ui-ia.md §2.1）。
+ */
+@Composable
+fun fileConsequenceLabel(file: GroupFile): String = when {
+    file.searchingSource -> stringResource(R.string.p4_consequence_finding)
+    file.state == FileState.SEEDING -> stringResource(R.string.p4_consequence_seeding)
+    file.state == FileState.DOWNLOADING -> stringResource(R.string.p4_consequence_downloading)
+    else -> stringResource(R.string.p4_consequence_sleeping)
 }
 
 /**

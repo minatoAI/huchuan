@@ -218,6 +218,17 @@ class InviteCode private constructor(
             sha256(Domains.CHECK.toByteArray(Charsets.UTF_8), secret).copyOf(5)
 
         /**
+         * 用给定的秘密段重建一枚码（校验段按 §2.1 现算）。
+         *
+         * 只给**派生码**用：个人空间的码是从设备身份派生的（不是随机生成），但它仍然是合法的
+         * 16 字符码，[fromFull] 能原样读回来。个人空间不接受加入，所以这枚码不作为准入凭据。
+         */
+        fun ofSecret(secret: ByteArray): InviteCode {
+            require(secret.size == 5) { "invite secret must be 5 bytes" }
+            return InviteCode(secret, checkOf(secret))
+        }
+
+        /**
          * 只给后 8 位：本机重算前 8 位（§2.1「由后 8 位重算前 8 位再比对」）。
          * 返回 null 表示字符集或长度不对。
          */

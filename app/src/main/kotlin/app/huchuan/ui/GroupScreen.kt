@@ -26,7 +26,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import app.huchuan.HuchuanState
@@ -141,11 +140,9 @@ fun GroupScreen(
 private fun FileRow(file: GroupFile, onClick: () -> Unit) {
     ListItem(
         headlineContent = {
-            Text(
+            MiddleEllipsisText(
                 text = file.name,
                 style = MaterialTheme.typography.titleMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
         },
         supportingContent = {
@@ -195,7 +192,10 @@ private fun FileRow(file: GroupFile, onClick: () -> Unit) {
                 }
             }
         },
-        modifier = Modifier.clickable(onClick = onClick),
+        // 整行可点：ListStyle 的 modifier 先撑满宽度，再挂 clickable，点击区域不跟着文字走。
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
     )
 }
 

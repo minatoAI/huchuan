@@ -68,6 +68,7 @@ public final class SelfTest {
             memberDialPolicy();
             sessionRateLimits();
             publicSwarm();
+            personalSpace();
             tracker();
             crossNet();
             crossNetWindow();
@@ -89,6 +90,15 @@ public final class SelfTest {
         }
         System.out.println("RESULT=FAIL");
         System.exit(1);
+    }
+
+    /**
+     * 个人空间（docs/design/personal-space.md）：首次启动自动建且 gid 由身份派生、不广播 mDNS、
+     * 不注册 tracker、join 一律回 E_JOIN_PERSONAL、文件 / 做种 / 评论 / 限速与普通群同一套读数、
+     * 重启后 state.json 往返完整（并给旧库补建）。断言全在 [PersonalSpaceSelfTest] 里。
+     */
+    private static void personalSpace() {
+        PersonalSpaceSelfTest.run(SelfTest::check);
     }
 
     /**

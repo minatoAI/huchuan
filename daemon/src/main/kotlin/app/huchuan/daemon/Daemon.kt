@@ -73,6 +73,8 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
                 "file_add", "file_list_entry", "file_seeding", "file_stopped",
                 "download_start", "download_completed", "comment_created", "op_ingested",
                 "group_created", "group_joined", "member_name",
+                // 个人空间在 start 里就会被建出来：它是 P2 的置顶入口，第一次出现的状态要推出去
+                "personal_space_ready",
                 -> bump(event)
                 else -> Unit
             }
@@ -512,9 +514,12 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
         return jobj(
             "id" to jstr(g.groupId),
             "name" to jstr(g.name),
-            "inviteCode" to jstr(g.inviteCode),
-            "inviteTail8" to jstr(g.inviteCode.takeLast(8)),
-            "invitePretty" to jstr(g.invitePretty),
+            // 个人空间（docs/design/personal-space.md）：P2 靠它置顶、P3/P4 靠它换入口文案。
+            // 个人空间不生成、不显示邀请码 —— 这里直接把三个邀请码字段清空，界面不必再判一次。
+            "isPersonal" to jbool(g.isPersonal),
+            "inviteCode" to jstr(if (g.isPersonal) "" else g.inviteCode),
+            "inviteTail8" to jstr(if (g.isPersonal) "" else g.inviteCode.takeLast(8)),
+            "invitePretty" to jstr(if (g.isPersonal) "" else g.invitePretty),
             "fingerprint" to jstr(g.fingerprint),
             "memberCount" to jnum(members.size.toLong()),
             "fileCount" to jnum(files.size.toLong()),

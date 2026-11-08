@@ -103,61 +103,62 @@ fun SettingsDrawer(
                 text = stringResource(R.string.p7_global_limit),
                 style = MaterialTheme.typography.titleSmall,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
-                OutlinedTextField(
-                    value = uploadText,
-                    onValueChange = { input ->
-                        val digits = input.filter { it.isDigit() }.take(6)
-                        uploadText = digits
-                        scope.launch { state.setGlobalUploadLimit(digits.toIntOrNull() ?: 0) }
-                    },
-                    label = { Text(stringResource(R.string.p7_upload)) },
-                    // 单位走 trailingIcon：M3 的 suffix 在「disabled / 空框」下不渲染，走查里两个灰框没单位。
-                    trailingIcon = { Text(stringResource(R.string.unit_kbps), style = MaterialTheme.typography.bodyMedium) },
-                    singleLine = true,
-                    enabled = !device.unlimited,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.weight(1f),
-                )
-                OutlinedTextField(
-                    value = downloadText,
-                    onValueChange = { input ->
-                        val digits = input.filter { it.isDigit() }.take(6)
-                        downloadText = digits
-                        scope.launch { state.setGlobalDownloadLimit(digits.toIntOrNull() ?: 0) }
-                    },
-                    label = { Text(stringResource(R.string.p7_download)) },
-                    trailingIcon = { Text(stringResource(R.string.unit_kbps), style = MaterialTheme.typography.bodyMedium) },
-                    singleLine = true,
-                    enabled = !device.unlimited,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.weight(1f),
-                )
-            }
-            // 「不限」开关：关掉 → 按输入框里的值限速；打开 → 两项都按 0 下发（触及内核，不是只改一个布尔）。
+            // 「限制速度」开关：开 = 显示上行/下行输入框；关 = 两项按 0 下发（真正不限速）。
             // 整行可点（M3 的 Row + toggleable）：脚本按文案点这一行就够，不用去戳开关那一小块。
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = Spacing.rowMinHeight)
                     .toggleable(
-                        value = device.unlimited,
+                        value = !device.unlimited,
                         role = Role.Switch,
-                        onValueChange = { scope.launch { state.setGlobalUnlimited(it) } },
+                        onValueChange = { limited -> scope.launch { state.setGlobalUnlimited(!limited) } },
                     ),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(stringResource(R.string.p7_unlimited))
+                Text(stringResource(R.string.p7_limit_speed))
                 Spacer(Modifier.weight(1f))
                 Switch(
-                    checked = device.unlimited,
+                    checked = !device.unlimited,
                     onCheckedChange = null,
                     colors = brandSwitchColors(),
                 )
             }
+            if (!device.unlimited) {
+                Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
+                    OutlinedTextField(
+                        value = uploadText,
+                        onValueChange = { input ->
+                            val digits = input.filter { it.isDigit() }.take(6)
+                            uploadText = digits
+                            // 清空 = 0 = 不限；关开关时也按 0 下发。
+                            scope.launch { state.setGlobalUploadLimit(digits.toIntOrNull() ?: 0) }
+                        },
+                        label = { Text(stringResource(R.string.p7_upload)) },
+                        // 单位走 trailingIcon：M3 的 suffix 在空框下不渲染，走查里两个框没单位。
+                        trailingIcon = { Text(stringResource(R.string.unit_kbps), style = MaterialTheme.typography.bodyMedium) },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                    )
+                    OutlinedTextField(
+                        value = downloadText,
+                        onValueChange = { input ->
+                            val digits = input.filter { it.isDigit() }.take(6)
+                            downloadText = digits
+                            scope.launch { state.setGlobalDownloadLimit(digits.toIntOrNull() ?: 0) }
+                        },
+                        label = { Text(stringResource(R.string.p7_download)) },
+                        trailingIcon = { Text(stringResource(R.string.unit_kbps), style = MaterialTheme.typography.bodyMedium) },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
 
             // 跨网发现（自建 tracker）：关掉后内核不注册、不 announce，只剩局域网 mDNS 与手动 IP。
-            // 与「不限」同一个开关组件（整行可点，脚本按文案点这一行就够）。
+            // 与「限制速度」同一个开关组件（整行可点，脚本按文案点这一行就够）。
             // 内核只接受启动前的基址，所以这一项改的是下一次冷启动；改完还没重启时补一行状态。
             if (state.trackerAvailable) {
                 Row(

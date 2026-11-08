@@ -4,20 +4,27 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.util.Log
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DropdownMenu
@@ -28,6 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -43,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
@@ -85,10 +94,20 @@ fun FileScreen(
     var limitText by rememberSaveable(fileId) {
         mutableStateOf(if (file.uploadLimitKbps > 0) file.uploadLimitKbps.toString() else "")
     }
+    // 开关状态单独存：输入框清空时限制实际为 0，但开关不能自己弹回去。
+    var limitEnabled by rememberSaveable(fileId) { mutableStateOf(file.uploadLimitKbps > 0) }
+
+    // 返回键先取消回复目标（不退出页面）；没有目标时交给 HuchuanApp 的全局返回。
+    BackHandler(enabled = replyTo != null) { replyTo = null }
 
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val copiedLabel = stringResource(R.string.p6_copied)
+    val applyFileLimit: (Boolean) -> Unit = { enabled ->
+        limitEnabled = enabled
+        val kbps = if (enabled) limitText.toIntOrNull() ?: 0 else 0
+        scope.launch { state.setFileUploadLimit(groupId, file.id, kbps) }
+    }
 
     // 顶栏「…」：私有条目一项「公开到群外」，公开条目一项「取消公开」（public-swarm §6.1）。
     // 发布期间菜单项置灰 —— 状态位已经写着「发布中」，这里不再多给一个入口。
@@ -107,7 +126,11 @@ fun FileScreen(
     }
 
     PageScaffold(
-        title = file.name,
+        // P4 顶部显示完整名：可换行、最多两行；两行用 titleMedium 才放得进 64dp 的 TopAppBar。
+        // 点/横线后补零宽空格，长文件名才有地方断行。
+        title = softWrapName(file.name),
+        titleMaxLines = 2,
+        titleStyle = MaterialTheme.typography.titleMedium,
         // 「移除」只对公开条目出现（public-swarm §5.2）：私有条目行为不变。
         actions = {
             if (file.scope == FileScope.PUBLIC) {
@@ -165,6 +188,7 @@ fun FileScreen(
                 commentText = commentText,
                 onCommentTextChange = { commentText = it },
                 replyToAuthor = replyTo?.author,
+                onCancelReply = { replyTo = null },
                 onSend = {
                     val body = commentText
                     val parent = replyTo?.id
@@ -316,16 +340,37 @@ fun FileScreen(
                 )
             }
 
+            // 开关下面一行「当前后果」：只解释状态，不加控件（ui-ia.md §2.1）。
+            Text(
+                text = fileConsequenceLabel(file),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            // P4 单文件限速：开关「限制速度」，关 = 不限，开 = 才出现 KB/s 输入框。
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = Spacing.rowMinHeight)
+                    .toggleable(
+                        value = limitEnabled,
+                        role = Role.Switch,
+                        onValueChange = applyFileLimit,
+                    ),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(Spacing.item),
             ) {
                 Text(
-                    text = stringResource(R.string.p4_upload_limit),
+                    text = stringResource(R.string.p4_limit_speed),
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 Spacer(Modifier.weight(1f))
+                Switch(
+                    checked = limitEnabled,
+                    onCheckedChange = null,
+                    colors = brandSwitchColors(),
+                )
+            }
+            if (limitEnabled) {
                 OutlinedTextField(
                     value = limitText,
                     onValueChange = { input ->
@@ -334,13 +379,11 @@ fun FileScreen(
                         // 清空输入框 = 0 = 不限：真的把 handle 上的限制清掉，不是「跳过不设」。
                         scope.launch { state.setFileUploadLimit(groupId, file.id, digits.toIntOrNull() ?: 0) }
                     },
-                    placeholder = { Text(stringResource(R.string.p4_unlimited)) },
-                    // 单位走 trailingIcon 而不是 suffix：M3 的 suffix 只在「有焦点 / 有文字」时出现，
-                    // 空框（P7 disabled、P7 空框）会把单位吞掉。trailingIcon 两种状态都画。
+                    // 单位走 trailingIcon 而不是 suffix：M3 的 suffix 在空框时会被吞掉。
                     trailingIcon = { Text(stringResource(R.string.unit_kbps), style = MaterialTheme.typography.bodyMedium) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.width(160.dp),
+                    modifier = Modifier.fillMaxWidth(),
                 )
             }
 
@@ -353,32 +396,90 @@ fun FileScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
-                file.comments.forEach { comment ->
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { replyTo = comment }
-                            .padding(vertical = 4.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(
-                                text = comment.author,
-                                style = MaterialTheme.typography.labelLarge,
-                            )
-                            Text(
-                                text = comment.time,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        Text(
-                            text = comment.body,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    }
+                val rows = remember(file.comments) { commentRows(file.comments) }
+                rows.forEach { row ->
+                    CommentRowView(row = row, onReply = { replyTo = row.comment })
                 }
             }
+        }
+    }
+}
+
+/**
+ * 评论展示行：depth = 1 主评论，depth = 2 回复（缩进 + 左侧竖线）。
+ * 超过两级的回复压平到第二级：只按“根评论”分组，不按直接父级递归（GitHub issue 的同款做法）。
+ */
+private data class CommentRow(val comment: Comment, val depth: Int)
+
+private fun commentRows(comments: List<Comment>): List<CommentRow> {
+    if (comments.isEmpty()) return emptyList()
+    val byId = comments.associateBy { it.id }
+    val rootIds = HashMap<String, String>(comments.size)
+    fun rootIdOf(comment: Comment): String {
+        rootIds[comment.id]?.let { return it }
+        var current = comment
+        val seen = HashSet<String>()
+        while (seen.add(current.id)) {
+            val parent = current.parentId?.let(byId::get) ?: return current.id
+            current = parent
+        }
+        // 父链成环（坏数据）：把当前评论当独立根，避免无限循环。
+        return comment.id
+    }
+    comments.forEach { rootIds[it.id] = rootIdOf(it) }
+
+    val rows = ArrayList<CommentRow>(comments.size)
+    comments.forEach { root ->
+        if (rootIds[root.id] != root.id) return@forEach
+        rows.add(CommentRow(root, depth = 1))
+        comments.forEach { child ->
+            if (child.id != root.id && rootIds[child.id] == root.id) {
+                rows.add(CommentRow(child, depth = 2))
+            }
+        }
+    }
+    return rows
+}
+
+@Composable
+private fun CommentRowView(row: CommentRow, onReply: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            // IntrinsicSize.Min 让左侧竖线跟着这一段评论的高度走，而不是撑满整列。
+            .height(IntrinsicSize.Min)
+            .clickable(onClick = onReply)
+            .padding(vertical = 4.dp),
+    ) {
+        if (row.depth > 1) {
+            Spacer(Modifier.width(16.dp))
+            Box(
+                Modifier
+                    .width(2.dp)
+                    .fillMaxHeight()
+                    .background(MaterialTheme.colorScheme.outlineVariant),
+            )
+            Spacer(Modifier.width(12.dp))
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = row.comment.author,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(
+                    text = row.comment.time,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Text(
+                text = row.comment.body,
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
@@ -396,9 +497,11 @@ private fun CommentInputBar(
     commentText: String,
     onCommentTextChange: (String) -> Unit,
     replyToAuthor: String?,
+    onCancelReply: () -> Unit,
     onSend: () -> Unit,
 ) {
-    Row(
+    val cancelReplyLabel = stringResource(R.string.p4_reply_cancel)
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .navigationBarsPadding()
@@ -409,23 +512,53 @@ private fun CommentInputBar(
                 top = Spacing.item,
                 bottom = 0.dp,
             ),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        OutlinedTextField(
-            value = commentText,
-            onValueChange = onCommentTextChange,
-            placeholder = {
-                Text(
-                    text = replyToAuthor?.let { stringResource(R.string.p4_reply, it) }
-                        ?: stringResource(R.string.p4_comment_hint),
-                )
-            },
-            maxLines = 3,
-            modifier = Modifier.weight(1f),
-        )
-        TextButton(onClick = onSend, enabled = commentText.isNotBlank()) {
-            Text(stringResource(R.string.p4_send))
+        val author = replyToAuthor
+        if (author != null) {
+            // 「回复 @作者名 ×」：点 × 只取消目标，输入内容保留。
+            Surface(
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(start = 12.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.p4_reply, author),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    TextButton(
+                        onClick = onCancelReply,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        modifier = Modifier.semantics { contentDescription = cancelReplyLabel },
+                    ) {
+                        Text("×", style = MaterialTheme.typography.titleMedium)
+                    }
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedTextField(
+                value = commentText,
+                onValueChange = onCommentTextChange,
+                placeholder = {
+                    Text(
+                        text = author?.let { stringResource(R.string.p4_reply, it) }
+                            ?: stringResource(R.string.p4_comment_hint),
+                    )
+                },
+                maxLines = 3,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onSend, enabled = commentText.isNotBlank()) {
+                Text(stringResource(R.string.p4_send))
+            }
         }
     }
 }

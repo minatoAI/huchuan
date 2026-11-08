@@ -245,7 +245,17 @@ class Api(private val daemon: Daemon) {
         val joined = kernel.joinByTail8(tail8, manual, timeoutMs)
         val elapsed = System.currentTimeMillis() - started
         if (joined == null) {
-            daemon.log.event("api_join_failed", mapOf("tail8" to tail8, "ms" to elapsed.toString()))
+            // 失败码分流：对端**明确拒绝**时（个人空间 = E_JOIN_PERSONAL）把它的码原样回给界面，
+            // 其余（超时 / 连不上 / 码不对）仍是笼统的 E_JOIN_FAILED。两者在 P5 上是两种文案：
+            // 「对方不能加入」不该显示成「没找到这个群」。
+            val reason = kernel.lastJoinError()
+            daemon.log.event(
+                "api_join_failed",
+                mapOf("tail8" to tail8, "ms" to elapsed.toString(), "reason" to reason),
+            )
+            if (reason == "E_JOIN_PERSONAL") {
+                return fail(reason, "对方是个人空间，不能被加入", 409)
+            }
             return fail("E_JOIN_FAILED", "没找到这个群：检查后 8 位、对方是否在跑、地址是否可达", 409)
         }
         daemon.bump("joined")

@@ -129,6 +129,16 @@ class M1Kernel @JvmOverloads constructor(
     @Volatile
     private var joinIntent: JoinIntent? = null
 
+    /**
+     * 最近一次 [joinByTail8] 失败的原因：协议失败码（如 `E_JOIN_PERSONAL`）或一句描述
+     * （`timeout connecting …`）。成功时是空串。
+     *
+     * 宿主（daemon 的 /api/join）拿它把「对方明确拒绝」和「连不上」区分开 —— 否则界面上
+     * 一次明确的拒绝会显示成一次超时。
+     */
+    @Volatile
+    private var joinError: String = ""
+
     @Volatile
     private var messagePortValue = 0
 
@@ -144,8 +154,14 @@ class M1Kernel @JvmOverloads constructor(
         identity = DeviceIdentity.loadOrCreate(File(dataDir, "identity.txt"))
         tlsIdentity = TlsIdentity.create(identity)
         loadState()
+        // 个人空间（docs/design/personal-space.md）：首次启动自动建；旧 state.json 没有就补建。
+        // 必须在这里做而不是等宿主点进 P2：它要跟着 resumeSeeds（重启续种）与 saveState 一起走。
+        ensurePersonalSpace()
         // 记下「这次是从本地库恢复出来的群」：只有它们需要冷启动主动重连（缺口一）。
-        for (g in allGroups()) restoredGroupIds.add(g.groupId)
+        // 个人空间没有对端，不进重连目标（它连自己都不需要重连）。
+        for (g in allGroups()) {
+            if (!g.isPersonal) restoredGroupIds.add(g.groupId)
+        }
 
         bt = BtSession(btHint, File(dataDir, "bt"), ipFilterEnabled = true)
         // P7 全局限速：宿主可能在 start() 之前就把设置读出来了，先把目标值交给会话（start 前设置进 settings_pack）。
@@ -177,7 +193,12 @@ class M1Kernel @JvmOverloads constructor(
         server = srv
 
         val mdnsOk = lanDiscovery.start()
-        for (g in allGroups()) lanDiscovery.register(g.meta, messagePortValue, bt.listenPort)
+        // 个人空间**不广播**（设计文档「mDNS：不广播，不响应任何加入请求」）：
+        // 它不是可加入的群，广播出去只会让同网段的设备看到一个点不进去的候选。
+        for (g in allGroups()) {
+            if (g.isPersonal) continue
+            lanDiscovery.register(g.meta, messagePortValue, bt.listenPort)
+        }
 
         startMonitor()
         // 缺口二：完成判定自己有一条线程（告警队列 + 200 ms 兜底巡查），不再等 2 s 巡查节拍。
@@ -302,7 +323,10 @@ class M1Kernel @JvmOverloads constructor(
         if (closed.get() || !this::bt.isInitialized) return
         refreshBtAllowlist()
         for (g in allGroups()) {
+            // 个人空间没有 mDNS 记录可刷（见 start 里同一个跳过）：unregister 是幂等的空操作，
+            // 这里保留它只是为了让两条路径长得一样。
             lanDiscovery.unregister(g.groupId)
+            if (g.isPersonal) continue
             lanDiscovery.register(g.meta, messagePortValue, localBtPort())
         }
         broadcastPeerAnnounceAll()
@@ -363,9 +387,13 @@ class M1Kernel @JvmOverloads constructor(
 
     internal fun messagePortHint(): Int = portHint
 
-    /** 冷启动重连的目标群（[start] 时从 state.json 恢复出来的那些，且现在还在本地库里）。 */
+    /**
+     * 冷启动重连的目标群（[start] 时从 state.json 恢复出来的那些，且现在还在本地库里）。
+     *
+     * 个人空间永远不在里面：它只有一个成员（本机），没有任何需要连回去的对端。
+     */
     internal fun reconnectTargets(): List<GroupRuntime> = synchronized(stateLock) {
-        restoredGroupIds.mapNotNull { groupsById[it] }
+        restoredGroupIds.mapNotNull { groupsById[it] }.filter { !it.isPersonal }
     }
 
     /** 建一条去程链路：TLS 握手成功后把 PeerLink 的读线程起起来，返回时链路已在收发 hello。 */
@@ -950,7 +978,11 @@ class M1Kernel @JvmOverloads constructor(
         tracker = service
         service.start()
         // 从 state.json 恢复出来的群：立刻注册并 announce，冷启动重连的候选表里就有跨网那一份。
-        for (group in allGroups()) service.watch(group)
+        // 个人空间跳过（它不可加入，注册上去只会让服务端多一条永远不会有 peer 的 swarm）。
+        for (group in allGroups()) {
+            if (group.isPersonal) continue
+            service.watch(group)
+        }
     }
 
     // ------------------------------------------------------------------ 会话级（P7 全局限速）
@@ -1013,6 +1045,77 @@ class M1Kernel @JvmOverloads constructor(
 
     fun groups(): List<GroupRuntime> = allGroups()
 
+    /** 个人空间（docs/design/personal-space.md）；内核没起来时返回 null。 */
+    fun personalSpace(): GroupRuntime? =
+        synchronized(stateLock) { groupsById.values.firstOrNull { it.isPersonal } }
+
+    /**
+     * 当前在 mDNS 上广播的群 gid（诊断 / 验收读口）。
+     *
+     * 个人空间的 gid **永远不在**这个集合里 —— 断言「不广播」看的就是它，而不是去猜组播包。
+     */
+    fun mdnsBroadcastGroupIds(): Set<String> = lanDiscovery.registeredGroupIds()
+
+    /**
+     * 首次启动自动建个人空间；旧 state.json 没有时就地补建（已有数据一律不动）。
+     *
+     * 认领顺序：① 已经标了 isPersonal 的群 → ② gid 等于派生值的群（旧库没写标记的情况）。
+     * 都不存在才新建。这样「补建」永远不会在同一份数据上建出第二个个人空间。
+     *
+     * 与 [createGroup] 的差别（除了 gid 派生）：
+     *   - **不生成邀请码**：码也是派生的（[PersonalSpace.inviteOf]），只给 kGrp / fp / proof 用；
+     *   - **不广播 mDNS、不注册 tracker**（见 [start] 与 [TrackerService.watch]）；
+     *   - **不推 joined 事件**：宿主把它当「群」处理会立刻进 P3，而它应该是 P2 的置顶入口，
+     *     由宿主自己在状态里按 isPersonal 认（这里只留一条 personal_space_ready 日志做证据）。
+     */
+    private fun ensurePersonalSpace(): GroupRuntime {
+        val expectedGid = PersonalSpace.groupIdOf(identity)
+        val reused = synchronized(stateLock) {
+            groupsById.values.firstOrNull { it.isPersonal } ?: groupsById[expectedGid]
+        }
+        if (reused != null) {
+            val marked = synchronized(stateLock) {
+                val was = reused.isPersonal
+                reused.isPersonal = true
+                was
+            }
+            events.log(
+                "personal_space_ready",
+                mapOf(
+                    "gid" to reused.groupId,
+                    "name" to reused.name,
+                    "created" to "false",
+                    "flag_restored" to (!marked).toString(),
+                    "files" to reused.files().size.toString(),
+                ),
+            )
+            if (!marked) saveState()
+            return reused
+        }
+        val meta = PersonalSpace.meta(identity, System.currentTimeMillis())
+        val rt = GroupRuntime(this, meta)
+        rt.isPersonal = true
+        rt.addMember(deviceId, deviceName, 1, identity.pub64.toHex())
+        // 自己的公钥同样进库：本机共享的文件条目由本机签名，恢复 / 校验时按 addedBy 取值。
+        registerPub(deviceId, identity.pub64)
+        synchronized(stateLock) { groupsById[meta.groupId] = rt }
+        saveState()
+        events.log(
+            "personal_space_ready",
+            mapOf(
+                "gid" to meta.groupId,
+                "name" to meta.name,
+                "created" to "true",
+                "flag_restored" to "false",
+                "files" to "0",
+                "mdns" to "skip",
+                "tracker" to "skip",
+                "join" to "reject",
+            ),
+        )
+        return rt
+    }
+
     fun group(groupId: String): GroupRuntime? = synchronized(stateLock) { groupsById[groupId] }
 
     internal fun allGroups(): List<GroupRuntime> = synchronized(stateLock) { groupsById.values.toList() }
@@ -1062,6 +1165,14 @@ class M1Kernel @JvmOverloads constructor(
      * 不抛异常、不改库、不重复发事件。返回 true 表示这一次真的删掉了。
      */
     fun removeGroup(groupId: String): Boolean {
+        // 个人空间不可删除（设计文档「删除：不可删除；删文件是删文件，不是删空间」）：
+        // 删掉它等于把分享链接的归属与做种记录一起抹掉，用户的本意从来不是这个。
+        synchronized(stateLock) { groupsById[groupId] }?.let { g ->
+            if (g.isPersonal) {
+                events.log("group_remove_rejected", mapOf("gid" to groupId, "reason" to "personal_space"))
+                return false
+            }
+        }
         val group = synchronized(stateLock) { groupsById.remove(groupId) } ?: run {
             events.log("group_remove_noop", mapOf("gid" to groupId))
             return false
@@ -1218,6 +1329,7 @@ class M1Kernel @JvmOverloads constructor(
         val intent = JoinIntent(invite)
         intent.manualCandidates = manualCandidates
         joinIntent = intent
+        joinError = ""
         try {
             val lanCandidates = if (lanDiscovery.start()) {
                 lanDiscovery.browse(minOf(4000L, timeoutMs))
@@ -1249,6 +1361,7 @@ class M1Kernel @JvmOverloads constructor(
                 val group = attemptJoin(c, intent, minOf(12_000L, remaining))
                 if (group != null) {
                     events.log("join_via", mapOf("source" to c.source, "addr" to c.key))
+                    joinError = ""
                     return group
                 }
                 // 候选连不上要留痕：多网卡机器上 mDNS 解析出的地址经常不可达，
@@ -1258,6 +1371,7 @@ class M1Kernel @JvmOverloads constructor(
                     mapOf("addr" to c.key, "source" to c.source, "error" to intent.lastError),
                 )
             }
+            joinError = intent.lastError
             events.log("join_failed", mapOf("reason" to intent.lastError))
             return null
         } finally {
@@ -1300,6 +1414,14 @@ class M1Kernel @JvmOverloads constructor(
     }
 
     internal fun currentJoinIntent(): JoinIntent? = joinIntent
+
+    /**
+     * 最近一次加入失败的原因（失败码 / 一句话）；成功或还没试过时是空串。
+     *
+     * 给宿主做错误分流用：`E_JOIN_PERSONAL` 是对方明确拒绝（个人空间不可加入），
+     * 其余才是「没找到 / 连不上」。docs/daemon-api.md 的 /api/join 一节同步了这条口径。
+     */
+    fun lastJoinError(): String = joinError
 
     internal fun onJoinComplete(intent: JoinIntent, group: GroupRuntime, link: PeerLink) {
         intent.attempt?.complete(group)
@@ -1471,6 +1593,9 @@ class M1Kernel @JvmOverloads constructor(
                     createdAt = o.num("createdAt") ?: 0L,
                 )
                 val rt = GroupRuntime(this, meta)
+                // 个人空间标记：先看落盘的 isPersonal，没有这个字段的旧库（或补建后第一次保存之前）
+                // 按派生 gid 认 —— 认出来的在下一次 saveState 时写回标记。
+                rt.isPersonal = (o.bool("isPersonal") ?: false) || gid == PersonalSpace.groupIdOf(identity)
                 for (m in o.arr("members") ?: emptyList()) {
                     val mo = m as? J.Obj ?: continue
                     val dev = mo.str("dev") ?: continue

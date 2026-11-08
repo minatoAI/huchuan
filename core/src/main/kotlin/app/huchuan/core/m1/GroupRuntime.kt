@@ -35,6 +35,19 @@ class GroupRuntime internal constructor(
 ) {
     private val lock = Any()
 
+    /**
+     * 个人空间（docs/design/personal-space.md）：本机保存分享文件的独立入口，**不可加入**。
+     *
+     * 落 state.json 的 `isPersonal`。旧库（没有这个字段）在启动补建 / 载入时按派生 gid 认出来
+     * 并写回（见 [M1Kernel.ensurePersonalSpace] 与 [M1Kernel.loadState]）。
+     *
+     * 它与普通群的差别全部在隔离上（mDNS / tracker / 消息层 join），文件、做种、评论、限速
+     * 走的是同一条代码路径 —— 这正是设计文档 §「文件：与群文件同一套存储与做种代码」的要求。
+     */
+    @Volatile
+    var isPersonal: Boolean = false
+        internal set
+
     internal val files = LinkedHashMap<String, FileEntry>()
     internal val members = LinkedHashMap<String, MemberRecord>()
     internal val links = LinkedHashMap<String, PeerLink>()
@@ -1575,6 +1588,9 @@ class GroupRuntime internal constructor(
     internal fun toStoreJson(): J.Obj = synchronized(lock) {
         jobj(
             "gid" to jstr(meta.groupId),
+            // 个人空间标记（docs/design/personal-space.md）。旧库没有这个字段：载入时按派生 gid 认，
+            // 认出来就写回这里，所以下一条 saveState 之后旧数据也带上了标记。
+            "isPersonal" to jbool(isPersonal),
             "gHandle" to jstr(meta.gHandle),
             "name" to jstr(meta.name),
             "code" to jstr(meta.invite.code),

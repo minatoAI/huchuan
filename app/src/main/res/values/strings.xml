@@ -79,9 +79,14 @@
     <string name="p4_comment_hint">写评论</string>
     <string name="p4_send">发送</string>
     <string name="p4_no_comments">还没有评论</string>
-    <string name="p4_reply">回复 %1$s</string>
-    <string name="p4_upload_limit">单文件限速</string>
-    <string name="p4_unlimited">不限</string>
+    <string name="p4_reply">回复 @%1$s</string>
+    <string name="p4_reply_cancel">取消回复</string>
+    <string name="p4_limit_speed">限制速度</string>
+    <!-- 激活/休眠开关下面那一行当前后果（ui-ia.md §2.1）：只说明状态，不加控件 -->
+    <string name="p4_consequence_seeding">正在做种，成员可从你这里下载</string>
+    <string name="p4_consequence_sleeping">已休眠，不占带宽，成员暂时下不到</string>
+    <string name="p4_consequence_downloading">正在下载</string>
+    <string name="p4_consequence_finding">正在寻找来源</string>
     <string name="p4_source">来源 %1$s</string>
     <string name="p4_connecting">正在连接做种者</string>
     <string name="p4_connect_failed">连不上做种者，重试</string>
@@ -128,7 +133,7 @@
     <string name="p7_global_limit">全局限速</string>
     <string name="p7_upload">上行</string>
     <string name="p7_download">下行</string>
-    <string name="p7_unlimited">不限</string>
+    <string name="p7_limit_speed">限制速度</string>
     <string name="p7_notification">通知</string>
     <!-- 跨网发现（自建 tracker）开关；改完要冷启动才生效时补一行状态 -->
     <string name="p7_tracker">跨网发现</string>
@@ -213,6 +218,8 @@
     <!-- P9 分享管理（link-share §3 P9 / §8）：文件名 / 剩余有效期 / 访客状态 / 撤销 -->
     <string name="p9_title">分享管理</string>
     <string name="p9_empty">还没有分享</string>
+    <string name="p9_new_share">新建分享</string>
+    <string name="p9_no_files">群里还没有文件</string>
     <string name="p9_revoke">撤销</string>
     <string name="p9_revoke_title">撤销分享</string>
     <string name="p9_revoke_confirm">撤销后这条链接立即失效</string>
