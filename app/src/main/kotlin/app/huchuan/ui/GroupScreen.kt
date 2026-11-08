@@ -46,6 +46,8 @@ fun GroupScreen(
     onOpenMembers: () -> Unit,
 ) {
     val group = state.groupOrNull(groupId)
+    // 个人空间没有成员页（docs/design/personal-space.md）：右上不出现「成员」入口。
+    val personal = state.isPersonal(groupId)
 
     if (group == null) {
         LaunchedEffect(groupId) { state.pop() }
@@ -75,13 +77,16 @@ fun GroupScreen(
     var adding by remember { mutableStateOf(false) }
 
     PageScaffold(
+        // 标题就是群名：个人空间的名字由内核固定为「我的分享」。
         title = group.name,
         actions = {
-            TextButton(onClick = onOpenMembers) {
-                Text(
-                    text = stringResource(R.string.p3_members, group.members.size),
-                    style = MaterialTheme.typography.labelLarge,
-                )
+            if (!personal) {
+                TextButton(onClick = onOpenMembers) {
+                    Text(
+                        text = stringResource(R.string.p3_members, group.members.size),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
             }
         },
     ) { padding ->
@@ -101,7 +106,10 @@ fun GroupScreen(
 
             if (group.files.isEmpty()) {
                 Text(
-                    text = stringResource(R.string.p3_empty),
+                    // 个人空间的空态要给下一步（加一个文件，链接就在 P4 里）：普通群那句只说「没有文件」。
+                    text = stringResource(
+                        if (personal) R.string.p3_empty_personal else R.string.p3_empty,
+                    ),
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(Spacing.section),

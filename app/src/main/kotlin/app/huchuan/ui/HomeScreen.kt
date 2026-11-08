@@ -14,11 +14,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -32,6 +34,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import app.huchuan.HuchuanState
@@ -58,9 +61,15 @@ fun HomeScreen(
     LaunchedEffect(Unit) { state.requestNotifyPermission("home") }
 
     var query by rememberSaveable { mutableStateOf("") }
-    val groups = state.groupList.filter { group ->
-        query.isBlank() || group.name.contains(query.trim(), ignoreCase = true)
-    }
+    val personalId = state.personalGroupId
+    // 个人空间固定置顶（docs/design/personal-space.md）：内核的 groups() 是插入顺序，
+    // 旧库补建出来的个人空间会排在最后，所以排序必须在界面做一次（sortedBy 是稳定排序，
+    // 普通群之间的先后不变）。
+    val groups = state.groupList
+        .filter { group ->
+            query.isBlank() || group.name.contains(query.trim(), ignoreCase = true)
+        }
+        .sortedBy { group -> if (group.id == personalId) 0 else 1 }
 
     Scaffold { padding ->
         Column(
@@ -139,7 +148,11 @@ fun HomeScreen(
                     contentPadding = PaddingValues(bottom = Spacing.pageVertical),
                 ) {
                     items(groups, key = { it.id }) { group ->
-                        GroupRow(group = group, onClick = { onOpenGroup(group.id) })
+                        GroupRow(
+                            group = group,
+                            personal = group.id == personalId,
+                            onClick = { onOpenGroup(group.id) },
+                        )
                     }
                 }
             }
@@ -147,16 +160,21 @@ fun HomeScreen(
     }
 }
 
+/**
+ * P2 的一行。个人空间与普通群的差别只有两处（docs/design/personal-space.md）：
+ * 左边多一枚品牌色图标，并且**不写「做种 n」**——个人空间只有本机自己，成员数 / 做种数没有意义。
+ */
 @Composable
-private fun GroupRow(group: Group, onClick: () -> Unit) {
-    ListItem(
-        headlineContent = {
-            Text(
-                text = group.name,
-                style = MaterialTheme.typography.titleMedium,
-            )
-        },
-        supportingContent = {
+private fun GroupRow(group: Group, personal: Boolean, onClick: () -> Unit) {
+    val leading: (@Composable () -> Unit)? = if (personal) {
+        { PersonalSpaceBadge() }
+    } else {
+        null
+    }
+    val supporting: (@Composable () -> Unit)? = if (personal) {
+        null
+    } else {
+        {
             Row(horizontalArrangement = Arrangement.spacedBy(Spacing.item)) {
                 Text(
                     text = stringResource(R.string.p2_seeding, group.seedingCount),
@@ -171,7 +189,17 @@ private fun GroupRow(group: Group, onClick: () -> Unit) {
                     )
                 }
             }
+        }
+    }
+    ListItem(
+        headlineContent = {
+            Text(
+                text = group.name,
+                style = MaterialTheme.typography.titleMedium,
+            )
         },
+        supportingContent = supporting,
+        leadingContent = leading,
         trailingContent = if (group.unreadCount > 0) {
             { StateChip(stringResource(R.string.p2_unread, group.unreadCount), highlighted = true) }
         } else {
@@ -180,4 +208,23 @@ private fun GroupRow(group: Group, onClick: () -> Unit) {
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
         modifier = Modifier.clickable(onClick = onClick),
     )
+}
+
+/** 个人空间的图标：品牌容器色的小方块 + 上行箭头（「从这里分享出去」）。 */
+@Composable
+private fun PersonalSpaceBadge() {
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+    ) {
+        Icon(
+            painter = painterResource(R.drawable.ic_personal_space),
+            contentDescription = stringResource(R.string.p2_personal),
+            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+            modifier = Modifier
+                .padding(10.dp)
+                .size(20.dp),
+        )
+    }
 }

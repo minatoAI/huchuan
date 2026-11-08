@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
-# capture-kernelstate-ui.sh — 内核态（kernelState）两态取证：acquiring（正在寻找来源）与 parked（休眠）
+# capture-kernelstate-ui.sh — 内核态（kernelState）与个人空间（isPersonal）的界面取证
 #
 #   bash windows/scripts/capture-kernelstate-ui.sh
 #   M1_SKIP_BUILD=1 bash windows/scripts/capture-kernelstate-ui.sh   # 复用已构建的 jar 与 exe
 #
-# 装置：一个 daemon（127.0.0.1:47280），群里只有一条**没有来源**的公开磁力条目
-# （随机 infohash + timeoutMs=0）。脚本对它 POST /active {active:true}，内核态当场变成
-# acquiring：元数据还没到手，state 仍是 sleeping、role 仍是 none、字节都是 0，但用户刚点了激活，
-# 界面要说「正在寻找来源」而不是「休眠」（docs/daemon-api.md §3.3、docs/core.md §3.12）。
+# 装置：一个 daemon（127.0.0.1:47280）。它启动时自动建个人空间「我的分享」（docs/design/personal-space.md），
+# 脚本往里放一个 64 KiB 文件；再建一个普通群「老板的群」，放一个 64 KiB 文件 + 一条**没有来源**的
+# 公开磁力条目（随机 infohash + timeoutMs=0），并对这条磁力 POST /active {active:true}。
+# 那一刻内核态是 acquiring：元数据还没到手，state 仍是 sleeping、role 仍是 none、字节都是 0，
+# 但用户刚点了激活，界面要说「正在寻找来源」而不是「休眠」（docs/daemon-api.md §3.3）。
 #
-# 三张图（走壳的离屏截图，跟桌面有没有渲染无关，见 docs/windows-ui.md §5.1）：
+# 五张图（走壳的离屏截图，跟桌面有没有渲染无关，见 docs/windows-ui.md §5.1）：
+#   p2-personal.png   P2 群列表：「我的分享」固定置顶（图标 + 品牌色竖线），普通群在其后
+#   p3-personal.png   P3 个人空间：标题「我的分享」，文件行 + 添加文件，成员入口仍是本机一个人
 #   p3-acquiring.png  P3 行状态 chip「正在寻找来源」（尺寸仍不显示）
 #   p4-acquiring.png  P4 chip「正在寻找来源」+ 激活开关保持「已激活」
 #   p3-parked.png     P3 行 chip「休眠」（kernelState=parked，没有任何 API 造得出来，见下）
@@ -20,12 +23,15 @@
 # 读得到它（daemon 照实投成 paused=true），但 API 没有哪一步能让它停在这。所以这一张走取证别名
 # p3-parked，由 app.js 的 fixtureGroup() 造一条与 daemon 同口径的条目（文档 §6.5）。
 #
-# 除截图外还有一层机读断言：Edge headless + CDP（windows/scripts/kernel-state-probe.mjs）读回
-# P3 的 chip 文案、P4 开关的 aria-checked，以及六个 kernelState 值的映射表。
+# 落点由路由别名钉死（p3-personal / p3-acquiring / p4-acquiring）：深链默认落「有文件的第一个群」，
+# 而个人空间往往排在 /api/state 第一个、又常常是空的。
 #
-# 产物：artifacts/windows/ui/{p3-acquiring,p4-acquiring,p3-parked}.png 与同名 .log
+# 除截图外还有一层机读断言：Edge headless + CDP（windows/scripts/kernel-state-probe.mjs）读回
+# P3 的 chip 文案、P4 开关的 aria-checked、六个 kernelState 值的映射表、P2 的置顶与 P3 的个人空间。
+#
+# 产物：artifacts/windows/ui/{p2-personal,p3-personal,p3-acquiring,p4-acquiring,p3-parked}.png 与同名 .log
 #       artifacts/windows/ui/kernelstate-index.json
-#       artifacts/windows/kernelstate/{daemon.log,api-*.json,probe.log}
+#       artifacts/windows/kernelstate/{daemon.log,state.json,api-*.json,probe.log}
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -110,6 +116,11 @@ post_json() { curl -s -m 30 -X POST -H 'Content-Type: application/json' --data-b
 sval() { printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed 's/^[^:]*:"//; s/"$//'; }
 nval() { printf '%s' "$1" | grep -o "\"$2\":[0-9]*" | head -1 | sed 's/^[^:]*://'; }
 
+# /api/state → 个人空间那一条的事实：gid / inviteCode / memberCount。
+node_field() { # node_field <json 文件> <gid|inviteCode|memberCount>
+  node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const g=(j.data.groups||[]).filter(function(x){return x.isPersonal;})[0];process.stdout.write(g?String(g[process.argv[2]]):"__none__")' "$(winpath "$1")" "$2"
+}
+
 wait_port_free() {
   local port=$1 limit=$2 i=0
   while [ "$i" -lt "$((limit * 2))" ]; do
@@ -146,7 +157,7 @@ newer_than() {
   find "$@" -type f -newer "$target" -print -quit 2>/dev/null | grep -q .
 }
 
-say "=== 内核态（acquiring / parked）界面取证 ==============================="
+say "=== 内核态（acquiring / parked）+ 个人空间 界面取证 ==================="
 say "root: $ROOT"
 
 command -v java >/dev/null 2>&1 || die "java 不在 PATH（要 JDK 17+）"
@@ -213,12 +224,41 @@ done
 [ "$STARTED" = "1" ] || die "daemon 起不来（$ART/daemon.out）"
 post "http://127.0.0.1:$PORT/api/settings" '{"userName":"WIN11-0715"}' > /dev/null
 
-printf '%s' '{"name":"可见性"}' > "$ART/group.json"
+# --- 个人空间：daemon 启动时自己建好了，这里只认它并把一个文件放进去
+sleep 1
+STATE=$(get "http://127.0.0.1:$PORT/api/state")
+printf '%s' "$STATE" > "$ART/state.json"
+PERSONAL_GID=$(node_field "$ART/state.json" id)
+PERSONAL_INVITE=$(node_field "$ART/state.json" inviteCode)
+PERSONAL_MEMBERS=$(node_field "$ART/state.json" memberCount)
+PERSONAL_LEN=$(printf '%s' "$PERSONAL_GID" | wc -c | tr -d ' ')
+chk "api.personal_space_created (gid=$PERSONAL_GID)" \
+  "$([ "$PERSONAL_LEN" = "32" ] && echo 1 || echo 0)"
+chk "api.personal_no_invite (inviteCode=$PERSONAL_INVITE)" \
+  "$([ -z "$PERSONAL_INVITE" ] && echo 1 || echo 0)"
+chk "api.personal_single_member (memberCount=$PERSONAL_MEMBERS)" \
+  "$([ "$PERSONAL_MEMBERS" = "1" ] && echo 1 || echo 0)"
+chk "daemon.log personal_space_ready" \
+  "$(grep -q 'event=personal_space_ready' "$ART/daemon.log" 2>/dev/null && echo 1 || echo 0)"
+
+head -c 65536 /dev/urandom > "$ART/travel-photos.zip"
+printf '{"path":"%s"}' "$(w "$ART/travel-photos.zip")" > "$ART/personal-file.json"
+PERSONAL_FILE=$(post_json "http://127.0.0.1:$PORT/api/groups/$PERSONAL_GID/files" "$ART/personal-file.json")
+chk "api.personal_file_added (name=$(sval "$PERSONAL_FILE" name) kernelState=$(sval "$PERSONAL_FILE" kernelState))" \
+  "$([ "$(sval "$PERSONAL_FILE" state)" = "seeding" ] && echo 1 || echo 0)"
+
+# --- 普通群：一个私有文件 + 一条没有来源的公开磁力
+printf '%s' '{"name":"老板的群"}' > "$ART/group.json"
 CREATED=$(post_json "http://127.0.0.1:$PORT/api/groups" "$ART/group.json")
 GID=$(sval "$CREATED" id)
 chk "setup.group_created (gid=$GID)" "$([ -n "$GID" ] && echo 1 || echo 0)"
 
-# 没有来源的公开磁力：随机 infohash、timeoutMs=0（不等元数据）。条目已建好、内核在找源。
+head -c 65536 /dev/urandom > "$ART/podcast.mp4"
+printf '{"path":"%s"}' "$(w "$ART/podcast.mp4")" > "$ART/group-file.json"
+GROUP_FILE=$(post_json "http://127.0.0.1:$PORT/api/groups/$GID/files" "$ART/group-file.json")
+chk "setup.private_file_added (name=$(sval "$GROUP_FILE" name))" \
+  "$([ "$(sval "$GROUP_FILE" state)" = "seeding" ] && echo 1 || echo 0)"
+
 HASH=$(head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n')
 printf '{"magnet":"magnet:?xt=urn:btih:%s&dn=yuanfang","name":"远方 4K.mp4","timeoutMs":0}' "$HASH" \
   > "$ART/magnet.json"
@@ -246,9 +286,11 @@ chk "daemon.log api_file_active kernel_state=acquiring" \
   "$(grep -q 'event=api_file_active .*kernel_state=acquiring' "$ART/daemon.log" 2>/dev/null && echo 1 || echo 0)"
 
 # ------------------------------------------------------------------ 出图
-say "--- 离屏截图三张（每张一个一次性进程）"
-rm -f "$UI/p3-acquiring.png" "$UI/p4-acquiring.png" "$UI/p3-parked.png"
-rm -f "$UI/p3-acquiring.log" "$UI/p4-acquiring.log" "$UI/p3-parked.log"
+say "--- 离屏截图五张（每张一个一次性进程）"
+SHOTS="p2-personal p3-personal p3-acquiring p4-acquiring p3-parked"
+for name in $SHOTS; do
+  rm -f "$UI/$name.png" "$UI/$name.log"
+done
 CAPTURE_RC=0
 if ! powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(winpath "$SCRIPT_DIR/capture-ui.ps1")" \
       -ExePath "$(winpath "$EXE")" -OutDir "$(winpath "$UI")" \
@@ -263,12 +305,22 @@ if [ -z "$SHOT_FAILED" ]; then SHOT_FAILED=1; fi
 chk "shot.capture_exit (rc=$CAPTURE_RC)" "$([ "$CAPTURE_RC" = "0" ] && echo 1 || echo 0)"
 chk "shot.no_failed_page (failed=$SHOT_FAILED)" "$([ "$SHOT_FAILED" = "0" ] && echo 1 || echo 0)"
 shot_bytes() { if [ -f "$1" ]; then stat -c %s "$1"; else echo 0; fi; }
-for name in p3-acquiring p4-acquiring p3-parked; do
+for name in $SHOTS; do
   bytes=$(shot_bytes "$UI/$name.png")
   chk "shot.$name ($bytes 字节)" "$([ "$bytes" -gt 20000 ] && echo 1 || echo 0)"
 done
 
 # 页面文案的硬证据：截图那一刻的 DOM 探针（capture-ui.ps1 原样存成同名 .log）
+chk "shot.p2_personal_pinned" \
+  "$(grep -q '我的分享' "$UI/p2-personal.log" 2>/dev/null && echo 1 || echo 0)"
+chk "shot.p2_lists_normal_group" \
+  "$(grep -q '老板的群' "$UI/p2-personal.log" 2>/dev/null && echo 1 || echo 0)"
+chk "shot.p3_personal_title" \
+  "$(grep -q '我的分享' "$UI/p3-personal.log" 2>/dev/null && echo 1 || echo 0)"
+chk "shot.p3_personal_file" \
+  "$(grep -q 'travel-photos.zip' "$UI/p3-personal.log" 2>/dev/null && echo 1 || echo 0)"
+chk "shot.p3_personal_no_invite" \
+  "$(grep -q '邀请码' "$UI/p3-personal.log" 2>/dev/null && echo 0 || echo 1)"
 chk "shot.p3_acquiring_chip" \
   "$(grep -q '正在寻找来源' "$UI/p3-acquiring.log" 2>/dev/null && echo 1 || echo 0)"
 chk "shot.p3_acquiring_not_sleeping" \
@@ -277,6 +329,8 @@ chk "shot.p3_acquiring_no_zero_size" \
   "$(grep -q '0 B' "$UI/p3-acquiring.log" 2>/dev/null && echo 0 || echo 1)"
 chk "shot.p4_acquiring_chip" \
   "$(grep -q '正在寻找来源' "$UI/p4-acquiring.log" 2>/dev/null && echo 1 || echo 0)"
+chk "shot.p4_acquiring_switch_labels" \
+  "$(grep -q '激活 休眠' "$UI/p4-acquiring.log" 2>/dev/null && echo 1 || echo 0)"
 chk "shot.p4_acquiring_no_disk_line" \
   "$(grep -q '已落盘' "$UI/p4-acquiring.log" 2>/dev/null && echo 0 || echo 1)"
 chk "shot.p3_parked_chip" \
@@ -284,13 +338,13 @@ chk "shot.p3_parked_chip" \
 chk "shot.p3_parked_not_acquiring" \
   "$(grep -q '正在寻找来源' "$UI/p3-parked.log" 2>/dev/null && echo 0 || echo 1)"
 
-# ------------------------------------------------------------------ CDP：chip / aria-checked / 映射表
-say "--- Edge headless + CDP 读回页面（P3 chip、P4 aria-checked、六值映射）"
+# ------------------------------------------------------------------ CDP：chip / aria-checked / 映射表 / 个人空间
+say "--- Edge headless + CDP 读回页面（P3 chip、P4 aria-checked、六值映射、个人空间）"
 PROBE_RC=1
 if [ -x "$EDGE" ] && command -v node >/dev/null 2>&1; then
   "$EDGE" --headless=new --disable-gpu --remote-debugging-port=$CDP_PORT \
     --user-data-dir="$(winpath "$ART/edge")" --no-first-run --no-default-browser-check \
-    "http://127.0.0.1:$PORT/index.html?route=p3" > "$ART/edge.out" 2>&1 &
+    "http://127.0.0.1:$PORT/index.html?route=p3-acquiring" > "$ART/edge.out" 2>&1 &
   EDGE_PID=$!
   CDP_READY=0
   for _ in $(seq 1 60); do
@@ -331,9 +385,9 @@ trap - EXIT
 
 say ""
 say "断言：通过 $OK / 失败 $BAD"
-say "截图：$UI/p3-acquiring.png  $UI/p4-acquiring.png  $UI/p3-parked.png"
+say "截图：$UI/p2-personal.png  $UI/p3-personal.png  $UI/p3-acquiring.png  $UI/p4-acquiring.png  $UI/p3-parked.png"
 say "索引：$UI/kernelstate-index.json"
-say "日志：$ART/daemon.log  $ART/probe.log  $UI/p3-acquiring.log  $UI/p4-acquiring.log  $UI/p3-parked.log"
+say "日志：$ART/daemon.log  $ART/probe.log  （同名 .log 是每张图的 DOM 探针原文）"
 if [ "$BAD" -eq 0 ]; then
   say "PASS"
   exit 0

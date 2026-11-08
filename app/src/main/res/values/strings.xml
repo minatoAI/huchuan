@@ -37,6 +37,8 @@
     <!-- P2 首页 -->
     <string name="p2_search">搜索群组</string>
     <string name="p2_empty">还没有群组</string>
+    <!-- 个人空间（docs/design/personal-space.md）：置顶行图标的无障碍名，界面上不显示文字 -->
+    <string name="p2_personal">个人空间</string>
     <string name="p2_seeding">做种 %1$d</string>
     <string name="p2_team">组队 %1$d 人</string>
     <string name="p2_unread">%1$d 条新消息</string>
@@ -65,6 +67,8 @@
     <string name="p3_team">组队 %1$d 人</string>
     <string name="p3_seeders">做种 %1$d</string>
     <string name="p3_empty">还没有文件</string>
+    <!-- 个人空间空态：下一步是「加一个文件，然后才有分享链接」 -->
+    <string name="p3_empty_personal">还没有文件，加一个再分享链接</string>
     <string name="p3_load_failed">加载失败，重试</string>
     <string name="p3_offline">离线，显示缓存</string>
 
@@ -110,7 +114,9 @@
     <string name="p5_invite_wrong">邀请码不对</string>
     <string name="p5_group_name_default">%1$s的群组</string>
     <string name="p5_create">创建</string>
-    <string name="p5_join_failed">加入失败</string>
+    <!-- 加入失败的两种口径：对方是个人空间（明确拒绝）/ 其余一律笼统一句话 -->
+    <string name="p5_join_failed">加入失败，检查邀请码或网络</string>
+    <string name="p5_join_personal">对方是个人空间，不能加入</string>
     <string name="p5_offline">离线，无法加入</string>
 
     <!-- P6 成员 -->

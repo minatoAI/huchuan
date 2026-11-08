@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    P2 个人空间的图标：托盘 + 上行箭头（「从这里分享出去」）。
+
+    自绘 24dp 线性图标，不引 material-icons（app 的依赖里没有它）：只画两笔，
+    stroke 走圆头圆角，颜色由 Compose 的 Icon(tint=…) 统一染色，深浅色主题共用一份。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- 托盘：底部开口的方括号 -->
+    <path
+        android:pathData="M5,14 L5,18.5 C5,19.33 5.67,20 6.5,20 L17.5,20 C18.33,20 19,19.33 19,18.5 L19,14"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+
+    <!-- 上行箭头 -->
+    <path
+        android:pathData="M12,16 L12,4 M7.5,8.5 L12,4 L16.5,8.5"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

@@ -93,6 +93,9 @@ private class DebugNetworkProbe(
     }
 }
 
+/** 内核失败码：对方是个人空间，不能加入（docs/core.md §3.13）。 */
+private const val JOIN_ERR_PERSONAL = "E_JOIN_PERSONAL"
+
 /** 页面（spec §2）。P7 设置是 P2 上的抽屉，不占独立目的地。 */
 sealed interface Destination {
     data class Network(val fromSettings: Boolean) : Destination
@@ -158,6 +161,29 @@ class HuchuanState(
         revision
         return groups.group(groupId)
     }
+
+    /**
+     * 个人空间的 gid（docs/design/personal-space.md）；内核没起来或静态壳时是 null。
+     *
+     * 只读这一个值就能回答「这个群是不是个人空间」：P2 置顶、P3 去掉「成员」入口与换空态文案
+     * 都靠它，界面不再按群名猜。
+     */
+    val personalGroupId: String?
+        get() {
+            @Suppress("UNUSED_EXPRESSION")
+            revision
+            return runtime?.kernel?.personalSpace()?.groupId
+        }
+
+    fun isPersonal(groupId: String): Boolean = groupId == personalGroupId
+
+    /** 最近一次加入失败的原因（内核失败码 / 一句话）；成功或还没试过时是空串。 */
+    val lastJoinError: String
+        get() = runtime?.kernel?.lastJoinError().orEmpty()
+
+    /** 最近一次加入是不是被对方以「个人空间不可加入」明确拒绝。 */
+    val lastJoinWasPersonal: Boolean
+        get() = lastJoinError == JOIN_ERR_PERSONAL
 
     fun push(destination: Destination) {
         stack.add(destination)

@@ -236,7 +236,7 @@ const RouteAlias = {
   // 才是深链默认落点（见 defaultGroup）—— 这几条别名把落点钉死，取证图不会被空列表顶掉。
   'p3-personal': { page: 'p3', group: 'personal' },
   'p3-acquiring': { page: 'p3', group: 'public' },
-  'p4-acquiring': { page: 'p4', group: 'public' },
+  'p4-acquiring': { page: 'p4', public: true, group: 'public' },
   // 取证用：落 P8/P9 前先确保 daemon 里有一条有效分享（没有就用本群第一个私有文件建一条）。
   // 正常导航不带这两个别名 —— 真实入口是 P4「…」与 P7「分享管理」。
   'p8-share': { page: 'p8', ensureShare: true },
@@ -948,10 +948,10 @@ function viewFile() {
     ? COPY.p4_seeders(file.seeders)
     : COPY.p4_waiting;
 
-  // 「已落盘」：内核写到磁盘的字节（diskBytes）。只在 P4、只在这个文件真在参与（下载 / 做种 /
-  // 找源）且盘上真有字节时出现 —— 休眠时说「已落盘」是噪音，acquiring 时它是 0（还没元数据）。
+  // 「已落盘」：内核写到磁盘的字节（diskBytes）。只在 P4、只在**真在下载**时出现 ——
+  // 做种时说「已落盘 X」与上面的尺寸 / 100% 是同一件事，休眠时说它是过时的数（都不是噪音就是重复）。
   // 完成度看百分比，看「下了多少 / 在不在动」看这一行（docs/daemon-api.md §3.3）。
-  const diskLine = fileActive(file) && file.diskBytes > 0
+  const diskLine = file.kernelState === KernelState.DOWNLOADING && file.diskBytes > 0
     ? '<p class="line" id="disk-line">' + COPY.p4_disked(formatSize(file.diskBytes)) + '</p>'
     : '';
   // 「公开」固定在状态 chip 左侧；元数据没到手时不写尺寸（不是 0 B）。
@@ -1065,6 +1065,16 @@ function viewNewGroup() {
     '</div>';
 }
 
+/**
+ * P5 加入失败的一句话（docs/daemon-api.md §3.4）。
+ *
+ * 两种失败是两句话：对端明确说「我是个人空间」（E_JOIN_PERSONAL）时不能含糊成「邀请码不对」——
+ * 那个码根本不存在，用户再输多少次都没用。其余（没找到 / 连不上 / 码不对 / 超时）仍是后者。
+ */
+function joinFailureLabel(code) {
+  return code === 'E_JOIN_PERSONAL' ? COPY.p5_join_personal : COPY.p5_invite_wrong;
+}
+
 function joinGroup() {
   const input = document.getElementById('invite-code');
   const note = document.getElementById('invite-note');
@@ -1089,12 +1099,8 @@ function joinGroup() {
     Nav.reset('p2');
     Nav.go('p3', joined.id);
   }).catch(function (error) {
-    // 两种失败两种说法（docs/daemon-api.md §3.4）：对端明确说「我是个人空间」时不能含糊成
-    // 「邀请码不对」—— 那个码根本不存在，用户再输多少次都没用。
     if (note) {
-      note.textContent = error && error.code === 'E_JOIN_PERSONAL'
-        ? COPY.p5_join_personal
-        : COPY.p5_invite_wrong;
+      note.textContent = joinFailureLabel(error && error.code);
       note.hidden = false;
     }
     if (button) {

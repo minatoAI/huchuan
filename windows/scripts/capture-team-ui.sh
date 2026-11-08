@@ -111,6 +111,12 @@ ival() { printf '%s' "$1" | grep -o "\"$2\":[0-9][0-9]*" | head -1 | sed 's/^[^:
 bval() { printf '%s' "$1" | grep -o "\"$2\":\(true\|false\)" | head -1 | sed 's/^[^:]*://'; }
 sval() { printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed 's/^[^:]*:"//; s/"$//'; }
 
+# /api/state 的第一个群现在是个人空间（isPersonal，docs/design/personal-space.md），它的 teamSize 恒 0 ——
+# 「第一个 teamSize」抓到的会是它。要哪个群就按 gid 取，别按字段出现的先后猜。
+group_ival() { # group_ival <json 文件> <gid> <字段>
+  node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const g=(j.data.groups||[]).filter(function(x){return x.id===process.argv[2];})[0];process.stdout.write(g?String(g[process.argv[3]]):"")' "$(winpath "$1")" "$2" "$3"
+}
+
 wait_health() { # wait_health <端口> <秒>
   local port=$1 limit=$2 i=0 body=""
   while [ "$i" -lt "$((limit * 2))" ]; do
@@ -252,8 +258,9 @@ chk "team.c1_teammates_ge_1 (teammates=$TEAM_MAX)" "$([ "$TEAM_MAX" -ge 1 ] && e
 [ "$TEAM_MAX" -ge 1 ] || die "C1 一直没看到队友：查 $ART/c1.log 的 peer_announce / bt_connect_peer 两行"
 
 STATE_C1=$(get "http://127.0.0.1:$PORT_C1/api/state")
+printf '%s' "$STATE_C1" > "$ART/c1-state.json"
 C1_STATE=$(sval "$STATE_C1" state)
-C1_TEAM_SIZE=$(ival "$STATE_C1" teamSize)
+C1_TEAM_SIZE=$(group_ival "$ART/c1-state.json" "$GID" teamSize)
 chk "team.c1_downloading (state=$C1_STATE)" "$([ "$C1_STATE" = "downloading" ] && echo 1 || echo 0)"
 chk "team.c1_team_size_2 (teamSize=$C1_TEAM_SIZE)" "$([ "$C1_TEAM_SIZE" = "2" ] && echo 1 || echo 0)"
 

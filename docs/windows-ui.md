@@ -64,7 +64,8 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 
 | 参数 | 取值 | 作用 |
 | --- | --- | --- |
-| `route` | `p0`…`p9`；取证别名 `p3-magnet` / `p4-public` / `p8-share` / `p9-list` | 直接落到某一页，跳过开屏 |
+| `route` | `p0`…`p9`；取证别名 `p3-magnet` / `p4-public` / `p3-personal` / `p3-acquiring` / `p4-acquiring` / `p3-parked` / `p8-share` / `p9-list` | 直接落到某一页，跳过开屏 |
+| `fixture` | `parked` | 页面夹具：把文件列表换成一条 `kernelState=parked` 的条目（只给 `p3-parked` 截图用，见 §6.5） |
 | `theme` | `light` / `dark` | 强制主题（默认跟随系统） |
 | `network` | `pass` / `limited` / `fail` | 强制自检结论；不带 = 用真实自检（daemon 在不在） |
 | `hold` | `boot` / `checking` / `result` | 把 P0 停在某个阶段，供截图 |
@@ -72,10 +73,14 @@ windows/build/Huchuan.exe                       # 双击或命令行都行
 | `api` | `http://host:port` | 浏览器里指定 daemon 地址（跨源场景 / 换端口调试） |
 | `manual` | `host:port`（逗号分隔） | 加入群时的手动候选，填对方的消息层端口 |
 
-`p3-magnet` / `p4-public` / `p8-share` / `p9-list` 只给截图取证用，正常导航不带（见 §6.3 / §6.4）：
-前两者分别落到 P3 的磁力输入、P4 的第一条公开条目；`p8-share` / `p9-list` 会先确保 daemon 里有
-一条有效分享（没有就用本群第一个私有文件建一条 7 天的），再落到 P8 / P9。页面名仍是
-`p3` / `p4` / `p8` / `p9`，所以截图任务表的 `page` / `--shot-page` 不用改。
+这些别名只给截图取证用，正常导航不带（见 §6.3 / §6.4 / §6.5）：`p3-magnet` 落到 P3 的磁力输入，
+`p4-public` 落到 P4 的第一条公开条目；`p8-share` / `p9-list` 会先确保 daemon 里有一条有效分享
+（没有就用第一个有文件的群的第一个私有文件建一条 7 天的），再落到 P8 / P9。
+
+`p3-personal` / `p3-acquiring` / `p4-acquiring` / `p3-parked` 钉的是**落哪个群**：个人空间
+（`isPersonal`）/ 有公开条目的那个群。深链默认落「有文件的第一个群」（见 §3.5），个人空间常常是空的，
+不钉死就会截出一张空列表。页面名仍是 `p3` / `p4` / `p8` / `p9`，所以截图任务表的
+`page` / `--shot-page` 不用改。
 
 壳自己的开关（不属于页面参数，正常双击一个都不带）：`--daemon-jar=`、`--daemon-port=`、
 `--daemon-data-dir=`（给测试用独立数据目录，别动 `%LOCALAPPDATA%\Huchuan\daemon`）。
@@ -190,13 +195,17 @@ P3 页面本身没有输入框：`Enter` 打开「添加文件」弹层；弹层
 这几处都容易「显示一个漂亮的假数」，所以来源写死在这里：
 
 `data.js` 的 `toFile` 透传公开条目的 `scope` / `magnet` / `sizeKnown`（`scope` 缺字段按
-`private`，`sizeKnown` 缺字段按 `true`，与 daemon-api 的旧对端口径一致）。页面只看这三个字段，
+`private`，`sizeKnown` 缺字段按 `true`，与 daemon-api 的旧对端口径一致），以及内核态的
+`kernelState` / `diskBytes`（缺字段按空串 / 0 —— 老 daemon 照样能跑）。页面只看这些字段，
 不按名字或状态猜。
 
 | 界面上的 | 数据来源 | 判定 |
 | --- | --- | --- |
 | P3 行内 chip「公开」 | `file.scope` | 仅 `public` 出现，固定在状态 chip 左侧；私有条目没有「私有」补位 chip |
-| P3/P4 状态「等待来源」 | `file.scope` + `file.sizeKnown` / `sizeBytes` | `fileAwaitingSource()`：公开且尺寸未知；尺寸整段不显示（不是 0 B） |
+| P3/P4 状态 chip | `file.kernelState`（六值） | 见下面的映射表；`kernelState` 缺字段 / 认不出的写法才退回 `state` 三值的老口径 |
+| P3/P4 状态「等待来源」 | `kernelState === 'waiting_metadata'`（老 daemon 退回 `scope` + `sizeKnown`） | `fileAwaitingSource()` 也参与：公开且尺寸未知；尺寸整段不显示（不是 0 B） |
+| P4 激活开关 | `fileActive()` | 在传（`downloading` / `seeding`）**或 `acquiring`** 都算「开」；`parked` / `waiting_metadata` / `absent` 是「关」 |
+| P4「已落盘」 | `file.diskBytes` | 只在 `kernelState=downloading` 且 `diskBytes > 0` 时出现一行；做种（与尺寸/100% 重复）与休眠（过时的数）都不出现 |
 | P4 磁力摘要 | `file.magnet` | 公开且磁力非空；只显示 `btih:` 前 16 位，点一下复制整条 |
 | P4「移除」 | 仅在公开条目出现 | `POST /api/groups/{gid}/files/{fid}/remove`：只藏本机列表，不广播、不删盘 |
 | P3 行内 chip「组队 n 人」 | `file.teammates`（daemon 直读 `kernel.teammates`） | `data.js` 的 `fileInTeam`：队友 ≥ 1 且进度 < 100；n = 队友数 + 1（含本机） |
@@ -214,6 +223,31 @@ P3 页面本身没有输入框：`Enter` 打开「添加文件」弹层；弹层
 跨网发现同理：开关写 `POST /api/settings/tracker`，页面不自己记状态。关掉时 P7 的「网络状态」说
 「仅局域网」；如果设置与内核现状差一次重启，开关下面多一行「重启后生效」（daemon 的
 `trackerRestartRequired`），不把「已点的值」冒充成「已经生效」。
+
+#### 状态 chip：`kernelState` 六值映射
+
+`state` 只有三个值，「导入后放着等来源」与「用户点了激活、内核正在找源」在它里面都是 `sleeping`；
+要说出两句不同的话只能看 `kernelState`（`docs/daemon-api.md` §3.3、`docs/core.md` §3.12）。
+判定在 `app.js` 的 `fileStateLabel()` / `fileActive()` 两个纯函数里，P3 的行 chip 与 P4 的
+chip、开关共用它们：
+
+| `kernelState` | P3/P4 状态 chip | 激活开关 | 什么时候出现 |
+| --- | --- | --- | --- |
+| `absent` | 休眠（公开条目且尺寸未知时仍说「等待来源」） | 关 | 不在会话里：休眠、或元数据到手后内核把导入任务摘掉 |
+| `parked` | 休眠 | 关 | 会话里有 torrent 但被 libtorrent 挂着（`paused`）；正常流程走不到，见 §6.5 |
+| `waiting_metadata` | 等待来源 | 关 | 导入后没激活、内核在等来源（`state` 也是 `sleeping`） |
+| `acquiring` | 正在寻找来源 | **开** | 用户点了激活、元数据还没到手（`state` 仍是 `sleeping`、`role` 仍是 `none`、字节 0） |
+| `downloading` | 下载中 | 开 | 真在传；n% 在同一行的进度条旁（`progressPercent`） |
+| `seeding` | 做种中 | 开 | 数据完整（或已进做种集合） |
+
+两条口径上的取舍：
+
+- **n% 不进 chip**。chip 只写「下载中」，百分比在行内进度条旁 / P4 的速率行里（与 Android 的
+  `fileStateLabel()` 一致：`p3_state_downloading` 也是「下载中」，`42%` 是另一个文本）。
+  spec §3 的「下载中 42%」说的是整块状态区，不是 chip 的字面。
+- **`acquiring` 期间开关不弹回休眠**。内核读数仍是「没在传」（`state=sleeping`、字节 0），
+  但用户刚拨过开关，弹回去就是「点了激活没反应」（`docs/core.md` §3.12）。所以
+  `fileActive()` 把 `acquiring` 也算「开」，P4 的 `aria-checked` 与 P3 chip 的高亮都读它。
 
 ### 3.4 链接分享（W1）：P4 → P8 → P9
 
@@ -257,6 +291,24 @@ P4 的「…」里只有「分享链接」一项：单文件限速在 Windows �
 - **没有 TURN**：对称 NAT / CGNAT 下打洞失败会如实显示「无法直连」。
 - 分享期间 daemon 要在线；进程退出链接变 offline。有效期上限 7 天，过期不续期。
 
+### 3.5 个人空间（我的分享）
+
+`docs/design/personal-space.md` 已经落到 Windows 页面：`/api/state` 的第一个群是
+`isPersonal=true` 的个人空间（32 字符 gid、`inviteCode` 是空串、`memberCount` 恒 1）。
+页面只认 `isPersonal` 这一位，不看名字、不看成员数（`docs/daemon-api.md` §3.2）。
+
+| 界面上的 | 数据来源 | 判定 |
+| --- | --- | --- |
+| P2 置顶的「我的分享」 | `group.isPersonal` | `orderedGroups()` 把它排到最前；行上多一枚上传图标 + 左边一道品牌色竖线（`.row.is-personal`），与普通群分开 |
+| P2 不显示成员数 | —— | P2 的行本来只写「做种 n（· 组队 n）」，个人空间同样不写成员数 |
+| P3 进个人空间 | 深链 `?route=p3-personal`（取证）；正常从 P2 点进去 | 标题就是群名「我的分享」；添加文件 / 磁力导入 / 分享链接与普通群同一套代码 |
+| P6 邀请码 | `group.inviteCode` | 个人空间不生成邀请码（daemon 给空串），P6 的邀请码整块不出现，不是显示一个空框 |
+| P5 加入失败 | `E_JOIN_PERSONAL` / `E_JOIN_FAILED` | 对端明确说「我是个人空间」→「对方是个人空间，不能被加入」；其余仍是「邀请码不对」 |
+| 深链默认落点 | `defaultGroup()` | **有文件的第一个群**；一个都没有才退回第一个群 —— 个人空间刚建时是空的，直接落上去就是一张空列表 |
+
+正常导航不受影响：P2 点哪个群就进哪个群。深链 / 取证默认跳过空的个人空间，需要它时用
+`p3-personal` 钉死（§1.3）。分享链接的入口仍在 P4「…」，个人空间的文件照样能建链接。
+
 ## 4. 内嵌：资源表怎么来的（现在只是兜底）
 
 daemon 起不来时壳回退到 exe 内嵌的那份页面，所以内嵌这条路仍然保留。
@@ -286,6 +338,7 @@ bash scripts/package-windows.sh              # 绿色版：jlink runtime + exe +
 bash windows/scripts/capture-team-ui.sh      # 组队通告 + 限速的三张取证图（三个 daemon，见 §6.1）
 bash windows/scripts/capture-tracker-ui.sh   # 跨网发现关闭态的一张取证图（一个 daemon，见 §6.2）
 bash windows/scripts/capture-share-ui.sh     # P8 / P9 两张（会真登记一条 7 天链接，见 §6.4）
+bash windows/scripts/capture-kernelstate-ui.sh  # 内核态 acquiring / parked + 个人空间五张（见 §6.5）
 ```
 
 四道关，任一不过脚本退出非 0：
@@ -362,8 +415,9 @@ P0 开屏、P1 用户名这种大半是底色的页面抽样只有 29–39 种�
 ## 6. 截图清单
 
 构建门禁的 `artifacts/windows/ui/` 共 16 张，每张一个独立进程；同一轮构建还会补 3 张公开种子图
-（§6.3，索引单独一份 `public-index.json`）。另有 §6.1 / §6.2 / §6.4 三个脚本产的 6 张也落在同一目录
-（P8 / P9 因为要真登记一条链接，不进构建门禁）。涉及数据的断言写的是取证 daemon 那份料的字面：
+（§6.3，索引单独一份 `public-index.json`）。另有 §6.1 / §6.2 / §6.4 / §6.5 四个脚本产的 11 张也落在
+同一目录（P8 / P9 要真登记一条链接，内核态 / 个人空间那五张要另一套装置，都不进构建门禁）。
+涉及数据的断言写的是取证 daemon 那份料的字面：
 
 | 文件 | 页 | 状态 | 断言文案 |
 | --- | --- | --- | --- |
@@ -400,7 +454,7 @@ C1 按成员拨号拨通 C2，`teammates` 从 0 变 1，界面上的 n = 队友�
 | 文件 | 页 | 状态 | 断言文案 |
 | --- | --- | --- | --- |
 | `p3-team.png` | P3 | 文件正在下、队友 1 人 | 组队 2 人 |
-| `p4-team.png` | P4 | 「正在组队 · 2 人」+ 单文件限速 512 KB/s 已生效 | 正在组队 · 2 人 |
+| `p4-team.png` | P4 | 「正在组队 · 2 人」+ 单文件限速 512 KB/s 已生效 + 「已落盘 n KB」（下载中才有，§3.3） | 正在组队 · 2 人 |
 | `p7-limits.png` | P7 | 全局限速 上行 512 / 下行 128，含内核读回 | 上行 512 KB/s |
 
 断言分两层：`capture-ui.ps1` 那套（页名 + 文案 + 像素）照旧；脚本另外断言 API 侧的事实 ——
@@ -488,13 +542,49 @@ bash windows/scripts/capture-share-ui.sh
 **网络依赖**：pages.dev 不可达（或本机没有 WebRTC 原生库）时这个脚本会明确失败，16 张门禁截图
 不受影响（门禁本身不碰外网）。这条链接只在脚本运行的这一两分钟里有效，跑完即撤销。
 
+### 6.5 内核态两态 + 个人空间两态（另一个脚本）
+
+`bash windows/scripts/capture-kernelstate-ui.sh`
+
+**先跑门禁再跑它**：`build-windows.sh` 出图前会 `rm -rf artifacts/windows/ui`（避免拿上次的图冒充本次），
+§6.1 / §6.2 / §6.4 的脚本同理 —— 它们都落在同一个目录，跑完门禁再跑。
+
+装置是一个专用 daemon（127.0.0.1:47280，`--device-name=KernelState-Evidence`）：个人空间里放一个
+64 KiB 文件；普通群「老板的群」里放一个 64 KiB 文件 + 一条**没有来源**的公开磁力（随机 infohash +
+`timeoutMs=0`），再对它 `POST …/active {active:true}` —— 回包 `kernelState=acquiring`、
+`state=sleeping`、`role=none`、`downloadedBytes=diskBytes=0`，正好是「点了激活、元数据还没到手」那一段。
+
+| 文件 | 页 | 状态 | 断言文案 |
+| --- | --- | --- | --- |
+| `p2-personal.png` | P2 | 「我的分享」固定置顶（图标 + 品牌色竖线）+ 普通群 | 我的分享 + 老板的群 |
+| `p3-personal.png` | P3 | 个人空间：标题「我的分享」、文件行、成员（1 人） | 我的分享 + travel-photos.zip |
+| `p3-acquiring.png` | P3 | 公开行「公开 + 正在寻找来源」，不写 0 B | 正在寻找来源 |
+| `p4-acquiring.png` | P4 | chip「正在寻找来源」+ 激活开关保持「已激活」，没有「已落盘」 | 正在寻找来源 + 激活 休眠 |
+| `p3-parked.png` | P3 | `kernelState=parked` 的行仍说「休眠」 | 休眠 |
+
+落点用取证别名钉死（`p3-personal` / `p3-acquiring` / `p4-acquiring`，见 §1.3）：深链默认落
+「有文件的第一个群」，而个人空间刚建时是空的。
+
+`parked` 那一态**没有任何 API 造得出来**：磁力导入元数据一到就摘任务（`absent`），点激活是
+`acquiring` / `downloading`，私有文件挂进会话就直接做种。core 的 `GroupRuntime.kernelState` 读得到它
+（daemon 也照实投成 `paused=true`），但没有哪一步能让它停在这。所以这一张走取证别名 `p3-parked` 的
+页面夹具（`app.js` 的 `fixtureGroup()`）：只在 `?route=p3-parked` / `?fixture=parked` 时把文件列表换成
+一条与 daemon 同口径的 `parked` 条目，正常启动永远不生效。
+
+断言分两层：`capture-ui.ps1` 的页名 + 文案 + 像素照旧（五张都 `mode=offscreen`）；脚本另外跑一遍
+Edge headless + CDP（`windows/scripts/kernel-state-probe.mjs`）读回页面侧的事实 —— P3 chip 的文案与
+`is-on`、P4 开关的 `aria-checked="true"`、六个 `kernelState` 值的映射表（`fileStateLabel()` /
+`fileActive()` 逐值对一遍）、P2 第一行是不是个人空间、P3 个人空间的标题与文件行。索引是
+`kernelstate-index.json`，与门禁那 16 张互不影响。
+
 ## 7. 页面与文案
 
 文案表在 `windows/resources/web/js/app.js` 顶部（`COPY`），逐条对应
 `docs/design/product-spec.md` §3 各页「文案」行。改文案的顺序：先改 spec，再改 `COPY`，
 再跑一次 `bash scripts/build-windows.sh` 让截图断言跟着更新（16 张门禁的断言文案在
 `ui-capture-jobs.json`；公开种子三张的任务表由 `build-windows.sh` 现场生成，见 §6.3；
-P8 / P9 两张在 `ui-capture-share.json`，见 §6.4）。
+P8 / P9 两张在 `ui-capture-share.json`，见 §6.4；内核态 / 个人空间五张在
+`ui-capture-kernelstate.json`，见 §6.5）。
 
 P7 的「跨网发现」「仅局域网」「重启后生效」是本轮新增的三条 Windows 文案，spec §3 P7 的元素表
 与文案行还没列进去（`docs/design/` 不归本任务改）；合并时由设计 agent 补进 spec，以免两处各说一套。
@@ -527,6 +617,8 @@ P8 没有做 Android 的那一次性 toast（「对方可见你的网络地址�
 | 15 | P9 撤销 | AlertDialog 一次确认 | 同款 scrim + modal 一次确认；确认后行立刻消失，服务端没同步时本机照样算撤销（`remoteRevoked=false`） |
 | 16 | P8 / P9 刷新 | 控制器的 StateFlow（信令回调里推进） | `GET /api/shares` 每 2 s 轮询（分享不在 `/api/state`），离开两页就停；状态行的「等待 → 传输中 → 已结束」都靠它 |
 | 17 | P4「…」 | 菜单：公开 / 取消公开 + 分享链接 | 菜单只有「分享链接」：单文件限速在页内（第 11 条），公开 / 取消公开 Windows 未实现（§9） |
+| 18 | 个人空间 | 本轮未接（`isPersonal` 还没进 UI） | P2 置顶「我的分享」+ 图标 + 品牌色竖线、P6 隐藏邀请码、P5 区分 `E_JOIN_PERSONAL`（§3.5） |
+| 19 | 状态 chip | 三种状态 + `searchingSource`（`ACQUIRING` →「正在寻找来源」） | 直接读 `kernelState` 六值（§3.3 的映射表）；`parked` 与 `waiting_metadata` 也能分开说 |
 
 ## 9. 当前限制
 
@@ -555,22 +647,29 @@ P8 没有做 Android 的那一次性 toast（「对方可见你的网络地址�
    （「对方可见你的网络地址」，需要的话是一次 toast + localStorage 标记，不影响其它状态）；
    P4「…」里没有「公开 / 取消公开」两项（公开条目目前从磁力导入，见 §8 第 17 条）。
 
+10. **acquiring 期间点「休眠」不会真停下**（daemon 侧的口径，Windows 页面不改内核）：P4 的开关在
+    `acquiring` 时保持「已激活」（§3.3），点它等于再激活一次 —— 因为 `POST …/files/{fid}/active
+    {active:false}` 只对 `role != none` 的文件调 `stopFile`，而 acquiring 的 `role` 是 `none`。
+    元数据一到转 `downloading`，那时才停得下来。要改的是 daemon 的 stop 路径，不在本页范围。
+
 ## 10. 体积
 
 | 项 | 字节 |
 | --- | --- |
 | `index.html` | 984 |
 | `css/tokens.css` | 2,573 |
-| `css/app.css` | 21,674 |
-| `js/data.js` | 28,800 |
+| `css/app.css` | 22,061 |
+| `js/data.js` | 30,625 |
 | `js/qrcode.js` | 15,916 |
-| `js/app.js` | 73,416 |
-| **页面资源合计** | **143,363**（140.0 KiB，预算 200 KB） |
-| `Huchuan.exe` | 446,976（WebView2 运行时是系统组件，不在 exe 内） |
-| `daemon.jar` | 18,058,923（含 core、libtorrent4j 的 x86_64 dll、WebRTC 原生包、jmdns、上面这份页面） |
+| `js/app.js` | 83,146 |
+| **页面资源合计** | **155,305**（151.7 KiB，预算 200 KB） |
+| `Huchuan.exe` | 458,752（WebView2 运行时是系统组件，不在 exe 内） |
+| `daemon.jar` | 18,091,562（含 core、libtorrent4j 的 x86_64 dll、WebRTC 原生包、jmdns、上面这份页面） |
 | `runtime/`（jlink） | 28,766,257（27.43 MiB，模块 `java.base,java.logging,java.net.http,jdk.crypto.ec`） |
-| **`dist/Huchuan` 合计** | **47,272,156**（45.08 MiB，按当前 exe + jar + runtime 相加；`dist/` 里还是 11-06 打的那份，本轮没重打） |
+| **`dist/Huchuan` 合计** | **47,316,511**（45.12 MiB，按当前 exe + jar + runtime 相加；`dist/` 里还是 11-06 打的那份，本轮没重打） |
 
 2026-11-07 读数：链接分享把 webrtc-java 1.0.0 的原生包（DLL 22.8 MB）打进 jar，daemon.jar 从 8.1 MiB
 涨到 17.22 MiB；runtime 因为 `java.net.http` 多 0.55 MiB。页面这一轮为 P8 / P9 增加了 `qrcode.js`
 （15.9 KB）与分享页样式、数据接口，页面资源从 96.7 KiB 涨到 140.0 KiB。
+2026-11-08 读数：状态 chip 改读 `kernelState`（§3.3）+ 个人空间置顶与图标（§3.5），页面资源
+从 140.0 KiB 涨到 151.7 KiB（`app.js` +9.7 KB、`data.js` +1.8 KB、`app.css` +0.4 KB）。

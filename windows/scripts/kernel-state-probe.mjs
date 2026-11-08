@@ -1,13 +1,14 @@
-// 内核态（kernelState）在 Windows 页面上的读回：Edge headless + CDP 驱动真实页面（证据用）。
+// 内核态（kernelState）与个人空间（isPersonal）在 Windows 页面上的读回：Edge headless + CDP（证据用）。
 //
-// 由 windows/scripts/capture-kernelstate-ui.sh 调用（那个脚本负责起 daemon、把条目点成 acquiring、
-// 再起 Edge headless）。这里只断言页面侧的事实：
+// 由 windows/scripts/capture-kernelstate-ui.sh 调用（它负责起 daemon、把条目点成 acquiring、再起 Edge）。
+// 这里只断言页面侧的事实：
 //   1. acquiring 态：P3 行状态 chip 说「正在寻找来源」且是 is-on，P4 的激活开关保持「已激活」，
 //      「已落盘」那一行不出现（元数据都没到手，盘上一字节没有）；
-//   2. 六值映射表：fileStateLabel() / fileActive() 逐值对一遍（纯函数，页面用到的就是这两个）；
-//   3. parked 态：取证别名 p3-parked 的夹具下 chip 说「休眠」（与 Android 同口径）。
+//   2. 六值映射表：fileStateLabel() / fileActive() 逐值对一遍（页面用到的就是这两个纯函数）；
+//   3. parked 态：取证别名 p3-parked 的夹具下 chip 说「休眠」，开关是关的；
+//   4. 个人空间：P2 第一行就是「我的分享」且带 is-personal，P3 进得去、成员入口仍是 1 人。
 //
-// 退出码即结论：0 = 全过，非 0 = 某条断言红了（CDP 的断言消息打在 stdout 里）。
+// 退出码即结论：0 = 全过，非 0 = 某条断言红了（断言消息打在 stdout 里）。
 import { setTimeout as delay } from 'node:timers/promises';
 
 const PORT = Number(process.env.CDP_PORT || 9336);
@@ -63,14 +64,11 @@ const CHIP_JS =
 await send('Runtime.enable');
 
 // ---------------------------------------------------------------- 1. acquiring 态
-await waitFor("document.body.dataset.page === 'p3' && document.querySelectorAll('.trow').length > 0", 'P3 ready', 20000);
+await waitFor("document.body.dataset.page === 'p3' && document.querySelectorAll('.trow').length > 0", 'P3 acquiring ready', 25000);
 const rows = await evalJs("Array.from(document.querySelectorAll('.trow')).map(function (row) { return row.innerText; })");
 console.log('p3 rows=' + JSON.stringify(rows));
-assert(rows.length === 1, 'P3 should hold exactly the one public magnet entry, got ' + rows.length);
-assert(rows[0].indexOf('公开') >= 0, 'P3 row keeps the 公开 chip');
-assert(rows[0].indexOf('正在寻找来源') >= 0, 'P3 row says 正在寻找来源 while acquiring');
-assert(rows[0].indexOf('休眠') < 0, 'P3 row does not say 休眠 while acquiring');
-assert(!/\b0 B\b/.test(rows[0]), 'P3 row does not show a 0 B size before metadata');
+assert(rows.some((row) => row.indexOf('公开') >= 0 && row.indexOf('正在寻找来源') >= 0), 'P3 public row says 公开 + 正在寻找来源');
+assert(!rows.some((row) => row.indexOf('正在寻找来源') >= 0 && /\b0 B\b/.test(row)), 'acquiring row does not show a 0 B size');
 
 const chips = await evalJs(CHIP_JS);
 console.log('p3 chips=' + JSON.stringify(chips));
@@ -90,7 +88,6 @@ const mapping = await evalJs(`(function () {
       var file = Object.assign({}, base, { kernelState: kernelState });
       return { kernelState: kernelState, label: fileStateLabel(file), active: fileActive(file) };
     }),
-    // 老 daemon：文件对象里没有 kernelState，只能按 state + 尺寸未知兜底
     legacySeeding: fileStateLabel(Object.assign({}, base, { state: 'seeding' })),
     legacySleeping: fileStateLabel(Object.assign({}, base, { kernelState: '' }))
   };
@@ -113,8 +110,14 @@ for (const row of mapping.table) {
 assert(mapping.legacySeeding === '做种中', 'old daemon without kernelState still says 做种中');
 assert(mapping.legacySleeping === '休眠', 'old daemon without kernelState falls back to 休眠');
 
+// P5 加入失败的两句话：对端明确说「我是个人空间」与普通失败不能混成一句。
+const joinCopy = await evalJs("({ personal: joinFailureLabel('E_JOIN_PERSONAL'), normal: joinFailureLabel('E_JOIN_FAILED') })");
+console.log('join copy=' + JSON.stringify(joinCopy));
+assert(joinCopy.personal === '对方是个人空间，不能被加入', 'E_JOIN_PERSONAL says 对方是个人空间，不能被加入');
+assert(joinCopy.normal === '邀请码不对', 'E_JOIN_FAILED keeps 邀请码不对');
+
 // ---------------------------------------------------------------- 3. P4：开关不弹回休眠
-await evalJs("(function () { var g = Store.groups()[0]; State.fileId = g.files[0].id; Nav.go('p4', g.files[0].id); })()");
+await evalJs("(function () { var g = Store.groups().filter(function (x) { return x.files.some(function (f) { return f.scope === 'public'; }); })[0]; State.groupId = g.id; State.fileId = g.files.filter(function (f) { return f.scope === 'public'; })[0].id; Nav.go('p4', State.fileId); })()");
 await waitFor("document.body.dataset.page === 'p4' && !!document.querySelector('[data-act=\"toggle-active\"]')", 'P4 ready');
 const p4 = await evalJs(
   "(function () {" +
@@ -129,16 +132,48 @@ assert(p4.text.indexOf('已落盘') < 0, 'P4 does not show 已落盘 when diskBy
 
 // ---------------------------------------------------------------- 4. parked 态（取证别名）
 await evalJs("location.href = '/index.html?route=p3-parked'");
-await waitFor("document.body.dataset.page === 'p3' && document.querySelectorAll('.trow').length > 0", 'P3 parked ready', 20000);
+await waitFor("document.body.dataset.page === 'p3' && document.querySelectorAll('.trow').length > 0", 'P3 parked ready', 25000);
 const parkedRows = await evalJs("Array.from(document.querySelectorAll('.trow')).map(function (row) { return row.innerText; })");
 const parkedChips = await evalJs(CHIP_JS);
 console.log('parked rows=' + JSON.stringify(parkedRows) + ' chips=' + JSON.stringify(parkedChips));
 assert(parkedRows.some((row) => row.indexOf('休眠') >= 0), 'parked row says 休眠');
 assert(parkedChips.some((chip) => chip.text === '休眠' && !chip.on), '休眠 chip is not highlighted');
 assert(!parkedRows.some((row) => row.indexOf('正在寻找来源') >= 0), 'parked row never says 正在寻找来源');
-const parkedActive = await evalJs("(function () { var g = Store.groups()[0]; State.fileId = g.files[0].id; Nav.go('p4', g.files[0].id); return document.querySelector('[data-act=\"toggle-active\"]').getAttribute('aria-checked'); })()");
+await evalJs("(function () { var g = Store.groups().filter(function (x) { return x.files.length > 0; })[0]; State.fileId = g.files[0].id; Nav.go('p4', g.files[0].id); })()");
+await waitFor("document.body.dataset.page === 'p4' && !!document.querySelector('[data-act=\"toggle-active\"]')", 'P4 parked ready');
+const parkedActive = await evalJs("document.querySelector('[data-act=\"toggle-active\"]').getAttribute('aria-checked')");
 console.log('parked p4 checked=' + parkedActive);
 assert(parkedActive === 'false', 'parked file shows 休眠 with the switch off');
+
+// ---------------------------------------------------------------- 5. 个人空间（P2 置顶 / P3 可进）
+await evalJs("location.href = '/index.html?route=p2'");
+await waitFor("document.body.dataset.page === 'p2' && document.querySelectorAll('.row').length > 0", 'P2 ready', 25000);
+const p2 = await evalJs(
+  "(function () {" +
+  "  var rows = Array.from(document.querySelectorAll('.row'));" +
+  "  return {" +
+  "    first: rows[0].innerText," +
+  "    firstPersonal: rows[0].className.indexOf('is-personal') >= 0," +
+  "    personalCount: rows.filter(function (r) { return r.className.indexOf('is-personal') >= 0; }).length," +
+  "    names: rows.map(function (r) { return r.innerText.split('\\n')[0]; })," +
+  "    text: document.body.innerText" +
+  "  };" +
+  "})()"
+);
+console.log('p2 first=' + JSON.stringify(p2.first) + ' names=' + JSON.stringify(p2.names));
+assert(p2.firstPersonal, 'P2 pins the personal space first (is-personal on the first row)');
+assert(p2.first.indexOf('我的分享') >= 0, 'P2 first row is 我的分享, got ' + p2.first);
+assert(p2.personalCount === 1, 'exactly one personal space in the list');
+assert(p2.names.length === 2, 'P2 lists 我的分享 + 老板的群, got ' + JSON.stringify(p2.names));
+
+await evalJs("location.href = '/index.html?route=p3-personal'");
+await waitFor("document.body.dataset.page === 'p3' && document.querySelectorAll('.trow').length > 0", 'P3 personal ready', 25000);
+const personal = await evalJs("({ text: document.body.innerText, rows: Array.from(document.querySelectorAll('.trow')).map(function (r) { return r.innerText; }) })");
+console.log('p3 personal rows=' + JSON.stringify(personal.rows));
+assert(personal.text.indexOf('我的分享') >= 0, 'P3 in the personal space shows 我的分享 in the header');
+assert(personal.rows.some((row) => row.indexOf('travel-photos.zip') >= 0), 'P3 personal space lists its own file');
+assert(personal.text.indexOf('成员（1 人）') >= 0, 'personal space still has the member entry (one person)');
+assert(personal.text.indexOf('邀请码') < 0, 'no invite copy in the personal space P3');
 
 console.log('KERNEL_STATE_UI_OK');
 ws.close();

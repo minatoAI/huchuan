@@ -36,13 +36,17 @@ fun NewGroupScreen(
 ) {
     val scope = rememberCoroutineScope()
     var code by rememberSaveable { mutableStateOf("") }
-    var wrong by remember { mutableStateOf(false) }
+    // 输入框下那一行错误：长度不对 / 加入失败 / 对方是个人空间，三句都能落到这里。
+    var error by remember { mutableStateOf<String?>(null) }
     var joining by remember { mutableStateOf(false) }
     var showCreate by remember { mutableStateOf(false) }
 
     val device = state.deviceState
     val localName = device.userName.ifBlank { device.deviceName }
     val defaultGroupName = stringResource(R.string.p5_group_name_default, localName)
+    val inviteWrong = stringResource(R.string.p5_invite_wrong)
+    val joinFailed = stringResource(R.string.p5_join_failed)
+    val joinPersonal = stringResource(R.string.p5_join_personal)
 
     LaunchedEffect(joining) {
         if (!joining) return@LaunchedEffect
@@ -50,7 +54,10 @@ fun NewGroupScreen(
         val joined = state.joinGroup(code)
         joining = false
         if (joined == null) {
-            wrong = true
+            // 失败分两种（docs/design/personal-space.md）：对方是个人空间是**明确拒绝**，
+            // 内核把失败码 E_JOIN_PERSONAL 原样留给宿主；其余（没找到 / 连不上 / 码不对）
+            // 一律一句话，不拿「邀请码不对」冒充。
+            error = if (state.lastJoinWasPersonal) joinPersonal else joinFailed
         } else {
             state.touch()
             onJoined(joined.id)
@@ -69,14 +76,14 @@ fun NewGroupScreen(
                 value = code,
                 onValueChange = { input ->
                     code = input.filter { it.isLetterOrDigit() }.uppercase().take(8)
-                    wrong = false
+                    error = null
                 },
                 placeholder = { Text(stringResource(R.string.p5_invite_hint)) },
                 singleLine = true,
                 readOnly = joining,
-                isError = wrong,
-                supportingText = if (wrong) {
-                    { Text(stringResource(R.string.p5_invite_wrong)) }
+                isError = error != null,
+                supportingText = if (error != null) {
+                    { Text(error!!) }
                 } else {
                     null
                 },
@@ -85,7 +92,7 @@ fun NewGroupScreen(
 
             BrandButton(
                 onClick = {
-                    if (code.length != 8) wrong = true else joining = true
+                    if (code.length != 8) error = inviteWrong else joining = true
                 },
                 enabled = !joining,
                 modifier = Modifier.fillMaxWidth(),
