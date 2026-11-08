@@ -121,6 +121,7 @@ final class PublicSwarmSelfTest {
         publish(check);
         importParking(check);
         acquiringSource(check);
+        cancelSearch(check);
         deleteTree(root);
         // 正向证据（可 grep）：这一组断言了几条、红了几条。RESULT=PASS 与它必须同时成立。
         System.out.println("selftest.public checks=" + COUNTS[0] + " failures=" + COUNTS[1]);

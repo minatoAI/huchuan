@@ -90,6 +90,14 @@ class PublicBtSession(
         @Volatile
         var failed: Boolean = false
 
+        /**
+         * 用户取消：内核把这条任务摘掉了（[cancelAcquire]）。两个闸门同时放开，等着的
+         * [addMagnet] 立刻以 [PublicMagnetResult.CANCELLED] 返回，而不是等到超时再报
+         * 「找不到来源」—— 用户点了停止，不该收到一条失败。
+         */
+        @Volatile
+        var cancelled: Boolean = false
+
         @Volatile
         var torrentBytes: ByteArray? = null
     }
@@ -500,6 +508,12 @@ class PublicBtSession(
                     metadataPath = "",
                 )
             }
+            // 用户取消优先于「没等到」：取消会放开等待槽（got=false），不先判这一位就退化成
+            // 一条「找不到来源」的失败 —— 用户点了停止，不该收到一条失败（docs/core.md §3.12）。
+            if (waiter.cancelled) {
+                log("magnet_cancelled", mapOf("infohash" to parsed.fileId, "phase" to "metadata"))
+                return failure(PublicMagnetResult.CANCELLED, parsed.fileId)
+            }
             if (waiter.failed) {
                 removeTorrent(parsed.fileId)
                 log("magnet_metadata_failed", mapOf("infohash" to parsed.fileId))
@@ -512,6 +526,12 @@ class PublicBtSession(
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 false
+            }
+            // 元数据已经到手、正在取 .torrent 字节时被取消：取消同样优先 —— 任务已经不在会话里了，
+            // 再往下走会把一条已经被摘掉的导入当成成功报给调用方。
+            if (waiter.cancelled) {
+                log("magnet_cancelled", mapOf("infohash" to parsed.fileId, "phase" to "saving"))
+                return failure(PublicMagnetResult.CANCELLED, parsed.fileId)
             }
             val bytes = if (saved) waiter.torrentBytes else null
 
@@ -596,6 +616,47 @@ class PublicBtSession(
         synchronized(lock) { task.importOnly = false }
         log("torrent_adopted", mapOf("infohash" to fileId, "name" to task.name))
         return true
+    }
+
+    /**
+     * 取消「等元数据 / 找来源」：把这条任务从公开会话里摘掉，并让任何正卡在 [addMagnet] 同步
+     * 等待里的调用方立刻以 [PublicMagnetResult.CANCELLED] 返回（不是等到超时再报「找不到来源」）。
+     *
+     * 与 [retire] 的分工：
+     *  - [retire] 是内核自己做完事（导入拿到元数据）后的退场，异步、跑在摘任务线程上；
+     *  - 这里是**用户点了停止**（daemon 的 active=false），同步做完 —— 调用方要在同一个请求里把
+     *    「内核现在是什么状态」如实回给页面，异步摘会让回包先说停掉了、状态却还是 acquiring。
+     *
+     * 导入任务（importOnly）与激活过（adopt）的任务都走这一条路：两者都是「有任务、没元数据」，
+     * 差别只在用户要不要它，停止对它们应该是同一件事（docs/core.md §3.12）。
+     *
+     * 返回 true = 真的从会话里摘掉了一条任务；false = 会话里本来就没有它（已经停过 / 已退场）。
+     */
+    fun cancelAcquire(fileId: String, reason: String = REASON_USER_CANCEL): Boolean {
+        val task = synchronized(lock) {
+            val found = tasks[fileId] ?: return false
+            // 等待槽与任务在同一次加锁里处理：addMagnet 不可能在「任务已经没了」之后还把等待放过去。
+            waiters[fileId]?.let { w ->
+                w.cancelled = true
+                w.received.countDown()
+                w.saved.countDown()
+            }
+            found
+        }
+        val removed = removeTorrent(fileId)
+        log(
+            "acquire_cancelled",
+            mapOf(
+                "infohash" to fileId,
+                "name" to task.name,
+                // 导入任务（只为取元数据）与激活过的任务都走这一条路；这一位让日志能分开两种现场。
+                "import_only" to task.importOnly.toString(),
+                "reason" to reason,
+                "removed" to removed.toString(),
+                "torrents" to torrentCount().toString(),
+            ),
+        )
+        return removed
     }
 
     /**
@@ -1243,6 +1304,12 @@ class PublicBtSession(
 
         /** 等元数据的默认上限（§3.1：BT 拉元数据本来就是分钟级）。 */
         const val DEFAULT_METADATA_WAIT_MS = 60_000L
+
+        /**
+         * [cancelAcquire] 的默认理由：用户点了停止（daemon 的 active=false / 本机移除）。
+         * 写进日志 `pub_acquire_cancelled reason=user_cancel`：可 grep 的事实，不是"失败"。
+         */
+        const val REASON_USER_CANCEL = "user_cancel"
 
         /** 元数据到手之后等 save_resume_data 吐 .torrent 字节的上限。 */
         private const val SAVE_TORRENT_WAIT_MS = 5_000L

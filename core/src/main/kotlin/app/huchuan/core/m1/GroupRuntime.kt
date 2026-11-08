@@ -821,25 +821,38 @@ class GroupRuntime internal constructor(
     /**
      * 「休眠」：把 torrent 从会话里摘掉（做种与下载都停）。
      * 部分下载的文件留在盘上，下次激活重新校验后从已完成的片继续。
+     *
+     * **「取消等待」也是这一条路**（docs/core.md §3.12）：状态是 [KernelState.ACQUIRING]
+     * （「正在寻找来源」）或 [KernelState.WAITING_METADATA]（「等待来源」）时，内核里确实挂着一条
+     * 找源任务，但 [localRole] 是 NONE（没有元数据，一个数据字节都没在动）。宿主若按角色判断
+     * 「要不要停」，这两种状态上的停止就成了空操作 —— 用户看到「正在寻找来源」却停不下来。
+     * 所以判据放在这里：按**内核真值**分流，找源中的任务走取消语义（摘任务 + 叫醒同步等待 + 取消日志），
+     * 其余照旧摘任务。
+     *
+     * @return 这次是否真的从会话里摘掉了一条任务（已经停过 / 本来就没挂 → false）。
      */
     fun stopFile(fileId: String): Boolean {
-        val had = synchronized(lock) {
+        val before = kernelState(fileId)
+        synchronized(lock) {
             localTasks.remove(fileId)
             seeding.leave(fileId)
             unhealthySeeds.remove(fileId)
             // 拨号状态也要清，否则刚休眠完再激活会被退避窗口卡住。
             dials.keys.removeIf { it.startsWith(fileId + "@") }
             connectedEndpoints.clear()
-            true
         }
-        kernel.sessionOf(fileId).removeTorrent(fileId)
+        val removed = if (before == KernelState.ACQUIRING || before == KernelState.WAITING_METADATA) {
+            kernel.cancelPublicAcquire(this, fileId, before)
+        } else {
+            kernel.sessionOf(fileId).removeTorrent(fileId)
+        }
         kernel.events.log("file_stopped", mapOf("group_id" to groupId, "file_id" to fileId))
         // 最后一条非休眠公开条目被摘掉 → 公开会话停掉（按需启停的另一半）。
         kernel.maybeStopPublicSession()
         // 做种数变了，重新自报一次（协议 §10 的 peer.announce.seeds）
         broadcastPeerAnnounce(null)
         kernel.saveState()
-        return had
+        return removed
     }
 
     /** 单文件限速（协议 §4：一文件一 torrent + setUploadLimit）。 */

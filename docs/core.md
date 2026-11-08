@@ -1231,7 +1231,7 @@ state.json 每群多一个 "isPersonal": true|false（落 GroupRuntime.isPersona
 **读口**
 
     kernel.personalSpace()          // GroupRuntime?（内核没起来时 null）
-    kernel.groups()                 // 每个群带 isPersonal；个人空间排在最前（宿主按它置顶 P2）
+    kernel.groups()                 // 每个群带 isPersonal；顺序是插入顺序，个人空间不保证在前（旧库补建时在最后），置顶由宿主按 isPersonal 排序
     kernel.mdnsBroadcastGroupIds()  // 当前在 mDNS 上广播的群（个人空间永远不在里面）
     kernel.lastJoinError()          // 最近一次加入失败的原因；E_JOIN_PERSONAL = 对面明确拒绝
 

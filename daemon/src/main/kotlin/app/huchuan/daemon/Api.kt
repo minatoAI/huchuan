@@ -548,6 +548,12 @@ class Api(private val daemon: Daemon) {
         val active = body.bool("active") ?: return fail("E_BAD_ACTIVE", "active 必填（true=激活 / false=休眠）", 400)
         val entry = daemon.visibleFile(group, fileId) ?: return fail("E_NO_FILE", fileId, 404)
         val role = group.localRole(fileId)
+        // 休眠的判据是**内核真值**，不是角色（docs/daemon-api.md §3.3、docs/core.md §3.12）：
+        // acquiring（正在寻找来源）与 waiting_metadata（等待来源）时内核里挂着一条找源任务，
+        // 但 role 是 none —— 没有元数据，一个数据字节都没在动。以前只看 role，这两种状态上
+        // 点停止什么都不发生，用户只能等它超时或者自己找到源。
+        val before = group.kernelState(fileId)
+        var stopped = false
         if (active) {
             if (role == GroupRuntime.LocalRole.NONE) {
                 // 本机共享的文件：唤醒 = 重新做种，不能走下载路径 —— core 的 startDownload 固定落到
@@ -568,10 +574,13 @@ class Api(private val daemon: Daemon) {
                 val limit = daemon.settings.uploadLimitOf(fileId)
                 if (limit > 0) group.setUploadLimitKbps(fileId, limit)
             }
-        } else if (role != GroupRuntime.LocalRole.NONE) {
-            group.stopFile(fileId)
+        } else if (before != GroupRuntime.KernelState.ABSENT) {
+            // 找源中的任务走内核的「取消等待」语义：摘任务 + 叫醒同步等待 + 记一条取消日志
+            // （core 的 `public_acquire_cancelled`，reason=user_cancel）。返回 false 说明本来就没挂着。
+            stopped = group.stopFile(fileId)
         }
         daemon.bump("file_active")
+        val after = group.kernelState(fileId)
         daemon.log.event(
             "api_file_active",
             mapOf(
@@ -579,12 +588,23 @@ class Api(private val daemon: Daemon) {
                 "file_id" to fileId,
                 "active" to active.toString(),
                 "role_before" to role.name.lowercase(),
-                // 激活之后的内核态：元数据没到手时点激活会立刻变成 acquiring（「正在寻找来源」），
-                // 这一行是可 grep 的证据（docs/core.md §3.12）。
-                "kernel_state" to group.kernelState(fileId).name.lowercase(),
+                // 动作前后的内核态：激活之后是 acquiring（「正在寻找来源」），休眠之后是 absent。
+                // 这是可 grep 的证据（docs/core.md §3.12）。
+                "kernel_state_before" to daemon.kernelStateWire(before),
+                "kernel_state" to daemon.kernelStateWire(after),
+                // 这一下到底停掉了没有：true = 真从会话里摘了一条任务，false = 本来就没在跑。
+                "stopped" to stopped.toString(),
             ),
         )
-        return ok(jobj("file" to daemon.fileJson(group, entry)))
+        // 回包如实说清结果：file 是动作之后的对象投影（kernelState 已经是新的），stopped 是「真停了吗」。
+        // 页面只读 file 也照旧工作；要判断「这一下有没有生效」的调用方看 stopped。
+        return ok(jobj(
+            "file" to daemon.fileJson(group, entry),
+            "active" to jbool(active),
+            "stopped" to jbool(stopped),
+            "kernelStateBefore" to jstr(daemon.kernelStateWire(before)),
+            "kernelState" to jstr(daemon.kernelStateWire(after)),
+        ))
     }
 
     private fun uploadLimitRoute(request: HttpRequest, group: GroupRuntime, fileId: String): HttpResponse {

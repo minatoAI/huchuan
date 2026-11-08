@@ -444,6 +444,15 @@ class M1Kernel @JvmOverloads constructor(
     fun publicTorrentCount(): Int = if (this::publicBt.isInitialized) publicBt.torrentCount() else 0
 
     /**
+     * 这个 fileId 的 torrent 现在在不在公开会话里（诊断 / 验收读口，只读）。
+     *
+     * 「停止之后公开会话里没有它」这条断言用它：[publicTorrentCount] 只是总数，会话里还有别的
+     * 任务时它证明不了任何事。会话没起来 / 没有这个 torrent 时都是 false。
+     */
+    fun publicHasTorrent(fileId: String): Boolean =
+        this::publicBt.isInitialized && publicBt.has(fileId)
+
+    /**
      * 公开会话的诊断快照：DHT 节点数、每个 tracker 的 announce 结果与下次时间、当前 peer 端点。
      *
      * 宿主（daemon 的 /api/state）直接把它摊成 JSON；会话没起来时是一份 running=false 的空表，
@@ -911,6 +920,46 @@ class M1Kernel @JvmOverloads constructor(
             events.log("public_session_error", mapOf("error" to e.toString()))
             null
         }
+    }
+
+    /**
+     * 取消「等来源」：用户点了停止（daemon 的 active=false / 本机移除）。
+     *
+     * 状态是 [GroupRuntime.KernelState.ACQUIRING]（正在寻找来源）或
+     * [GroupRuntime.KernelState.WAITING_METADATA]（等待来源）时，内核里挂着一条找源任务，
+     * 但 [GroupRuntime.localRole] 是 NONE —— 没有元数据，一个数据字节都没在动。只看角色判
+     * 「要不要停」会让这两种状态上的停止变成空操作（用户看到「正在寻找来源」却停不下来）。
+     *
+     * 这里做三件事，按这个顺序：
+     *  1. 把那条任务从公开会话里摘掉（[PublicBtSession.cancelAcquire]，同步做完）；
+     *  2. 叫醒任何正卡在 addPublicMagnet 同步等待里的调用方，让它拿到 cancelled 而不是等到超时；
+     *  3. 记一条 `public_acquire_cancelled` —— **取消**，不是失败：日志里能一眼看出是用户
+     *     点了停止（reason=user_cancel），而不是内核找不到来源。
+     *
+     * 公开会话要不要停不在这里判：[GroupRuntime.stopFile] 之后统一走 [maybeStopPublicSession]。
+     *
+     * @return 是否真的从会话里摘掉了一条任务。
+     */
+    internal fun cancelPublicAcquire(
+        group: GroupRuntime,
+        fileId: String,
+        from: GroupRuntime.KernelState,
+    ): Boolean {
+        if (!this::publicBt.isInitialized) return false
+        val removed = publicBt.cancelAcquire(fileId, PublicBtSession.REASON_USER_CANCEL)
+        events.log(
+            "public_acquire_cancelled",
+            mapOf(
+                "group_id" to group.groupId,
+                "file_id" to fileId,
+                // 从哪个状态被取消：acquiring（正在寻找来源）/ waiting_metadata（等待来源）。
+                "from" to from.name.lowercase(),
+                "removed" to removed.toString(),
+                // 取消之后公开会话里还剩几条任务（0 = 没有别人在用，随后会被停掉、端口释放）。
+                "torrents" to publicBt.torrentCount().toString(),
+            ),
+        )
+        return removed
     }
 
     /** 没有任何非休眠公开条目时停掉公开会话（按需启停的另一半，§7.1）。 */

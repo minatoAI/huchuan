@@ -667,7 +667,7 @@ class Daemon(val options: DaemonOptions, val log: DaemonLogger) {
      * `state` 是「画面上该显示什么」（三值），这个是 libtorrent 侧的真值（六值）；
      * 多出来的 `acquiring` 就是「用户点了激活、内核还在找源」那一段。
      */
-    private fun kernelStateWire(state: GroupRuntime.KernelState): String = when (state) {
+    fun kernelStateWire(state: GroupRuntime.KernelState): String = when (state) {
         GroupRuntime.KernelState.ABSENT -> "absent"
         GroupRuntime.KernelState.PARKED -> "parked"
         GroupRuntime.KernelState.WAITING_METADATA -> "waiting_metadata"

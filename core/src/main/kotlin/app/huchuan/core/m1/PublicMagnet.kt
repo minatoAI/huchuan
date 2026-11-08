@@ -127,6 +127,10 @@ class MagnetLink private constructor(
  *
  * **永不抛异常**：五种失败各有一句中文（[messageFor]），宿主直接把 [message] 显示在输入框下一行 /
  * P3 行上，不弹窗、不要求用户点重试。
+ *
+ * [CANCELLED] **不是失败**：用户在「等待来源 / 正在寻找来源」期间点了停止，内核把那条找源任务摘掉了。
+ * 它与超时 / 无源分开，因为「用户不要了」和「找不到」是两件事（界面文案与日志都不该混着说，
+ * 见 docs/core.md §3.12）。
  */
 data class PublicMagnetResult(
     /** 元数据到手（能下载 / 能做种）。 */
@@ -159,6 +163,14 @@ data class PublicMagnetResult(
         const val SESSION_ERROR = "session_error"
 
         /**
+         * 用户取消（不是失败）：acquiring / waiting_metadata 期间点了停止。
+         *
+         * 只在「同步等待中的导入被取消」这一条路上出现 —— 已经回包、事后才取消的那种没有调用方在等，
+         * 这时代码只体现在日志 `public_acquire_cancelled` 上。
+         */
+        const val CANCELLED = "cancelled"
+
+        /**
          * 失败原因 → 一句话（public-swarm §3.1 的表）。
          *
          * 纯函数：SelfTest 在字节层钉「五种失败各有一句话、彼此不同、都不为空」，
@@ -173,6 +185,7 @@ data class PublicMagnetResult(
             BAD_METADATA -> "文件信息无效"
             NO_GROUP -> "群不存在"
             SESSION_ERROR -> "公开会话没起来"
+            CANCELLED -> "已取消，不再寻找来源"
             else -> ""
         }
 
