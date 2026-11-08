@@ -242,6 +242,23 @@ step "写 NOTES.md"
   echo "- 提交：$COMMIT$DIRTY"
   echo "- 平台：Android arm64-v8a / Windows x64"
   echo
+  echo "## 这一版能做什么"
+  echo
+  # 只写已经验过的能力，取自 README 的能力表。改这里之前先确认对面的验证记录。
+  while IFS= read -r line; do
+    [ -n "$line" ] && echo "- $line"
+  done <<'CAPS'
+群组：邀请制，16 字符邀请码，加入时只输后 8 位
+私有直连：局域网 mDNS 发现与手动地址；私有群固定关 DHT、PEX、LSD
+组队通告：显示实际互连的队友数，不做分片调度
+文件激活/休眠：休眠的文件不参与传输
+文件下评论：每文件一条签名追加日志，支持回复
+通知三档（系统气泡 / 静音 / 仅应用内），全局限速与单文件限速（上行、下行）
+公开种子：私有文件可公开到群外做种；磁力导入后需激活才开始下载
+链接分享：二维码或链接，对方用浏览器直接接收，7 天有效、可撤销
+系统分享：别的应用分享到互传，文件直接落地
+CAPS
+  echo
   echo "## 文件"
   echo
   echo "| 文件 | 大小 | SHA-256 |"
@@ -269,6 +286,8 @@ step "写 NOTES.md"
     [ -n "$APK_CERT_SHA" ] && echo "- 证书 SHA-256 指纹：$APK_CERT_SHA（apksigner 原始输出见 APK-SIGNATURE.txt）"
     echo "- 覆盖安装认这个证书，换 keystore 之后必须先卸载旧版。"
   fi
+  echo "- 链接分享：分享者要保持在应用前台，或让前台服务跑着；进程被杀之后链接失效。"
+  echo "- 公开种子的元数据获取速度取决于 tracker / DHT，可能较慢（实测有 15 分钟才拿到元数据的）。"
   echo "- APK 只含 arm64-v8a，没有 x86_64 模拟器包与 32 位包。"
   echo "- Windows 包没有代码签名，SmartScreen 会拦一次，选「仍要运行」。"
   echo "- 验证范围：Android 13（API 33）与 Android 17（API 37）真机、Windows 11 x64；"
