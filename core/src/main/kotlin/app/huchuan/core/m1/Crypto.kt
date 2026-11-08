@@ -1,6 +1,7 @@
 package app.huchuan.core.m1
 
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.text.Normalizer
@@ -41,6 +42,27 @@ fun sha256(vararg parts: ByteArray): ByteArray {
     val md = MessageDigest.getInstance("SHA-256")
     for (p in parts) md.update(p)
     return md.digest()
+}
+
+/**
+ * 文件 SHA-256（小写 hex），只用于日志自证（`file_seeding` / `download_completed` 的 `sha256=`）。
+ * 读失败返回空串：调用方只打日志，绝不因为算哈希失败改变共享/完成逻辑。
+ */
+fun sha256File(file: File): String {
+    return try {
+        val md = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(1 shl 20)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                if (n > 0) md.update(buf, 0, n)
+            }
+        }
+        md.digest().toHex()
+    } catch (e: Exception) {
+        ""
+    }
 }
 
 fun hmacSha256(key: ByteArray, vararg parts: ByteArray): ByteArray {

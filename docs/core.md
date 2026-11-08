@@ -363,7 +363,7 @@ override fun peersChanged(group: GroupRuntime, deviceId: String, online: Boolean
 | `source=monitor` | 2 s 巡查兜底（幂等，正常情况下此时已经完成过） | 不再承担时效 |
 
 `completeFile` 幂等（`GroupRuntime.markCompleted` 的 `first` 位去重），所以告警与兜底撞在一起也只出一次事件。
-事件顺序照旧：进做种集合 → `KernelEvents.fileCompleted` + `download_completed`（带 `source=`）→ 做种数变了才 `peer.announce`。
+事件顺序照旧：进做种集合 → `KernelEvents.fileCompleted` + `download_completed`（带 `source=` 与 `sha256=`）→ 做种数变了才 `peer.announce`。
 
 **边界**
 
@@ -1376,7 +1376,7 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 | 退群（G1） | `removeGroup` 幂等：停该群全部 torrent、关全部链路、mDNS 注销、抹 `keySeed`+`kGrp`、`saveState` 后库里不再有该群；磁盘文件不删 | `M1Kernel.removeGroup`、`GroupRuntime.purgeForRemoval` |
 | 做种集合（M1.3） | 「本机在做种」只有一份：`addFile` 挂进会话、下载完成（`markCompleted`）、重启续种成功三处进；`stopFile`、文件被移走删掉、校验后缺片、退群四处出。做种数、`peer.announce.seeds`、P3 状态同一个读数 | `SeedingLedger`、`GroupRuntime.seedingFileCount` |
 | 冷启动重连（M1.4） | 只对 `start()` 时从 `state.json` 恢复的群；候选 = 落盘端点 → 手动地址 → mDNS（按 gid 归群）；退避 1/2/4/8/16/30 s（30 s 封顶）、每群并发 3；连上走 hello 绑定，不重新 join | `ReconnectPolicy`、`PeerReconnector`、`GroupRuntime.reconnectCandidates` |
-| 完成推送（M1.4） | `torrent_finished_alert` 入队即判 + 200 ms 兜底巡查；两条路同一个幂等的 `completeFile`，事件在判定当场推，不再等 2 s 巡查。日志 `download_completed source=alert\|sweep\|monitor` | `BtSession.onTorrentFinished`、`M1Kernel.completeFile`、`M1Kernel.COMPLETION_TICK_MS` |
+| 完成推送（M1.4） | `torrent_finished_alert` 入队即判 + 200 ms 兜底巡查；两条路同一个幂等的 `completeFile`，事件在判定当场推，不再等 2 s 巡查。日志 `download_completed source=alert\|sweep\|monitor sha256=` | `BtSession.onTorrentFinished`、`M1Kernel.completeFile`、`M1Kernel.COMPLETION_TICK_MS` |
 | 跨网发现的 info_hash（M1.6） | `groupHash20 = SHA-256(UTF8("huchuan/gh1/v1") ‖ codeBytes)[0..20]`（20 字节 `%XX` 进查询串）；**与文件 infohash 无关**，文件 swarm 侧 `0x380000`（DISABLE_DHT\|DISABLE_LSD\|DISABLE_PEX）不变 | `TrackerProtocol.groupHash20`、`TrackerHttp.announce` |
 | 跨网发现的 passkey（M1.6） | `hex(HMAC-SHA256(kGrp, UTF8("huchuan/trk1/v1") ‖ UTF8(gid) ‖ UTF8(小时十进制)))`；小时 = `floor(unix ms / 3600_000)`。拼接是**普通 UTF-8 字节**（与 worker 的 `tokenHashHex` / `passkeyHashHex` 同一口径），不是 signBytes 的长度前缀格式。日志一律 `TrackerProtocol.mask`（前 4 字符） | `TrackerProtocol.passkeyHex`、`Domains.TRACKER` |
 | 跨网发现的节奏（M1.6） | 注册后立刻 announce（`event=started`，之后 `none`）；interval 取服务端下发值夹到 `[max(min interval,300), 3600]`，缺省 600；下一拍不超过「本小时结束 + 1.5 s」；失败 30 s 退避 | `GroupTracker.tick` / `nextDelay` |
@@ -1385,6 +1385,7 @@ M2 的 5 个类型（group.rotate / log.del / file.del / team.part / tracker.hin
 | peer.announce.pubBtPort（M1.7） | 可选 u16，公开会话 BT 端口；0/缺省 = 没有公开会话。**不进 peer1 签名域**（仍是 `[dev,gid,btPort,ts]`），负数 / >65535 归 0；公开会话启停时重新广播。日志 `pub_bt_port=` | `PeerAnnounceMsg.pubBtPort`、`GroupRuntime.peerAnnounceBody/onPeerAnnounce`、`M1Kernel.localPublicBtPort` |
 | 公开条目拨号（M1.7） | `connectSeeders` 按条目 scope 选端点表：公开 → `pubBtEndpoints`（每成员每个文件各拨一次，走公开会话）；成员没报 `pubBtPort` 时跳过，不回落私有 `btPort`。日志字段 `sess=pub` 是证伪点 | `GroupRuntime.connectSeeders`、`PublicBtSession.connectPeer` |
 | 完成事件与日志的顺序（M1.5） | `completeFile` **先写 `download_completed` 日志行、再推 `fileCompleted` 事件**：宿主常在回调里立刻读 `source`，反过来写会出现「事件已到、source 还是空」的窗口（harness 因此把快通道误判成慢通道过一次） | `M1Kernel.completeFile` |
+| 共享/完成日志的 SHA-256（M1.5） | `file_seeding` 带共享副本的 `sha256=`（`GroupRuntime.addFile`），`download_completed` 带落地文件的 `sha256=`（`M1Kernel.completeFile`）。两处都只多读一次文件、算哈希，不改变做种/完成/广播逻辑；release 包不能 `run-as` 时，真机脚本靠这两个字段做手机侧自证 | `sha256File`、`GroupRuntime.addFile`、`M1Kernel.completeFile` |
 | 在线成员事件（M1.4） | `KernelEvents.peersChanged(group, dev, online)`：只在连接表变化（`attach` / `detach`）时回调，重连成功同样是一次 `online=true`；宿主据此重读 P6 | `KernelEvents.peersChanged`、`GroupRuntime.attach/detach` |
 | 冷启动重连的落盘 | `state.json` 每群多两个字段：`peerAddrs`（`[{dev, addr}]`，只记本机拨出去并绑定成功的端点）与 `manual`（`[host:port]`，join 时用过的手动地址）。旧库缺这两个字段 → 重连改走 mDNS | `GroupRuntime.toStoreJson`、`M1Kernel.loadState` |
 | 公开会话参数（M3） | `enable_dht=true`、`enable_lsd=false`、`enable_incoming/outgoing_utp=true`、UPnP/NAT-PMP 默认关（`setPortMapping` 按需开）、`connections_limit=200` / `active_downloads=3` / `active_seeds=20`、**不设 ip_filter**、`listen_interfaces=0.0.0.0:6881` 起顺延 100（不与私有 51413 段重叠） | `PublicBtSession.settings` |

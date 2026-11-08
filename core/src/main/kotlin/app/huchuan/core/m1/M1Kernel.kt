@@ -1870,13 +1870,16 @@ class M1Kernel @JvmOverloads constructor(
             // 先写日志行再推事件：宿主（含 harness）常在 fileCompleted 回调里立刻读
             // "download_completed 的 source"，反过来写会有一个「事件已到、字段还没填」的窗口，
             // 表现为 source="" 把快通道误判成慢通道（真机与 harness 都踩到过）。
+            // 只加日志字段：落地文件再算一次 SHA-256，供 release 包（run-as 不可用）自证。
+            val saved = group.savedFile(fileId)
             events.log(
                 "download_completed",
                 mapOf(
                     "group_id" to group.groupId,
                     "file_id" to fileId,
                     "size" to entry.size.toString(),
-                    "path" to (group.savedFile(fileId)?.absolutePath ?: ""),
+                    "path" to (saved?.absolutePath ?: ""),
+                    "sha256" to (saved?.let { sha256File(it) } ?: ""),
                     "source" to source,
                 ),
             )

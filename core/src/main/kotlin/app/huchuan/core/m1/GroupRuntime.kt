@@ -318,6 +318,8 @@ class GroupRuntime internal constructor(
             seeding.enter(entry.fileId, file.absolutePath)
             connectedEndpoints.add("seed:" + entry.fileId)
         }
+        // 只加日志字段：真机脚本在 release 包上读不了私有目录，用它做手机侧自证。
+        val fileSha256 = sha256File(file)
         kernel.events.log(
             "file_seeding",
             mapOf(
@@ -328,6 +330,7 @@ class GroupRuntime internal constructor(
                 "piece_size" to entry.pieceSize.toString(),
                 "torrent_bytes" to seeded.torrentBytes.size.toString(),
                 "super_seeding" to superSeeding.toString(),
+                "sha256" to fileSha256,
             ),
         )
         broadcast(

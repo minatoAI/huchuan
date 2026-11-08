@@ -5,6 +5,8 @@
 #   bash scripts/m1-device.sh              # 全流程 + 崩溃压力（3 轮 128 MiB，中途取消一次）
 #   bash scripts/m1-device.sh --quick      # 跳过压力测试
 #   bash scripts/m1-device.sh --rounds 2 --mib 64
+#   M1_INSTALL=0 bash scripts/m1-device.sh --quick
+#                                          # 不构建/安装 app，用设备上已装的包（验 release 包用）
 #
 # 链路（脚本自己判定并写在输出里）：
 #   android-desktop  手机 + 桌面 JVM 对端（当前唯一可跑的链路）
@@ -33,9 +35,11 @@
 #       P4 单文件限速设 1024 → 桌面端下载 32 MiB 实测 ≤ 1229 KB/s（20% 余量），清空输入框后 kbps=0；
 #       P7 全局限速设上行 512 → 另一份 32 MiB 实测 ≤ 600 KB/s；清掉限制（不限）→ 第三份实测 > 2 MB/s。
 #       两条都带内核读回校验（session_up_kbps=512 / ok=true），防止「设置成功但没生效」。
+#       debuggable：私有目录哈希要 run-as，release 包上记 SKIP（原因 package not debuggable），
+#       手机侧自证改读 core 日志 file_seeding / download_completed 的 sha256=。
 # 证据：artifacts/m1-device/（截图、ui-dump、logcat、peer 日志、拉回的文件与哈希）
 #
-# 最后一行打印 PASS / FAIL，退出码 0 / 1。
+# 最后一行打印 PASS / FAIL，退出码 0 / 1；上一行 checks 单独列 PASS / FAIL / SKIP。
 #
 set -uo pipefail
 
@@ -57,6 +61,8 @@ ECHO_DELAY_MS="${M1_ECHO_DELAY_MS:-25000}"
 # 冷启动自动重连（M1.4）：peer_reconnected 的 elapsed_ms 上限，超了就算候选选错或退避太慢。
 RECONNECT_MAX_MS="${M1_RECONNECT_MS:-5000}"
 QUICK=0
+# 1 = 构建并安装 debug 包（默认）；0 = 用设备上已装的包，只构建桌面对端要用的 core。
+INSTALL="${M1_INSTALL:-1}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -75,8 +81,14 @@ say() { printf '%s\n' "$*"; }
 step() { printf '\n=== %s ===\n' "$1"; }
 die() { say "FATAL: $*" >&2; say "FAIL"; exit 1; }
 
+case "$INSTALL" in
+  0|1) ;;
+  *) die "M1_INSTALL 只能是 0 或 1（当前：$INSTALL）" ;;
+esac
+
 CHECKS_FAIL=0
 CHECKS_PASS=0
+CHECKS_SKIP=0
 chk() {
   local name="$1" ok="$2" detail="${3:-}"
   if [ "$ok" = "1" ]; then
@@ -86,6 +98,12 @@ chk() {
     say "CHECK FAIL $name${detail:+ ($detail)}"
     CHECKS_FAIL=$((CHECKS_FAIL + 1))
   fi
+}
+# SKIP 是「这次环境测不了」，不是 FAIL，也不能混进 PASS（汇总单独计数）。
+chk_skip() {
+  local name="$1" reason="${2:-}"
+  say "CHECK SKIP $name${reason:+ ($reason)}"
+  CHECKS_SKIP=$((CHECKS_SKIP + 1))
 }
 warn() { say "WARN  $*"; }
 info() { say "INFO  $*"; }
@@ -430,12 +448,60 @@ sha256_of() {
   fi
 }
 
-# 从应用私有目录把文件拉回本机（adb pull 读不了 /data/data，debuggable 包走 run-as）
+# run-as 只对 debuggable 包有效。release 包上必然报 "package not debuggable"，
+# 这时不能把空哈希当 FAIL（产品没问题），也不能静默当 PASS；调用方按 SKIP 记账。
+# 一次运行里包不会换，所以只探一次。
+RUN_AS_STATE=""
+RUN_AS_REASON=""
+probe_run_as() {
+  [ -n "$RUN_AS_STATE" ] && return 0
+  local out
+  out="$("$ADB" -s "$SERIAL" exec-out run-as "$PKG" id 2>&1 | tr -d '\r')"
+  case "$out" in
+    *"package not debuggable"*)
+      RUN_AS_STATE="no"
+      RUN_AS_REASON="package not debuggable（release 包）"
+      ;;
+    uid=*)
+      RUN_AS_STATE="ok"
+      RUN_AS_REASON="debuggable 包"
+      ;;
+    *)
+      RUN_AS_STATE="no"
+      RUN_AS_REASON="run-as 不可用：${out:-adb exec-out run-as 无输出}"
+      ;;
+  esac
+  return 0
+}
+
+# 从应用私有目录把文件拉回本机（adb pull 读不了 /data/data，debuggable 包走 run-as）。
+# 返回 0 = 拉到非空文件；2 = 能力不可用，调用方必须记 SKIP；1 = 能力可用但文件拉不到（真 FAIL）。
+# 结果同时写进 PULL_PRIVATE_STATUS / PULL_PRIVATE_REASON，调用方不用猜 stderr。
+PULL_PRIVATE_STATUS=""
+PULL_PRIVATE_REASON=""
 pull_private() {
-  local device_path="$1" local_path="$2"
+  local device_path="$1" local_path="$2" err out
+  PULL_PRIVATE_STATUS="fail"
+  PULL_PRIVATE_REASON=""
   mkdir -p "$(dirname "$local_path")"
-  "$ADB" -s "$SERIAL" exec-out run-as "$PKG" cat "$device_path" > "$local_path" 2>/dev/null
-  [ -s "$local_path" ]
+  rm -f "$local_path" "$local_path.err"
+  probe_run_as
+  if [ "$RUN_AS_STATE" != "ok" ]; then
+    PULL_PRIVATE_STATUS="skip"
+    PULL_PRIVATE_REASON="$RUN_AS_REASON"
+    return 2
+  fi
+  err="$local_path.err"
+  if "$ADB" -s "$SERIAL" exec-out run-as "$PKG" cat "$device_path" > "$local_path" 2>"$err" \
+    && [ -s "$local_path" ]; then
+    rm -f "$err"
+    PULL_PRIVATE_STATUS="ok"
+    return 0
+  fi
+  out="$(tr -d '\r' < "$err" 2>/dev/null | head -2 | tr '\n' ' ')"
+  rm -f "$err" "$local_path"
+  PULL_PRIVATE_REASON="${out:-文件不存在或为空：$device_path}"
+  return 1
 }
 
 # ------------------------------------------------------------------ 0. 设备与链路
@@ -452,6 +518,9 @@ MODEL="$(sh_ getprop ro.product.model | tr -d '\r')"
 SDK="$(sh_ getprop ro.build.version.sdk | tr -d '\r')"
 say "adb       : $ADB"
 say "device    : $SERIAL  $MODEL  API $SDK"
+say "install   : $( [ "$INSTALL" = "1" ] && echo "构建 debug 包并安装" || echo "M1_INSTALL=0，用设备上已装的包" )"
+# run-as 要等安装/清场之后才能探：设备上还没装包时探到的「不可用」会被缓存，
+# 装完 debug 包也一直记 SKIP（首次安装/卸载重装都会踩）。探测放在第 3 步。
 
 CHAIN="android-desktop"
 if [ "$COUNT" -ge 2 ]; then
@@ -491,10 +560,17 @@ trap cleanup EXIT
 # ------------------------------------------------------------------ 1. 构建
 
 step "1/12 构建"
-( cd "$ROOT" && ./gradlew --console=plain -q :app:assembleDebug :core:jar :core:m1Deps :core:m1Native ) \
+# 桌面对端永远用本仓库现编的 core；只有默认模式才构建并安装 app 的 debug 包。
+GRADLE_TASKS=(:core:jar :core:m1Deps :core:m1Native)
+if [ "$INSTALL" = "1" ]; then GRADLE_TASKS=(:app:assembleDebug "${GRADLE_TASKS[@]}"); fi
+( cd "$ROOT" && ./gradlew --console=plain -q "${GRADLE_TASKS[@]}" ) \
   || die "gradle 构建失败"
-APK="$ROOT/app/build/outputs/apk/debug/app-debug.apk"
-[ -f "$APK" ] || die "APK 不存在：$APK"
+if [ "$INSTALL" = "1" ]; then
+  APK="$ROOT/app/build/outputs/apk/debug/app-debug.apk"
+  [ -f "$APK" ] || die "APK 不存在：$APK"
+else
+  info "M1_INSTALL=0：不构建 app，沿用设备上已装的 $PKG"
+fi
 
 CORE_JAR="$(ls "$ROOT"/core/build/libs/*.jar 2>/dev/null | head -1)"
 [ -n "$CORE_JAR" ] || die "core jar 不存在"
@@ -509,12 +585,16 @@ javac -encoding UTF-8 -cp "$PEER_CP" -d "$(w "$PEER_CLASSES")" "$(w "$ROOT/app/t
 PEER_CP="$PEER_CP;$(w "$PEER_CLASSES")"
 PEER_NATIVE="$(w "$ROOT/core/build/m1-native/libtorrent4j.dll")"
 [ -f "$ROOT/core/build/m1-native/libtorrent4j.dll" ] || die "libtorrent4j.dll 未解出"
-info "apk=$(du -h "$APK" | cut -f1) peer_classes=$PEER_CLASSES"
-
-SO_SHA="$(unzip -p "$APK" lib/arm64-v8a/libtorrent4j.so 2>/dev/null | sha256sum | cut -d' ' -f1)"
-SO_BYTES="$(unzip -l "$APK" 2>/dev/null | awk '/lib\/arm64-v8a\/libtorrent4j.so/{print $1}')"
-WANT_SHA="$(sha256_of "$ROOT/artifacts/build-libtorrent/run5-sde1/libtorrent4j.so")"
-chk "apk.selfbuilt_arm64_so" "$([ "$SO_SHA" = "$WANT_SHA" ] && echo 1 || echo 0)" "$SO_BYTES bytes"
+if [ "$INSTALL" = "1" ]; then
+  info "apk=$(du -h "$APK" | cut -f1) peer_classes=$PEER_CLASSES"
+  SO_SHA="$(unzip -p "$APK" lib/arm64-v8a/libtorrent4j.so 2>/dev/null | sha256sum | cut -d' ' -f1)"
+  SO_BYTES="$(unzip -l "$APK" 2>/dev/null | awk '/lib\/arm64-v8a\/libtorrent4j.so/{print $1}')"
+  WANT_SHA="$(sha256_of "$ROOT/artifacts/build-libtorrent/run5-sde1/libtorrent4j.so")"
+  chk "apk.selfbuilt_arm64_so" "$([ "$SO_SHA" = "$WANT_SHA" ] && echo 1 || echo 0)" "$SO_BYTES bytes"
+else
+  info "peer_classes=$PEER_CLASSES"
+  chk_skip "apk.selfbuilt_arm64_so" "M1_INSTALL=0 不构建 APK"
+fi
 
 # ------------------------------------------------------------------ 2. 素材
 
@@ -569,7 +649,23 @@ step "3/12 清场并安装"
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { $_.CommandLine -like '*DesktopPeer*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >/dev/null 2>&1
 sh_ am force-stop "$PKG" >/dev/null 2>&1
 sh_ pm clear "$PKG" >/dev/null 2>&1
-"$ADB" -s "$SERIAL" install -r -t -g "$(w "$APK")" 2>&1 | grep -E "Success|Failure|Error" | tail -1
+if [ "$INSTALL" = "1" ]; then
+  INSTALL_OUT="$("$ADB" -s "$SERIAL" install -r -t -g "$(w "$APK")" 2>&1)"
+  printf '%s\n' "$INSTALL_OUT" | grep -E "Success|Failure|Error" | tail -1
+  case "$INSTALL_OUT" in
+    *Success*) ;;
+    *) die "安装失败：$INSTALL_OUT
+设备上若是别的签名包，先 adb uninstall $PKG 再跑（脚本不会拿旧包继续跑）。" ;;
+  esac
+else
+  info "M1_INSTALL=0：不安装，沿用设备上已装的 $PKG"
+fi
+probe_run_as
+if [ "$RUN_AS_STATE" = "ok" ]; then
+  info "run-as    : 可用（debuggable 包），私有目录哈希走 pull_private"
+else
+  info "run-as    : 不可用（$RUN_AS_REASON）→ 私有目录哈希断言记 SKIP，手机侧自证改读 logcat sha256="
+fi
 "$ADB" -s "$SERIAL" logcat -b all -c >/dev/null 2>&1
 info "logcat / crash buffer cleared"
 
@@ -825,12 +921,26 @@ chk "share.saf_copied" "$([ "$SHARE_BYTES" = "33554432" ] && echo 1 || echo 0)" 
 chk "share.seeding" "$([ -n "$FILE_ID" ] && echo 1 || echo 0)" "file_id=$FILE_ID"
 
 DEVICE_SHARE_PATH="/data/data/$PKG/files/m1/share/$SHARE_NAME"
+SEED_SHA=""
 if pull_private "$DEVICE_SHARE_PATH" "$ART/pulled/android-seed-copy.bin"; then
   SEED_SHA="$(sha256_of "$ART/pulled/android-seed-copy.bin")"
+  chk "share.copy_matches_payload" "$([ "$SEED_SHA" = "$PAYLOAD_SHA" ] && echo 1 || echo 0)" "sha=${SEED_SHA:0:16}"
+elif [ "$PULL_PRIVATE_STATUS" = "skip" ]; then
+  chk_skip "share.copy_matches_payload" "$PULL_PRIVATE_REASON；跨端一致性由 sha256.equal_android_desktop 守"
 else
-  SEED_SHA=""
+  chk "share.copy_matches_payload" 0 "pull 失败：$PULL_PRIVATE_REASON"
 fi
-chk "share.copy_matches_payload" "$([ "$SEED_SHA" = "$PAYLOAD_SHA" ] && echo 1 || echo 0)" "sha=${SEED_SHA:0:16}"
+
+# 手机侧自证：core 的 file_seeding 日志带 sha256=（只加日志字段）。
+# release 包拉不了私有目录时这条不依赖 run-as；旧构建没有该字段就记 SKIP，不误判成产品问题。
+SHARE_LOG_LINE="$(applog | grep -F 'event=file_seeding' | tail -1)"
+SHARE_KERNEL_SHA="$(printf '%s' "$SHARE_LOG_LINE" | grep -o 'sha256=[0-9a-f]*' | tail -1 | cut -d= -f2)"
+if printf '%s' "$SHARE_LOG_LINE" | grep -q 'sha256='; then
+  chk "share.kernel_sha256" "$([ -n "$SHARE_KERNEL_SHA" ] && [ "$SHARE_KERNEL_SHA" = "$PAYLOAD_SHA" ] && echo 1 || echo 0)" \
+    "file_seeding sha256=${SHARE_KERNEL_SHA:0:16}"
+else
+  chk_skip "share.kernel_sha256" "file_seeding 没有 sha256 字段（旧构建）"
+fi
 
 # ------------------------------------------------------------------ 8. 桌面下载 + 评论双向
 
@@ -1012,12 +1122,25 @@ else
 
     DEVICE_FILE="/data/data/$PKG/files/m1/downloads/$NAME"
     PULLED="$ART/pulled/round$ROUND-$NAME"
+    PULL_SHA=""
     if pull_private "$DEVICE_FILE" "$PULLED"; then
       PULL_SHA="$(sha256_of "$PULLED")"
+      chk "stress.round$ROUND.sha256" "$([ "$PULL_SHA" = "$SHA" ] && echo 1 || echo 0)" "android=${PULL_SHA:0:16} pc=${SHA:0:16}"
+    elif [ "$PULL_PRIVATE_STATUS" = "skip" ]; then
+      chk_skip "stress.round$ROUND.sha256" "$PULL_PRIVATE_REASON"
     else
-      PULL_SHA=""
+      chk "stress.round$ROUND.sha256" 0 "pull 失败：$PULL_PRIVATE_REASON"
     fi
-    chk "stress.round$ROUND.sha256" "$([ "$PULL_SHA" = "$SHA" ] && echo 1 || echo 0)" "android=${PULL_SHA:0:16} pc=${SHA:0:16}"
+
+    # 手机侧自证：core 的 download_completed 日志带 sha256=（只加日志字段），按 file_id 取本轮。
+    DL_LOG_LINE="$(applog | grep -F 'event=download_completed' | grep -F "file_id=$FILE_ID_ROUND" | tail -1)"
+    DL_KERNEL_SHA="$(printf '%s' "$DL_LOG_LINE" | grep -o 'sha256=[0-9a-f]*' | tail -1 | cut -d= -f2)"
+    if printf '%s' "$DL_LOG_LINE" | grep -q 'sha256='; then
+      chk "stress.round$ROUND.kernel_sha256" "$([ -n "$DL_KERNEL_SHA" ] && [ "$DL_KERNEL_SHA" = "$SHA" ] && echo 1 || echo 0)" \
+        "download_completed sha256=${DL_KERNEL_SHA:0:16} pc=${SHA:0:16}"
+    else
+      chk_skip "stress.round$ROUND.kernel_sha256" "download_completed 没有 sha256 字段（旧构建）"
+    fi
 
     back_to_group || die "第 $ROUND 轮结束后回不到 P3"
     ROUND=$((ROUND + 1))
@@ -1427,16 +1550,20 @@ say "peer      : $PEER_LOG"
 say "screenshots: $ART/screenshots/"
 say "pulled    : $ART/pulled/"
 say "关键日志行："
-grep -hE "event=(app_kernel_ready|kernel_started|reconnect_attempt|peer_reconnected|ui_peers_changed|join_input|join_via|group_joined|share_import|file_seeding|download_start|file_stopped|seed_resumed|seed_resume_done|ui_file_completed|ui_op_received)" \
+grep -hE "event=(app_kernel_ready|kernel_started|reconnect_attempt|peer_reconnected|ui_peers_changed|join_input|join_via|group_joined|share_import|file_seeding|download_start|download_completed|file_stopped|seed_resumed|seed_resume_done|ui_file_completed|ui_op_received)" \
   "$ART/logs/app-logcat.log" 2>/dev/null | sed 's/^/  /' | head -30
 say "桌面关键行："
 grep -hE "PEER (ready|peer_joined|file_seen|download_done|comment_sent|op_received|reply_seen|share )" \
   "$PEER_LOG" 2>/dev/null | sed 's/^/  /' | head -20
 
 say ""
+say "checks    : PASS=$CHECKS_PASS FAIL=$CHECKS_FAIL SKIP=$CHECKS_SKIP（SKIP 不计入 PASS）"
+if [ "$CHECKS_SKIP" -gt 0 ]; then
+  say "提示      : $CHECKS_SKIP 项 SKIP 的原因见上面的 CHECK SKIP 行；产品判定只看 FAIL 是否为 0。"
+fi
 if [ "$CHECKS_FAIL" -eq 0 ]; then
-  say "PASS ($CHECKS_PASS checks)"
+  say "PASS"
   exit 0
 fi
-say "FAIL ($CHECKS_FAIL failed / $((CHECKS_PASS + CHECKS_FAIL)) checks)"
+say "FAIL"
 exit 1

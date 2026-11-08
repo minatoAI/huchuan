@@ -6,9 +6,11 @@
 bash scripts/m1-device.sh            # 全流程 + 崩溃压力（3 × 128 MiB，第 2 轮中途取消一次）
 bash scripts/m1-device.sh --quick    # 只跑功能闭环，跳过压力
 bash scripts/m1-device.sh --rounds 2 --mib 64
+M1_INSTALL=0 bash scripts/m1-device.sh --quick   # 用设备上已装的包，不构建/安装 app（验 release 包）
 ```
 
-最后一行是 `PASS` / `FAIL`，退出码 0 / 1。证据全部落在 `artifacts/m1-device/`。
+最后一行是 `PASS` / `FAIL`，退出码 0 / 1；前一行 `checks    : PASS=n FAIL=n SKIP=n` 单独列 SKIP。
+证据全部落在 `artifacts/m1-device/`。
 
 ## 1. 链路
 
@@ -241,7 +243,8 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 | `desktop.invite_code_16` | 建群方邀请码 16 位 Crockford Base32 |
 | `kernel.started` / `kernel.keystore_keyseed` / `kernel.multicast_lock` | logcat `huchuan/m1` |
 | `join.tail8_only` | 加入方只拿到后 8 位（`join_candidates tail8=`） |
-| `share.saf_copied` / `share.seeding` / `share.copy_matches_payload` | SAF 拷贝字节数、`file_seeding`、拉回私有目录副本比对 SHA-256 |
+| `share.saf_copied` / `share.seeding` / `share.copy_matches_payload` | SAF 拷贝字节数、`file_seeding`、拉回私有目录副本比对 SHA-256（**需要 debuggable 包**；release 包记 SKIP，见 §4.1） |
+| `share.kernel_sha256` | logcat `file_seeding ... sha256=` 与素材 SHA-256 相同（手机侧自证，不依赖 run-as） |
 | `desktop.downloaded_32MiB` / `sha256.equal_android_desktop` | 对端 `PEER download_done bytes= sha256=` |
 | `comment.pc_to_android` | 手机 P4 界面上出现 `from-pc-1`（ui-dump） |
 | `comment.android_to_pc` | 对端 `PEER op_received body=from-mix-1` |
@@ -267,7 +270,8 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 | `restart.reconnect_p6_online` | 重启后 P6 上对端那一行是「在线」（`KernelEvents.peersChanged` 推的实时状态） |
 | `join.mdns_discovered` | `join_candidates lan=` ≥ 1（mDNS 找到候选；端点与手动候选重复时协议记 manual） |
 | `desktop.shared_stress_files` | 对端把压力文件真的共享出去了（否则第 10 步才发现 P3 没文件） |
-| `stress.roundN.sha256` | 每轮下载完成后 `run-as` 拉回手机上的文件，与桌面源文件比对 SHA-256 |
+| `stress.roundN.sha256` | 每轮下载完成后 `run-as` 拉回手机上的文件，与桌面源文件比对 SHA-256（**需要 debuggable 包**；release 包记 SKIP，见 §4.1） |
+| `stress.roundN.kernel_sha256` | logcat `download_completed ... sha256=` 与桌面源文件相同（手机侧自证，不依赖 run-as） |
 | `stress.cancel_hibernate` / `cancel_stops_transfer` / `resume_after_cancel` | 第 2 轮 ≥25% 时休眠：`file_stopped` 之后没有新的 `download_progress`，重新激活后能续传完成 |
 | `dht_nodes=0` | logcat 里所有 `dht_nodes=` 采样都是 0 |
 | `crash_buffer.app_crash_0` | crash 缓冲区里没有 `app.huchuan` 的崩溃（缓冲区是全局的，uiautomator 的崩溃单列） |
@@ -287,6 +291,26 @@ host 的固定顺序：建群 → 打印 `PEER ready tail8=.. msg_port=..` → �
 | `limit.global_restored_after_restart` | 冷启动后按偏好重新下发 512：`global_limit_applied ... session_up_kbps=512 ... ok=true` 的条数比重启前多一条（限速不落内核盘，只靠 app 重放） |
 | `limit.restored_logged` | 冷启动日志里有 `limits_restored files=N`（全局限速 + 每个文件的限速都在这里重放） |
 
+### 4.1 debuggable 包与 release 包
+
+`pull_private` 用 `adb exec-out run-as app.huchuan cat` 读应用私有目录。`run-as` 只对 **debuggable** 包有效；
+release 包实测报 `run-as: package not debuggable: app.huchuan`。脚本在安装/清场后探测一次，输出
+`run-as : 可用（debuggable 包）` 或 `run-as : 不可用（package not debuggable（release 包））`。
+
+| 包 | `run-as` | `share.copy_matches_payload` / `stress.roundN.sha256` | 手机侧自证 |
+| --- | --- | --- | --- |
+| debug（默认 `assembleDebug`） | 可用 | 正常拉回文件算 SHA-256，PASS / FAIL | `share.kernel_sha256` / `stress.roundN.kernel_sha256` 同时校验 core 日志字段 |
+| release（非 debuggable） | `package not debuggable` | 显式 `CHECK SKIP`，原因里带 `package not debuggable`；不计 FAIL、不计 PASS | 改读 logcat `file_seeding sha256=` 与 `download_completed sha256=`；字段缺失（旧构建）也记 SKIP |
+
+- SKIP 在汇总里单独计数：`checks    : PASS=n FAIL=n SKIP=n`；`FAIL=0` 时最后一行仍是 `PASS`、退出码 0。
+  汇总行之后还有一句 `提示 : ... SKIP ...`，说明这些项没有产品结论，只有环境结论。
+- 跨端一致性仍由 `sha256.equal_android_desktop` 守住：它比的是对端 `download_done sha256=`，不需要读手机私有目录。
+- 手机侧自证字段只由 core 加日志输出（`GroupRuntime.addFile` 的 `file_seeding sha256=`、
+  `M1Kernel.completeFile` 的 `download_completed sha256=`），不改变做种/下载/广播逻辑。
+- 验 release 包用 `M1_INSTALL=0 bash scripts/m1-device.sh --quick`：不构建 `:app`，沿用设备上已装的包，
+  `apk.selfbuilt_arm64_so` 也记 SKIP。默认 `M1_INSTALL=1` 构建并安装 debug 包；安装失败（设备上占着别的签名包）
+  会直接 `FATAL`，不会静默拿旧包继续跑。
+
 ## 5. 产物
 
 ```
@@ -304,7 +328,7 @@ artifacts/m1-device/
   logs/full-logcat.log       全量（Scudo/ANR 断言用）
   logs/crash-buffer.log      crash 缓冲区
   logs/desktop-peer.log      对端完整日志
-  pulled/          从手机私有目录拉回的文件（做种副本 + 每轮下载结果）
+  pulled/          从手机私有目录拉回的文件（做种副本 + 每轮下载结果；release 包上为空，相关断言记 SKIP）
   payload/         32 MiB 素材 + N × 压力素材（缓存，不重复生成）
 ```
 
@@ -335,6 +359,8 @@ artifacts/m1-device/
    留这条是为了保住编号：core 的 `Seeding.kt` 注释按「§6-6」指过来。
 7. **ip_filter 只放行私网**：M1 是局域网产品，跨网要按 `docs/design/nat-traversal.md`
    改成「私网 + 消息层确认的群成员公网地址」，属于 M2。
+8. **release 包不能 `run-as`**：私有目录哈希断言在 release 包上记 SKIP（不是 FAIL）。
+   原因、替代证据与运行方式见 §4.1；`M1_INSTALL=0` 用来跑设备上已装的 release 包。
 
 ## 7. 上真机才暴露、已修掉的内核缺陷
 
