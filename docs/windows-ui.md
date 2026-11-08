@@ -647,10 +647,10 @@ P8 没有做 Android 的那一次性 toast（「对方可见你的网络地址�
    （「对方可见你的网络地址」，需要的话是一次 toast + localStorage 标记，不影响其它状态）；
    P4「…」里没有「公开 / 取消公开」两项（公开条目目前从磁力导入，见 §8 第 17 条）。
 
-10. **acquiring 期间点「休眠」不会真停下**（daemon 侧的口径，Windows 页面不改内核）：P4 的开关在
-    `acquiring` 时保持「已激活」（§3.3），点它等于再激活一次 —— 因为 `POST …/files/{fid}/active
-    {active:false}` 只对 `role != none` 的文件调 `stopFile`，而 acquiring 的 `role` 是 `none`。
-    元数据一到转 `downloading`，那时才停得下来。要改的是 daemon 的 stop 路径，不在本页范围。
+10. ~~acquiring 期间点「休眠」不会真停下~~ **已修**（core/daemon 提交 c664256）：daemon 的
+    `POST …/files/{fid}/active {active:false}` 改为按 `kernelState` 判定，`acquiring` 时调
+    `PublicBtSession.cancelAcquire` 同步摘掉找源任务并释放公开会话，回包带 `stopped` 与前后 `kernelState`。
+    P4 的开关在 `acquiring` 时仍显示「已激活」（§3.3），但点它现在真的能停下来。
 
 ## 10. 体积
 
