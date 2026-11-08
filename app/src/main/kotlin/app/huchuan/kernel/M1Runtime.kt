@@ -398,7 +398,12 @@ class M1Runtime(context: Context) {
 
     /**
      * P4「移除」（public-swarm §5.2）：只从本机列表消失 —— 不广播 file.del（M2 才有）、
-     * 不删磁盘文件。本机正在做种 / 下载的先休眠，否则「移除」之后公开会话还在替它上传。
+     * 不删磁盘文件。本机正在做种 / 下载 / **找源**的先休眠，否则「移除」之后任务还留在会话里。
+     *
+     * 判据是内核真值而不是角色（与 daemon 的 active 路由同一口径，docs/core.md §3.12）：
+     * acquiring（正在寻找来源）与 waiting_metadata（等待来源）时内核里挂着一条找源任务，
+     * 但 localRole 是 NONE —— 没有元数据，一个数据字节都没在动。以前只看角色，这两种状态上
+     * 「移除」只是把条目藏起来，找源任务会一直留到公开会话被别的事情停掉为止。
      *
      * 只对公开条目开放（私有条目行为不变），调用方已经离开界面线程。
      */
@@ -406,14 +411,18 @@ class M1Runtime(context: Context) {
         val group = kernel.group(groupId) ?: return
         val entry = group.file(fileId) ?: return
         if (!entry.isPublic) return
-        val role = group.localRole(fileId)
-        val wasActive = role != GroupRuntime.LocalRole.NONE
+        val state = group.kernelState(fileId)
+        val wasActive = state != GroupRuntime.KernelState.ABSENT
+        // 找源中的任务走内核的「取消等待」语义：摘任务 + 叫醒同步等待 + 一条 public_acquire_cancelled
+        // （reason=user_cancel）。随后内核自己判「公开会话还有没有事做」，没有就停掉。
         if (wasActive) group.stopFile(fileId)
         prefs.hideFile(groupId, fileId)
         Log.i(
             TAG,
             "event=ui_file_remove_local group_id=" + groupId + " file_id=" + fileId +
-                " scope=" + entry.scope.wire + " was_active=" + wasActive +
+                " scope=" + entry.scope.wire +
+                " kernel_state_before=" + state.name.lowercase() +
+                " was_active=" + wasActive +
                 " file_kept=" + (group.savedFile(fileId)?.isFile == true),
         )
         requestUiRefresh()
